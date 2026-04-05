@@ -1,0 +1,858 @@
+﻿import { useState, useEffect, useRef, useCallback } from "react";
+import {
+  Terminal,
+  Activity,
+  ArrowUp,
+  Database,
+  ChevronDown,
+  Square,
+  Monitor,
+  Trash2,
+  Wrench,
+  Coins,
+  Plus,
+  MessageSquare,
+  History,
+  X,
+  MoreHorizontal,
+  Pencil,
+  FolderOpen,
+  Archive
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Textarea } from "@/components/ui/textarea";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup
+} from "@/components/ui/resizable";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
+import { AgentStep } from "@/components/agent/AgentStep";
+import MarkdownBlock from "@/components/ui/MarkdownBlock";
+import { QueryEngine, type AgentMessage, type ToolPermissionMode } from "@/lib/agent/QueryEngine";
+import { invoke } from "@tauri-apps/api/core";
+import { threadService } from "@/lib/agent/ThreadService";
+import type { ThreadMetadata } from "@/lib/agent/ThreadService";
+import type { ThreadEvent } from "@/lib/agent/ThreadService";
+
+interface AgentWorkstationViewProps {
+  apiConfig: { baseUrl: string; apiKey: string } | null;
+}
+
+interface ModelInfo {
+  id: string;
+  label: string;
+}
+
+const FALLBACK_MODELS: ModelInfo[] = [
+  { id: "deepseek-ai/DeepSeek-V3", label: "DeepSeek V3 (SiliconFlow)" },
+  { id: "gpt-4o", label: "GPT-4o (OpenAI)" },
+  { id: "claude-3-5-sonnet-20240620", label: "Claude 3.5 Sonnet" },
+  { id: "Qwen/Qwen2.5-72B-Instruct", label: "Qwen 2.5 72B" },
+];
+
+const PERMISSION_OPTIONS: Array<{ label: string; value: ToolPermissionMode }> = [
+  { label: "默认权限", value: "default" },
+  { label: "完全访问权限", value: "full_access" },
+];
+
+function cloneMessages(messages: AgentMessage[]): AgentMessage[] {
+  if (typeof structuredClone === "function") {
+    return structuredClone(messages);
+  }
+  return JSON.parse(JSON.stringify(messages)) as AgentMessage[];
+}
+
+export default function AgentWorkstationView({ apiConfig }: AgentWorkstationViewProps) {
+  const [input, setInput] = useState("");
+  const [availableModels, setAvailableModels] = useState<ModelInfo[]>(FALLBACK_MODELS);
+  const [currentModel, setCurrentModel] = useState<string>("deepseek-ai/DeepSeek-V3");
+  const [permissionMode, setPermissionMode] = useState<ToolPermissionMode>("default");
+  const [memories, setMemories] = useState<any[]>([]);
+  const [userInfo, setUserInfo] = useState<any>(null);
+  const [showUserPopover, setShowUserPopover] = useState(false);
+
+  // Thread management states
+  const [threads, setThreads] = useState<ThreadMetadata[]>([]);
+  const [currentThreadId, setCurrentThreadId] = useState<string | null>(null);
+  const [currentThreadName, setCurrentThreadName] = useState("新任务");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState("");
+
+  const [messages, setMessages] = useState<AgentMessage[]>([
+    {
+      id: "init",
+      role: "assistant",
+      content: "TraceForge 智能逆向助手已就绪。我将协助您进行自动化 APK 分析、协议还原与 Hook 脚本编写。请提供目标进程或任务指令。",
+      status: "completed"
+    }
+  ]);
+
+  const engineRef = useRef<QueryEngine | null>(null);
+  const pendingEngineMessagesRef = useRef<AgentMessage[] | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const isUserAtBottomRef = useRef(true);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const lastPersistedMessagesRef = useRef<AgentMessage[] | null>(null);
+  const messagesRef = useRef<AgentMessage[]>(messages);
+
+  // Load threads on mount
+  const refreshThreads = useCallback(async () => {
+    try {
+      const list = await threadService.listThreads();
+      setThreads(list);
+
+      // If no thread is selected, select the most recent one or create new
+      if (!currentThreadId && list.length > 0) {
+        handleLoadThread(list[0].id);
+      } else if (!currentThreadId && list.length === 0) {
+        handleNewThread();
+      }
+    } catch (e) {
+      console.warn("Failed to list threads:", e);
+    }
+  }, [currentThreadId]);
+
+  useEffect(() => {
+    refreshThreads();
+  }, [refreshThreads]);
+
+  // Initialize engine
+  useEffect(() => {
+    if (!apiConfig) return;
+
+    const engine = new QueryEngine(
+      (updatedMessages) => {
+        const nextMessages = [...updatedMessages];
+        setMessages(nextMessages);
+        messagesRef.current = nextMessages;
+      },
+      apiConfig.baseUrl,
+      apiConfig.apiKey
+    );
+    engineRef.current = engine;
+    engine.setPermissionMode(permissionMode);
+
+    // Replay any messages loaded before engine was ready.
+    if (pendingEngineMessagesRef.current) {
+      engine.setMessages(pendingEngineMessagesRef.current);
+      pendingEngineMessagesRef.current = null;
+    } else if (messagesRef.current.length > 0) {
+      engine.setMessages(messagesRef.current);
+    }
+
+    const fetchModels = async () => {
+      try {
+        const response = await fetch(`${apiConfig.baseUrl}/models`, {
+          headers: { "Authorization": `Bearer ${apiConfig.apiKey}` }
+        });
+        if (response.ok) {
+          const data = await response.json();
+          if (data.data && Array.isArray(data.data)) {
+            const models: ModelInfo[] = data.data
+              .filter((m: any) => m.id)
+              .map((m: any) => ({ id: m.id, label: m.id }))
+              .slice(0, 20);
+            if (models.length > 0) {
+              setAvailableModels(models);
+              // Auto-switch away from gpt-4o if not available and using common SiliconFlow baseline
+              if (currentModel === "gpt-4o" && !models.some(m => m.id === "gpt-4o")) {
+                setCurrentModel(models[0].id);
+              }
+            }
+          }
+        }
+      } catch (e) { }
+    };
+    fetchModels();
+
+    return () => {
+      engine.dispose();
+      if (engineRef.current === engine) {
+        engineRef.current = null;
+      }
+    };
+  }, [apiConfig]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  useEffect(() => {
+    engineRef.current?.setPermissionMode(permissionMode);
+  }, [permissionMode]);
+
+  // Thread Handlers
+  const handleNewThread = () => {
+    const newId = threadService.generateId();
+    setCurrentThreadId(newId);
+    setCurrentThreadName("新任务");
+    const initMsg: AgentMessage[] = [{
+      id: "init",
+      role: "assistant",
+      content: "TraceForge 逆向分析引擎已就绪。14 个工具已加载，等待指令。",
+      status: "completed"
+    }];
+    const nextMessages = cloneMessages(initMsg);
+    setMessages(nextMessages);
+    messagesRef.current = nextMessages;
+    lastPersistedMessagesRef.current = cloneMessages(nextMessages);
+    if (engineRef.current) {
+      engineRef.current.setMessages(nextMessages);
+      pendingEngineMessagesRef.current = null;
+    } else {
+      pendingEngineMessagesRef.current = nextMessages;
+    }
+  };
+
+  const handleLoadThread = async (id: string) => {
+    try {
+      const data = await threadService.loadThread(id);
+      setCurrentThreadId(data.metadata.id);
+      setCurrentThreadName(data.metadata.name);
+      const nextMessages = cloneMessages(data.messages);
+      setMessages(nextMessages);
+      messagesRef.current = nextMessages;
+      lastPersistedMessagesRef.current = cloneMessages(nextMessages);
+      if (engineRef.current) {
+        engineRef.current.setMessages(nextMessages);
+        pendingEngineMessagesRef.current = null;
+      } else {
+        pendingEngineMessagesRef.current = nextMessages;
+      }
+    } catch (e) {
+      console.error("Failed to load thread:", e);
+    }
+  };
+
+  const handleDeleteThread = async (id: string) => {
+    try {
+      await threadService.deleteThread(id);
+      if (currentThreadId === id) {
+        setCurrentThreadId(null);
+      }
+      refreshThreads();
+    } catch (e) { }
+  };
+
+  const handleStartRename = (thread: ThreadMetadata) => {
+    setEditingId(thread.id);
+    setEditingName(thread.name || "");
+  };
+
+  const handleConfirmRename = async () => {
+    if (!editingId || !editingName.trim()) return;
+    try {
+      await threadService.renameThread(editingId, editingName);
+      if (currentThreadId === editingId) {
+        setCurrentThreadName(editingName);
+      }
+      setEditingId(null);
+      refreshThreads();
+    } catch (e) { }
+  };
+
+  const handleRevealThreads = async () => {
+    try {
+      await threadService.revealThreadsDir();
+    } catch (e) { }
+  };
+
+  // Auto-save thread on message updates
+  useEffect(() => {
+    if (!currentThreadId) return;
+
+    const buildThreadEvents = (prev: AgentMessage[], next: AgentMessage[]): ThreadEvent[] => {
+      const events: ThreadEvent[] = [];
+      const prevMap = new Map(prev.map((m) => [m.id, m]));
+      const nextMap = new Map(next.map((m) => [m.id, m]));
+      const now = Date.now();
+
+      for (const m of next) {
+        const old = prevMap.get(m.id);
+        if (!old) {
+          events.push({
+            event_type: "append_message",
+            message_id: m.id,
+            payload: cloneMessages([m])[0],
+            at: now,
+          });
+          continue;
+        }
+        if (JSON.stringify(old) !== JSON.stringify(m)) {
+          events.push({
+            event_type: "upsert_message",
+            message_id: m.id,
+            payload: cloneMessages([m])[0],
+            at: now,
+          });
+        }
+      }
+
+      for (const old of prev) {
+        if (!nextMap.has(old.id)) {
+          events.push({
+            event_type: "delete_message",
+            message_id: old.id,
+            payload: {},
+            at: now,
+          });
+        }
+      }
+      return events;
+    };
+
+    // Auto-name detection: if thread name is default and there's a user message
+    let name = currentThreadName;
+    if ((name === "新任务" || name === "") && messages.length > 0) {
+      const firstUserMsg = messages.find(m => m.role === "user");
+      if (firstUserMsg) {
+        name = firstUserMsg.content.slice(0, 30).trim();
+        if (firstUserMsg.content.length > 30) name += "...";
+        setCurrentThreadName(name);
+      }
+    }
+
+    const saveTimer = setTimeout(() => {
+      const prev = lastPersistedMessagesRef.current;
+      const currentMessages = cloneMessages(messages);
+      if (!prev) {
+        void threadService.saveThread(currentThreadId, name, currentMessages)
+          .then(() => {
+            lastPersistedMessagesRef.current = cloneMessages(currentMessages);
+            void refreshThreads();
+          })
+          .catch((error) => {
+            console.warn("Failed to save thread:", error);
+          });
+        return;
+      }
+
+      const events = buildThreadEvents(prev, currentMessages);
+      if (events.length === 0) return;
+
+      void threadService.appendThreadEvents(currentThreadId, name, events)
+        .then(() => {
+          lastPersistedMessagesRef.current = cloneMessages(currentMessages);
+          void refreshThreads();
+        })
+        .catch((error) => {
+          console.warn("Failed to append thread events, fallback to full snapshot:", error);
+          void threadService.saveThread(currentThreadId, name, currentMessages)
+            .then(() => {
+              lastPersistedMessagesRef.current = cloneMessages(currentMessages);
+              void refreshThreads();
+            })
+            .catch((saveErr) => {
+              console.warn("Failed to save thread snapshot:", saveErr);
+            });
+        });
+      // Refresh list metadata (like last_active) occasionally
+      // (Simplified: list update on every save might be heavy, but metadata reflects active)
+    }, 1000);
+
+    return () => clearTimeout(saveTimer);
+  }, [messages, currentThreadId, currentThreadName, refreshThreads]);
+
+  const fetchUserInfo = useCallback(async () => {
+    if (!apiConfig) return;
+    try {
+      const response = await fetch("https://api.siliconflow.cn/v1/user/info", {
+        headers: { "Authorization": `Bearer ${apiConfig.apiKey}` }
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.data) setUserInfo(data.data);
+      }
+    } catch (e) { }
+  }, [apiConfig]);
+
+  useEffect(() => {
+    fetchUserInfo();
+  }, [fetchUserInfo]);
+
+  const loadMemories = useCallback(async () => {
+    if (!currentThreadId) return;
+    try {
+      const entries: any = await invoke("invoke_agent_load_memories", {
+        thread_id: currentThreadId,
+        limit: 20
+      });
+      setMemories(entries);
+    } catch (e) { }
+  }, [currentThreadId]);
+
+  useEffect(() => {
+    loadMemories();
+  }, [loadMemories]);
+
+  useEffect(() => {
+    const hasCompleted = messages.some(m => m.status === "completed" && m.steps && m.steps.length > 0);
+    if (hasCompleted) {
+      const timer = setTimeout(loadMemories, 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [messages, loadMemories]);
+
+  useEffect(() => {
+    if (scrollRef.current && isUserAtBottomRef.current) {
+      const el = scrollRef.current;
+      requestAnimationFrame(() => {
+        el.scrollTop = el.scrollHeight;
+      });
+    }
+  }, [messages]);
+
+  const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    isUserAtBottomRef.current = distanceFromBottom < 50;
+  };
+
+  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    if (e.deltaY < 0) isUserAtBottomRef.current = false;
+  };
+
+  const isThinking = messages.some(m => m.status === "running");
+  const queuedCount = engineRef.current?.getQueueCount() || 0;
+  const permissionLabel = PERMISSION_OPTIONS.find((option) => option.value === permissionMode)?.label ?? "默认权限";
+
+
+  const handleSend = () => {
+    if (!input.trim() || !engineRef.current) return;
+    const query = input;
+    setInput("");
+    if (inputRef.current) {
+      inputRef.current.style.height = "auto";
+    }
+    engineRef.current.processQuery(query, currentModel);
+    setTimeout(fetchUserInfo, 100);
+  };
+
+  const handleStop = () => engineRef.current?.abort();
+
+  const handleClear = () => {
+    engineRef.current?.clear();
+    const nextMessages: AgentMessage[] = [{
+      id: "init-" + Date.now(),
+      role: "assistant",
+      content: "会话已清空。等待新指令...",
+      status: "completed"
+    }];
+    setMessages(nextMessages);
+    messagesRef.current = nextMessages;
+  };
+
+  const toolCallCount = messages.reduce((acc, m) => acc + (m.steps?.length || 0), 0);
+
+  return (
+    <div className="flex h-full w-full flex-col bg-background text-foreground selection:bg-primary/10 overflow-hidden font-sans">
+      <header className="flex h-11 shrink-0 items-center justify-between border-b border-border/50 px-5 bg-card/10 backdrop-blur-md">
+        <div className="flex items-center gap-3">
+          <Terminal size={14} className="text-primary/70" />
+          <h1 className="text-[12px] font-bold tracking-tight uppercase opacity-50 font-mono">
+            TraceForge 智能实验室 / <span className="text-primary/60">{currentThreadName}</span>
+          </h1>
+        </div>
+
+        <div className="flex items-center gap-4">
+          <Badge variant="outline" className="h-5 text-[9px] px-1.5 font-mono border-primary/20 text-primary/60 bg-primary/5 cursor-default uppercase">
+            逆向引擎: Rust v0.1.3
+          </Badge>
+          {toolCallCount > 0 && (
+            <Badge variant="outline" className="h-5 text-[9px] px-1.5 font-mono border-green-500/30 text-green-500/70 bg-green-500/5">
+              <Wrench size={9} className="mr-1" /> {toolCallCount} 工具已执行
+            </Badge>
+          )}
+          <div className="flex items-center gap-2">
+            <div className={cn("h-2 w-2 rounded-full", apiConfig ? "bg-green-500 animate-pulse" : "bg-red-500")} />
+          </div>
+        </div>
+      </header>
+
+      <div className="flex flex-1 min-h-0 overflow-hidden">
+        <ResizablePanelGroup orientation="horizontal" className="flex-1">
+
+          {/* 鐎归潻缂氶弲? 濞寸姾顕ф慨鐔煎储閸℃钑?(THREADS) */}
+          <ResizablePanel defaultSize={18} minSize={10} className="flex flex-col bg-muted/10 border-r border-border/30">
+            <header className="h-11 flex items-center justify-between px-4 border-b border-border/30">
+              <span className="text-[10px] font-black tracking-widest text-muted-foreground/60 uppercase flex items-center gap-2">
+                <History size={12} /> 任务历史
+              </span>
+              <Button variant="ghost" size="icon" className="h-7 w-7 text-primary/60 hover:text-primary hover:bg-primary/5" onClick={handleNewThread}>
+                <Plus size={16} />
+              </Button>
+            </header>
+            <ScrollArea className="flex-1">
+              <div className="p-2 space-y-1">
+                {threads.map(thread => (
+                  <div
+                    key={thread.id}
+                    onClick={() => handleLoadThread(thread.id)}
+                    className={cn(
+                      "group relative flex flex-col p-3 rounded-xl cursor-pointer transition-all border border-transparent",
+                      currentThreadId === thread.id
+                        ? "bg-primary/5 border-primary/20 shadow-sm"
+                        : "hover:bg-muted/40 hover:border-border/40"
+                    )}
+                  >
+                    <div className="flex items-start justify-between gap-2 overflow-hidden">
+                      <MessageSquare size={13} className={cn("shrink-0 mt-0.5", currentThreadId === thread.id ? "text-primary/70" : "text-muted-foreground/30")} />
+
+                      {editingId === thread.id ? (
+                        <Input
+                          autoFocus
+                          className="h-6 flex-1 text-[12px] px-1 bg-background border-primary/40 focus-visible:ring-1 focus-visible:ring-primary/20"
+                          value={editingName}
+                          onChange={(e) => setEditingName(e.target.value)}
+                          onKeyDown={(e: React.KeyboardEvent) => {
+                            if (e.key === "Enter") handleConfirmRename();
+                            if (e.key === "Escape") setEditingId(null);
+                          }}
+                          onBlur={() => handleConfirmRename()}
+                          onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                        />
+                      ) : (
+                        <span className={cn("flex-1 text-[12px] font-medium truncate", currentThreadId === thread.id ? "text-primary/90" : "text-muted-foreground/80")}>
+                          {thread.name || "未命名任务"}
+                        </span>
+                      )}
+
+                      <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button variant="ghost" size="icon" className="h-6 w-6 text-muted-foreground/40 hover:text-primary hover:bg-transparent" onClick={(e) => e.stopPropagation()}>
+                              <MoreHorizontal size={14} />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end" className="w-[180px] bg-card/95 backdrop-blur-md border-border/50">
+                            <DropdownMenuItem className="text-[11px] flex items-center gap-2" onClick={handleRevealThreads}>
+                              <FolderOpen size={13} /> Open in Explorer
+                            </DropdownMenuItem>
+                            <DropdownMenuItem className="text-[11px] flex items-center gap-2 opacity-50 cursor-not-allowed">
+                              <Activity size={13} /> 获取分析报告
+                            </DropdownMenuItem>
+                            <DropdownMenuItem className="text-[11px] flex items-center gap-2" onClick={() => handleStartRename(thread)}>
+                              <Pencil size={13} /> 重命名任务
+                            </DropdownMenuItem>
+                            <DropdownMenuItem className="text-[11px] flex items-center gap-2 opacity-50 cursor-not-allowed">
+                              <Archive size={13} /> 归档任务
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator className="bg-border/30" />
+                            <DropdownMenuItem className="text-[11px] flex items-center gap-2 text-destructive focus:text-destructive" onClick={() => handleDeleteThread(thread.id)}>
+                              <X size={13} /> 删除任务
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-6 w-6 text-muted-foreground/40 hover:text-primary hover:bg-transparent"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleStartRename(thread);
+                          }}
+                        >
+                          <Pencil size={12} />
+                        </Button>
+                      </div>
+                    </div>
+                    <span className="text-[9px] text-muted-foreground/40 mt-1 font-mono uppercase">
+                      {new Date(thread.last_active).toLocaleDateString()}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </ScrollArea>
+          </ResizablePanel>
+
+          <ResizableHandle withHandle className="hover:bg-primary/40 bg-border/20" />
+
+          {/* 濞戞搩鍙冨Λ? 濞戞捁顕ч顔炬嫚濠靛棗闅橀柛?*/}
+          <ResizablePanel defaultSize={60} minSize={30} className="relative flex flex-col bg-background expert-grid">
+            <div
+              className="flex-1 overflow-y-auto overflow-x-hidden scrollbar-thin scrollbar-thumb-border/30 scrollbar-track-transparent hover:scrollbar-thumb-border/50"
+              ref={scrollRef}
+              onScroll={handleScroll}
+              onWheel={handleWheel}
+            >
+              <div className="max-w-3xl mx-auto px-6 py-10 space-y-12">
+                {messages.map((m) => (
+                  <div key={m.id} className="animate-in fade-in slide-in-from-bottom-3 duration-500">
+                    <div className="flex flex-col space-y-4">
+                      <div className="flex items-center gap-2">
+                        <span className={cn("text-[12px] font-bold tracking-tight", m.role === 'user' ? "text-muted-foreground/60" : "text-primary")}>
+                          {m.role === 'user' ? "任务指令" : "分析助手"}
+                        </span>
+                        {m.role === "assistant" && (
+                          <span className="text-[10px] text-muted-foreground/30 font-mono tracking-tighter">Agent::Analytical</span>
+                        )}
+                        {m.status === "error" && <Badge variant="destructive" className="h-4 text-[8px] px-1">执行异常</Badge>}
+                      </div>
+
+                      {m.role === "assistant" && m.steps && m.steps.length > 0 && (
+                        <div className="flex flex-col -space-y-2 pb-2">
+                          {m.steps.map((step) => (
+                            <AgentStep key={step.id} title={step.title} status={step.status} logs={step.logs} />
+                          ))}
+                        </div>
+                      )}
+
+                      <div className={cn(
+                        "text-[14.5px] font-sans transition-colors",
+                        m.role === "assistant" ? "text-foreground/90 font-medium" : "text-muted-foreground/90 pl-1 border-l border-border/50"
+                      )}>
+                        <MarkdownBlock content={m.content} isStreaming={m.status === "running"} />
+                      </div>
+                    </div>
+                  </div>
+                ))}
+
+                {isThinking && (
+                  <div className="flex flex-col space-y-4 py-4 opacity-50 animate-pulse">
+                    <div className="h-px w-full bg-border/20" />
+                    <div className="flex items-center gap-3">
+                      <div className="h-1.5 w-1.5 rounded-full bg-primary" />
+                      <span className="text-[11px] font-mono uppercase tracking-[0.2em]">正在深度检索符号表与环境诊断中...</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="pb-6 flex flex-col items-center gap-4 shrink-0">
+              <div className="max-w-3xl w-full relative group px-2">
+                <div className="absolute inset-0 bg-primary/5 blur-2xl opacity-0 group-focus-within:opacity-100 transition-opacity duration-1000" />
+                <div className="relative flex flex-col p-2.5 rounded-2xl border border-border/60 bg-card/70 backdrop-blur-2xl transition-all group-focus-within:border-primary/20 group-focus-within:shadow-primary/5">
+                  <Textarea
+                    ref={inputRef}
+                    className="min-h-[42px] max-h-[400px] w-full px-4 border-none bg-transparent focus-visible:ring-0 text-[14.5px] placeholder:text-muted-foreground/30 font-medium resize-none shadow-none focus:ring-0 py-3 scrollbar-none"
+                    placeholder="输入分析指令，例如：分析 MUJI 应用的所有网络请求或快速编写 Frida Hook..."
+                    value={input}
+                    onChange={(e) => {
+                      setInput(e.target.value);
+                      e.target.style.height = "auto";
+                      e.target.style.height = `${e.target.scrollHeight}px`;
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        handleSend();
+                      }
+                    }}
+                    disabled={false}
+
+                  />
+                  <div className="flex items-center justify-between px-3 pt-1 pb-1">
+                    <div className="flex items-center gap-1.5 text-muted-foreground/40">
+                      <Button variant="ghost" size="icon" className="h-8 w-8 hover:bg-muted" onClick={handleClear} title="清空当前会话">
+                        <Trash2 size={15} />
+                      </Button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="ghost" size="sm" className="h-8 text-[11px] font-bold hover:bg-muted flex items-center gap-1 max-w-[180px]">
+                            <span className="truncate">{currentModel}</span> <ChevronDown size={12} />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start" className="w-[260px] max-h-[300px] overflow-y-auto bg-card/95 backdrop-blur-md border-border/50">
+                          {availableModels.map(model => (
+                            <DropdownMenuItem key={model.id} className={cn("text-[12px] font-medium cursor-pointer", currentModel === model.id && "text-primary font-bold")} onClick={() => setCurrentModel(model.id)}>
+                              {model.label} {currentModel === model.id && <span className="ml-auto">✓</span>}
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {isThinking && (
+                        <Button
+                          onClick={handleStop}
+                          size="icon"
+                          variant="ghost"
+                          className="h-9 w-9 text-destructive/60 hover:text-destructive hover:bg-destructive/10 rounded-full transition-colors"
+                          title="中止当前任务"
+                        >
+                          <Square size={14} className="fill-current" />
+                        </Button>
+                      )}
+
+                      <Button
+                        onClick={handleSend}
+                        size="icon"
+                        disabled={!input.trim()}
+                        className={cn(
+                          "h-9 w-9 transition-all duration-300 rounded-full shadow-sm",
+                          isThinking
+                            ? "bg-primary/20 hover:bg-primary/30 text-primary"
+                            : "bg-primary hover:bg-primary/90 text-white"
+                        )}
+                        title={isThinking ? "加入队列" : "发送指令"}
+                      >
+                        <ArrowUp size={20} className="stroke-[3.5px]" />
+                      </Button>
+                    </div>
+
+                  </div>
+                </div>
+              </div>
+
+              <div className="max-w-3xl w-full flex items-center gap-4 px-4 pr-6">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="sm" className="h-7 text-[10px] text-muted-foreground/50 hover:bg-muted flex items-center gap-2 px-2 rounded-lg bg-muted/20">
+                      <Monitor size={12} className="opacity-70" /> 引擎就绪: 14 个逆向工具 <ChevronDown size={10} />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-[200px] bg-card/95 border-border/50">
+                    {["grep", "list_dir", "hexdump", "strings", "binary_info", "shell", "adb", "jadx", "frida"].map(t => (
+                      <DropdownMenuItem key={t} className="text-[11px] font-mono">工具: {t}</DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+
+                {queuedCount > 0 && (
+                  <Badge variant="outline" className="h-7 text-[10px] px-2.5 font-bold border-yellow-500/30 text-yellow-500 bg-yellow-500/5 animate-pulse flex items-center gap-1.5 rounded-lg shrink-0">
+                    <div className="h-1.5 w-1.5 rounded-full bg-yellow-500" />
+                    任务队列: {queuedCount} 个待处理
+                  </Badge>
+                )}
+
+
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="sm" className="h-7 text-[10px] text-muted-foreground/50 hover:bg-muted flex items-center gap-2 px-2 rounded-lg bg-muted/20">
+                      <Activity size={12} className="opacity-70" /> {permissionLabel} <ChevronDown size={10} />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="w-[160px] bg-card/95 border-border/50">
+                    {PERMISSION_OPTIONS.map((option) => (
+                      <DropdownMenuItem
+                        key={option.value}
+                        className="text-[11px] flex justify-between items-center"
+                        onClick={() => setPermissionMode(option.value)}
+                      >
+                        {option.label} {permissionMode === option.value && "✓"}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+
+                <div className="ml-auto">
+                  <div className="relative group/user" onMouseEnter={() => setShowUserPopover(true)} onMouseLeave={() => setShowUserPopover(false)}>
+                    <button className="h-6 w-6 rounded-lg bg-muted/20 border border-border/20 flex items-center justify-center hover:bg-muted/40 transition-all cursor-help">
+                      <div className={cn("h-1.5 w-1.5 rounded-full", userInfo?.status === "normal" ? "bg-green-500 animate-pulse" : "bg-muted-foreground/30")} />
+                    </button>
+
+                    {showUserPopover && userInfo && (
+                      <div className="absolute bottom-full right-0 mb-3 w-[220px] p-4 rounded-xl border border-border/40 bg-card/95 backdrop-blur-xl shadow-2xl animate-in fade-in slide-in-from-bottom-2 duration-200">
+                        <header className="mb-3 text-[10px] font-bold text-muted-foreground/40 uppercase tracking-widest">个人账户信息</header>
+                        <div className="space-y-3">
+                          <div className="flex flex-col gap-0.5">
+                            <div className="flex items-end gap-1.5">
+                              <span className="text-[18px] font-bold tracking-tight text-primary">¥{parseFloat(userInfo.totalBalance).toFixed(2)}</span>
+                              <span className="text-[9px] text-muted-foreground font-mono mb-1">元</span>
+                            </div>
+                            <div className="flex justify-between items-center text-[10px] text-muted-foreground/60 font-medium"><span>当前可用余额</span><span className="text-[9px]">按量付费</span></div>
+                          </div>
+                          <div className="h-1 w-full bg-muted/40 rounded-full overflow-hidden">
+                            <div className="h-full bg-primary/60 rounded-full" style={{ width: `${Math.min(100, (parseFloat(userInfo.chargeBalance) / parseFloat(userInfo.totalBalance)) * 100)}%` }} />
+                          </div>
+                          <div className="grid grid-cols-2 gap-2 pt-1">
+                            <div className="flex flex-col border-l border-border/20 pl-2"><span className="text-[9px] text-muted-foreground/40 uppercase">充值</span><span className="text-[11px] font-mono">¥{userInfo.chargeBalance}</span></div>
+                            <div className="flex flex-col border-l border-border/20 pl-2"><span className="text-[9px] text-muted-foreground/40 uppercase">状态</span><span className="text-[11px] font-mono text-green-500/70">正常</span></div>
+                          </div>
+                        </div>
+                        <footer className="mt-4 pt-3 border-t border-border/10 flex items-center justify-between"><span className="text-[9px] text-muted-foreground/30 italic">SiliconFlow 动力驱动</span><Coins size={10} className="text-primary/20" /></footer>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </ResizablePanel>
+
+          <ResizableHandle withHandle className="hover:bg-primary/40 bg-border/20" />
+
+          {/* 闁告瑥鍘栭弲? 闁告瑦鍨归獮鍥儗閵夈劎妲曢幖?*/}
+          <ResizablePanel defaultSize={22} minSize={15} className="flex flex-col bg-card/30 backdrop-blur-sm border-l border-border/30">
+            <header className="h-11 flex items-center justify-between px-5 border-b border-border/30 bg-muted/20">
+              <span className="text-[10px] font-black tracking-widest text-muted-foreground/60 uppercase">逆向成果集</span>
+              <Button variant="ghost" size="icon" className="h-6 w-6 text-muted-foreground/30 hover:text-primary" onClick={loadMemories}><Database size={12} /></Button>
+            </header>
+            <ScrollArea className="flex-1 px-1">
+              <div className="p-6 space-y-10">
+                {memories.length > 0 ? (
+                  Object.entries(groupByCategory(memories)).map(([category, items]) => (
+                    <section key={category}>
+                      <h4 className="flex items-center gap-2 text-[10px] font-bold text-primary mb-5 uppercase tracking-widest opacity-80"><Activity size={12} /> {getCategoryLabel(category)}</h4>
+                      <div className="space-y-4">
+                        {(items as any[]).map((entry: any) => (
+                          <ArtifactCard key={entry.id} title={truncateStr(entry.content, 40)} subtitle={entry.category} discovery={entry.metadata || entry.created_at || ""} status="detected" />
+                        ))}
+                      </div>
+                    </section>
+                  ))
+                ) : (
+                  <div className="rounded-xl border border-border/40 p-6 bg-muted/20 text-center">
+                    <p className="text-[11px] text-muted-foreground/40 leading-relaxed">
+                      该线程暂无分析结果。<br />
+                      Agent 记录的关键发现将显示在这里。
+                    </p>
+                  </div>
+                )}
+              </div>
+            </ScrollArea>
+          </ResizablePanel>
+        </ResizablePanelGroup>
+      </div>
+    </div>
+  );
+}
+
+// Helpers
+function groupByCategory(entries: any[]): Record<string, any[]> {
+  const groups: Record<string, any[]> = {};
+  for (const entry of entries) {
+    const cat = entry.category || "other";
+    if (!groups[cat]) groups[cat] = [];
+    groups[cat].push(entry);
+  }
+  return groups;
+}
+
+function getCategoryLabel(category: string): string {
+  const map: Record<string, string> = {
+    crypto: "加密分析", protocol: "协议逆向", hook_point: "Hook 点", class_map: "类映射", key_finding: "关键发现", other: "其他发现"
+  };
+  return map[category] || `成果: ${category}`;
+}
+
+function truncateStr(s: string, maxLen: number): string {
+  if (!s) return "";
+  return s.length > maxLen ? s.slice(0, maxLen) + "..." : s;
+}
+
+function ArtifactCard({ title, subtitle, discovery, status }: { title: string; subtitle: string; discovery: string; status: "detected" | "pending" }) {
+  return (
+    <div className="group cursor-pointer rounded-xl border border-border/40 p-4 transition-all hover:border-primary/30 hover:bg-muted/40 shadow-sm">
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-[13px] font-bold text-foreground/80 group-hover:text-primary transition-colors">{title}</span>
+        <div className={cn("h-1.5 w-1.5 rounded-full", status === "detected" ? "bg-green-500" : "bg-primary animate-pulse")} />
+      </div>
+      <p className="text-[10px] text-muted-foreground mb-3 opacity-60">{subtitle}</p>
+      <div className="text-[10px] text-muted-foreground font-mono bg-muted/30 px-2 py-1 rounded-[4px] border border-border/10 break-all">{discovery}</div>
+    </div>
+  );
+}
+
