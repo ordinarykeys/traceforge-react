@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 /**
- * The standard interface for an Agent Tool in TraceForge.
+ * The standard interface for an Agent Tool in Lumo Coding.
  * Inspired by Claude Code's Tool architecture.
  */
 export interface Tool<P extends z.ZodTypeAny = z.ZodTypeAny, R = any> {
@@ -30,14 +30,14 @@ export interface Tool<P extends z.ZodTypeAny = z.ZodTypeAny, R = any> {
   /**
    * Whether this tool is read-only (safe to run concurrently).
    * Read-only tools: file reading, memory querying, device listing.
-   * Write tools: shell execution, frida injection, file modification.
+   * Write tools: shell execution and file modification.
    * Default: false (treated as write/side-effect tool).
    */
   isReadOnly?: boolean;
 
   /**
    * Maximum characters for tool output before truncation.
-   * Prevents overly long outputs (e.g., full logcat dump) from blowing up context.
+   * Prevents overly long outputs from blowing up context.
    * Default: 30000
    */
   maxOutputChars?: number;
@@ -78,6 +78,11 @@ export interface ToolContext {
    * Current thread identifier for thread-scoped persistence.
    */
   threadId?: string;
+
+  /**
+   * Current user turn identifier (used for file checkpointing/rewind).
+   */
+  turnId?: string;
 }
 
 /**

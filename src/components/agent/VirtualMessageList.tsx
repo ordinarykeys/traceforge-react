@@ -1,5 +1,6 @@
 import {
   memo,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -55,7 +56,7 @@ const MeasuredItem = memo(function MeasuredItem({
   return <div ref={elementRef}>{children}</div>;
 });
 
-export function VirtualMessageList<T>({
+function VirtualMessageListInner<T>({
   items,
   itemKey,
   renderItem,
@@ -67,21 +68,35 @@ export function VirtualMessageList<T>({
 }: VirtualMessageListProps<T>) {
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
-  const [measuredHeights, setMeasuredHeights] = useState<Record<string, number>>({});
+  const [measuredHeights, setMeasuredHeights] = useState<Map<string, number>>(() => new Map());
+  const scrollRafRef = useRef<number | null>(null);
+  const pendingScrollTopRef = useRef<number>(0);
 
   useEffect(() => {
     const scrollParent = scrollParentRef.current;
     if (!scrollParent) return;
 
     const updateViewport = () => {
-      setViewportHeight(scrollParent.clientHeight);
-      setScrollTop(scrollParent.scrollTop);
+      const nextViewportHeight = scrollParent.clientHeight;
+      const nextScrollTop = scrollParent.scrollTop;
+      setViewportHeight((previous) =>
+        previous === nextViewportHeight ? previous : nextViewportHeight,
+      );
+      setScrollTop((previous) => (previous === nextScrollTop ? previous : nextScrollTop));
     };
 
     updateViewport();
 
     const handleScroll = () => {
-      setScrollTop(scrollParent.scrollTop);
+      pendingScrollTopRef.current = scrollParent.scrollTop;
+      if (scrollRafRef.current !== null) {
+        return;
+      }
+      scrollRafRef.current = window.requestAnimationFrame(() => {
+        scrollRafRef.current = null;
+        const nextTop = pendingScrollTopRef.current;
+        setScrollTop((previous) => (previous === nextTop ? previous : nextTop));
+      });
     };
 
     const resizeObserver = new ResizeObserver(() => {
@@ -91,6 +106,10 @@ export function VirtualMessageList<T>({
     scrollParent.addEventListener("scroll", handleScroll, { passive: true });
 
     return () => {
+      if (scrollRafRef.current !== null) {
+        window.cancelAnimationFrame(scrollRafRef.current);
+        scrollRafRef.current = null;
+      }
       resizeObserver.disconnect();
       scrollParent.removeEventListener("scroll", handleScroll);
     };
@@ -103,19 +122,15 @@ export function VirtualMessageList<T>({
 
   useEffect(() => {
     setMeasuredHeights((previous) => {
-      const next: Record<string, number> = {};
+      const keySet = new Set(itemKeys);
+      const next = new Map(previous);
       let changed = false;
-
-      for (const key of itemKeys) {
-        if (previous[key] !== undefined) {
-          next[key] = previous[key];
+      for (const key of next.keys()) {
+        if (!keySet.has(key)) {
+          next.delete(key);
+          changed = true;
         }
       }
-
-      if (Object.keys(previous).length !== Object.keys(next).length) {
-        changed = true;
-      }
-
       return changed ? next : previous;
     });
   }, [itemKeys]);
@@ -127,11 +142,61 @@ export function VirtualMessageList<T>({
     for (let index = 0; index < items.length; index += 1) {
       offsets[index] = totalHeight;
       const key = itemKeys[index];
-      totalHeight += (key ? measuredHeights[key] : undefined) ?? estimateHeight;
+      totalHeight += (key ? measuredHeights.get(key) : undefined) ?? estimateHeight;
     }
 
     return { offsets, totalHeight };
   }, [estimateHeight, itemKeys, items.length, measuredHeights]);
+
+  const findStartIndex = useCallback(
+    (targetScrollTop: number) => {
+      if (items.length === 0) return 0;
+      let low = 0;
+      let high = items.length - 1;
+      let candidate = items.length;
+
+      while (low <= high) {
+        const mid = (low + high) >> 1;
+        const key = itemKeys[mid];
+        const height = (key ? measuredHeights.get(key) : undefined) ?? estimateHeight;
+        const bottom = layout.offsets[mid] + height;
+        if (bottom >= targetScrollTop) {
+          candidate = mid;
+          high = mid - 1;
+        } else {
+          low = mid + 1;
+        }
+      }
+
+      if (candidate === items.length) {
+        return items.length - 1;
+      }
+      return candidate;
+    },
+    [estimateHeight, itemKeys, items.length, layout.offsets, measuredHeights],
+  );
+
+  const findEndIndex = useCallback(
+    (viewportBottom: number) => {
+      if (items.length === 0) return 0;
+      let low = 0;
+      let high = items.length - 1;
+      let candidate = items.length;
+
+      while (low <= high) {
+        const mid = (low + high) >> 1;
+        if (layout.offsets[mid] >= viewportBottom) {
+          candidate = mid;
+          high = mid - 1;
+        } else {
+          low = mid + 1;
+        }
+      }
+
+      return candidate === items.length ? items.length : candidate;
+    },
+    [items.length, layout.offsets],
+  );
 
   const visibleRange = useMemo(() => {
     if (!enabled || items.length === 0) {
@@ -139,20 +204,8 @@ export function VirtualMessageList<T>({
     }
 
     const viewportBottom = scrollTop + viewportHeight;
-    let start = 0;
-    let end = items.length;
-
-    while (
-      start < items.length &&
-      layout.offsets[start] + (((measuredHeights[itemKeys[start]] ?? estimateHeight))) < scrollTop
-    ) {
-      start += 1;
-    }
-
-    end = start;
-    while (end < items.length && layout.offsets[end] < viewportBottom) {
-      end += 1;
-    }
+    const start = findStartIndex(scrollTop);
+    const end = Math.max(start, findEndIndex(viewportBottom));
 
     return {
       start: Math.max(0, start - overscan),
@@ -160,11 +213,9 @@ export function VirtualMessageList<T>({
     };
   }, [
     enabled,
-    estimateHeight,
-    itemKeys,
+    findEndIndex,
+    findStartIndex,
     items.length,
-    layout.offsets,
-    measuredHeights,
     overscan,
     scrollTop,
     viewportHeight,
@@ -175,7 +226,7 @@ export function VirtualMessageList<T>({
     ? (() => {
         let total = 0;
         for (let index = visibleRange.start; index < visibleRange.end; index += 1) {
-          total += measuredHeights[itemKeys[index]] ?? estimateHeight;
+          total += measuredHeights.get(itemKeys[index] ?? "") ?? estimateHeight;
         }
         return total;
       })()
@@ -184,18 +235,17 @@ export function VirtualMessageList<T>({
     ? Math.max(0, layout.totalHeight - topSpacer - renderedHeight)
     : 0;
 
-  const handleHeightChange = (key: string, height: number) => {
+  const handleHeightChange = useCallback((key: string, height: number) => {
     setMeasuredHeights((previous) => {
       const roundedHeight = Math.ceil(height);
-      if (previous[key] === roundedHeight) {
+      if (previous.get(key) === roundedHeight) {
         return previous;
       }
-      return {
-        ...previous,
-        [key]: roundedHeight,
-      };
+      const next = new Map(previous);
+      next.set(key, roundedHeight);
+      return next;
     });
-  };
+  }, []);
 
   const visibleItems = enabled ? items.slice(visibleRange.start, visibleRange.end) : items;
   const startIndex = enabled ? visibleRange.start : 0;
@@ -216,3 +266,5 @@ export function VirtualMessageList<T>({
     </div>
   );
 }
+
+export const VirtualMessageList = memo(VirtualMessageListInner) as typeof VirtualMessageListInner;

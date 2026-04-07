@@ -1,4 +1,4 @@
-import nobleBlake2Source from '@noble/hashes/blake2.js?raw'
+﻿import nobleBlake2Source from '@noble/hashes/blake2.js?raw'
 import nobleBlake3Source from '@noble/hashes/blake3.js?raw'
 import nobleSha3Source from '@noble/hashes/sha3.js?raw'
 import nobleBlakeHelpersSource from '../vendor/noble-hashes/_blake.js?raw'
@@ -552,38 +552,18 @@ export const generateEasyLanguageCodeWithValues = async (
 
   const runtimeRunner = getEasyLanguageRunner(mergedParams)
   if (!runtimeRunner) {
-    return `; 褰撳墠绠楁硶鏆備笉鏀寔鐢熸垚鏄撹瑷€鑴氭湰
-; 绫诲瀷: ${mergedParams.type}
-; 鐩墠鍏堟敮鎸佸熀浜?CryptoJS 鐨勭畻娉曪紝濡?MD5 / SHA / HMAC / AES / DES / 3DES / RC4 / Rabbit / PBKDF2 / EvpKDF / UTF-16`
+    return `; 当前算法暂不支持生成易语言脚本
+; 类型: ${mergedParams.type}
+; 目前仅支持基于 CryptoJS 的算法，例如 MD5 / SHA / HMAC / AES / DES / 3DES / RC4 / Rabbit / PBKDF2 / EvpKDF / UTF-16`
   }
 
   const runtimeScript = await generateEasyLanguageRuntimeScript(mergedParams)
   if (!runtimeScript) {
-    return `; 褰撳墠绠楁硶鏆備笉鏀寔鐢熸垚鏄撹瑷€鑴氭湰
-; 绫诲瀷: ${mergedParams.type}`
-  }
-
-  return buildEasyLanguageTemplate(runtimeScript, runtimeRunner)
-
-  const runner = getEasyLanguageRunner(mergedParams)
-
-  if (!CRYPTO_JS_TYPES.has(mergedParams.type) && !runner) {
-    return `; 当前算法暂不支持生成易语言脚本
-; 类型: ${mergedParams.type}
-; 目前先支持基于 CryptoJS 的算法，如 MD5 / SHA / HMAC / AES / DES / 3DES / RC4 / Rabbit / PBKDF2 / EvpKDF / UTF-16`
-  }
-
-  /*
-  const bundle = CRYPTO_JS_TYPES.has(mergedParams.type)
-    ? await loadCryptoJsBundle(mergedParams)
-    : ''
-  if (!runner) {
     return `; 当前算法暂不支持生成易语言脚本
 ; 类型: ${mergedParams.type}`
   }
 
-  return buildEasyLanguageTemplate(bundle ? `${bundle}\n\n${runner.script}` : runner.script, runner)
-  */
+  return buildEasyLanguageTemplate(runtimeScript, runtimeRunner)
 }
 
 async function buildScript(params: ScriptBuildParams): Promise<string> {

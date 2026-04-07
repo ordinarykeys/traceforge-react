@@ -1846,7 +1846,7 @@ export const validateBtcAddress = (address: string): { valid: boolean; type: str
       }
     }
     return { valid: false, type: 'Invalid' }
-  } catch (e) {
+  } catch {
     return { valid: false, type: 'Invalid' }
   }
 }

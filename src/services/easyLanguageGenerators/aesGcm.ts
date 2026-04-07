@@ -6,9 +6,9 @@ export const buildAesGcmEasyLanguageRunner = (params: EasyLanguageScriptParams):
   return {
     description: 'WT-JS_AES_GCM',
     parameters: [
-      { name: 'text', comment: '鍙傛暟1' },
-      { name: 'key', comment: '鍙傛暟2' },
-      { name: 'iv', comment: '鍙傛暟3' },
+      { name: 'text', comment: '参数1' },
+      { name: 'key', comment: '参数2' },
+      { name: 'iv', comment: '参数3' },
     ],
     evalExpression: `WT_Run(${quoteParam('text')}, ${quoteParam('key')}, ${quoteParam('iv')})`,
     script: `${EASY_BINARY_HELPERS}

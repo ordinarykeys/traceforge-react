@@ -817,4 +817,4 @@ function WT_Run(text, publicKey) {
   return WT_RsaEncryptLong(text, publicKey);
 }
 
-WScript.Echo(String(WT_Run("abc", "-----BEGIN PUBLIC KEY-----\r\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC9SYrFWkSb+ZRXQeW/afPCna63\r\nR4+HV8RFlz9+RJk5h+eVLLQJwWPa6veEdMHe2Qfw8t5qS6xsKXptH/hFFKaOig/J\r\nvR2/ZBBiRjLijW3PWbT+TEwdKrodePcGbJKWKjmcgE6ACyI3fiOk0XjNyLzy8ER+\r\nMCgA6vDXFTakLP9BcwIDAQAB\r\n-----END PUBLIC KEY-----\r\n")));
+WScript.Echo(String(WT_Run("abc", "-----BEGIN PUBLIC KEY-----\r\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCpEOK7zTV035QhxGNplQSaeKG+\r\nNqJgsSFe6pOwKLPINViGG3y79tNAmy/Mxtp0cNeIavbrQD41+ic/CRn84o0Wwlsa\r\nEawZyisMtlRK5+Qny0xXbq0tfenlx8yL4F2N1V+GZBgOXYbTpXDOZy0DVGy4Yri7\r\nBOJWJEZDgUNHAIAouwIDAQAB\r\n-----END PUBLIC KEY-----\r\n")));

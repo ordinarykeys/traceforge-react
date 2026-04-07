@@ -45,31 +45,31 @@ function Invoke-WtRun {
 
 $unicode = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("5L2g5aW9IFdUIOW3peWFtyAxMjM="))
 $md5Expected = "bd8e860f1d85ebf3b788339ac379e0a3"
-$md5Actual = Invoke-WtRun "D:\\pingfan\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\md5.js" $unicode 'lower32'
+$md5Actual = Invoke-WtRun "C:\\Users\\pingfan\\Desktop\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\md5.js" $unicode 'lower32'
 if ($md5Actual -ne $md5Expected) {
   throw "MD5 mismatch: expected $md5Expected actual $md5Actual"
 }
 
-$aesCipher = Invoke-WtRun "D:\\pingfan\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\aes_encrypt.js" $unicode '0123456789abcdef' '0123456789abcdef'
-$aesPlain = Invoke-WtRun "D:\\pingfan\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\aes_decrypt.js" $aesCipher '0123456789abcdef' '0123456789abcdef'
+$aesCipher = Invoke-WtRun "C:\\Users\\pingfan\\Desktop\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\aes_encrypt.js" $unicode '0123456789abcdef' '0123456789abcdef'
+$aesPlain = Invoke-WtRun "C:\\Users\\pingfan\\Desktop\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\aes_decrypt.js" $aesCipher '0123456789abcdef' '0123456789abcdef'
 if ($aesPlain -ne $unicode) {
   throw "AES roundtrip mismatch: expected $unicode actual $aesPlain"
 }
 
-$utf16Cipher = Invoke-WtRun "D:\\pingfan\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\utf16_encrypt.js" $unicode
-$utf16Plain = Invoke-WtRun "D:\\pingfan\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\utf16_decrypt.js" $utf16Cipher
+$utf16Cipher = Invoke-WtRun "C:\\Users\\pingfan\\Desktop\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\utf16_encrypt.js" $unicode
+$utf16Plain = Invoke-WtRun "C:\\Users\\pingfan\\Desktop\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\utf16_decrypt.js" $utf16Cipher
 if ($utf16Plain -ne $unicode) {
   throw "UTF16 roundtrip mismatch: expected $unicode actual $utf16Plain"
 }
 
-$sm4Cipher = Invoke-WtRun "D:\\pingfan\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\sm4_encrypt.js" $unicode '0123456789abcdef' '0123456789abcdef'
-$sm4Plain = Invoke-WtRun "D:\\pingfan\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\sm4_decrypt.js" $sm4Cipher '0123456789abcdef' '0123456789abcdef'
+$sm4Cipher = Invoke-WtRun "C:\\Users\\pingfan\\Desktop\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\sm4_encrypt.js" $unicode '0123456789abcdef' '0123456789abcdef'
+$sm4Plain = Invoke-WtRun "C:\\Users\\pingfan\\Desktop\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\sm4_decrypt.js" $sm4Cipher '0123456789abcdef' '0123456789abcdef'
 if ($sm4Plain -ne $unicode) {
   throw "SM4 roundtrip mismatch: expected $unicode actual $sm4Plain"
 }
 
-$base64UrlCipher = Invoke-WtRun "D:\\pingfan\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\base64url_encode.js" $unicode
-$base64UrlPlain = Invoke-WtRun "D:\\pingfan\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\base64url_decode.js" $base64UrlCipher
+$base64UrlCipher = Invoke-WtRun "C:\\Users\\pingfan\\Desktop\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\base64url_encode.js" $unicode
+$base64UrlPlain = Invoke-WtRun "C:\\Users\\pingfan\\Desktop\\tools\\traceforge-react\\.tmp-scriptcontrol-smoke\\base64url_decode.js" $base64UrlCipher
 if ($base64UrlPlain -ne $unicode) {
   throw "Base64URL roundtrip mismatch: expected $unicode actual $base64UrlPlain"
 }

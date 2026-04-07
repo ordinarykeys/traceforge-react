@@ -73,13 +73,16 @@ function defaultShouldRetry(error: any): boolean {
   }
 
   // Retry on common server-side transient errors
-  const status = error.status || (error.message?.match(/LLM API 错误: (\d+)/)?.[1]);
-  if (status) {
-    const statusCode = parseInt(status, 10);
+  const statusFromMessage =
+    error?.message?.match(/\b(?:llm api (?:error|\u9519\u8bef)|http(?:\s+status)?)\s*:?\s*(\d{3})\b/i)?.[1] ??
+    error?.message?.match(/\bstatus(?:\s*code)?\s*:?\s*(\d{3})\b/i)?.[1];
+  const status = error?.status ?? statusFromMessage;
+  if (status !== undefined && status !== null) {
+    const statusCode = parseInt(String(status), 10);
     return [429, 500, 502, 503, 504, 529].includes(statusCode);
   }
 
   // Also check error message content
-  const msg = (error.message || "").toLowerCase();
+  const msg = String(error?.message ?? "").toLowerCase();
   return msg.includes("overloaded") || msg.includes("rate limit") || msg.includes("timeout");
 }

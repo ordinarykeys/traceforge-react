@@ -6,9 +6,9 @@ import {
 
 import {
   createRequestDocument,
-  type RequestHistoryEntry,
   type RequestCollection,
   type RequestDocument,
+  type RequestHistoryEntry,
 } from "./requestTypes";
 
 const REQUESTS_STORAGE_KEY = "traceforge.request.tabs";
@@ -18,14 +18,6 @@ const COLLECTIONS_STORAGE_KEY = "traceforge.request.collections";
 const COLLECTIONS_STORAGE_BACKUP_KEY = "traceforge.request.collections.backup";
 const HISTORY_STORAGE_KEY = "traceforge.request.history";
 const HISTORY_STORAGE_BACKUP_KEY = "traceforge.request.history.backup";
-
-const LEGACY_REQUESTS_STORAGE_KEY = "wt-js-next:request-tabs:v1";
-const LEGACY_REQUESTS_STORAGE_BACKUP_KEY = "wt-js-next:request-tabs:v1:backup";
-const LEGACY_ACTIVE_REQUEST_STORAGE_KEY = "wt-js-next:request-active:v1";
-const LEGACY_COLLECTIONS_STORAGE_KEY = "wt-js-next:request-collections:v1";
-const LEGACY_COLLECTIONS_STORAGE_BACKUP_KEY = "wt-js-next:request-collections:v1:backup";
-const LEGACY_HISTORY_STORAGE_KEY = "traceforge.request.history";
-const LEGACY_HISTORY_STORAGE_BACKUP_KEY = "traceforge.request.history.backup";
 
 export type StorageNoticeTone = "info" | "error";
 
@@ -40,6 +32,8 @@ export type RequestWorkspaceState = {
   collections: RequestCollection[];
   activeRequestId: string;
 };
+
+type WorkspaceSnapshotEntries = Record<string, string>;
 
 function isRequestHistoryArray(value: unknown): value is RequestHistoryEntry[] {
   return (
@@ -56,7 +50,25 @@ function isRequestHistoryArray(value: unknown): value is RequestHistoryEntry[] {
   );
 }
 
-type WorkspaceSnapshotEntries = Record<string, string>;
+function isRequestDocumentArray(value: unknown): value is RequestDocument[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((item) => item && typeof item === "object" && "id" in item && "method" in item)
+  );
+}
+
+function isRequestCollectionArray(value: unknown): value is RequestCollection[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((item) => item && typeof item === "object" && "id" in item && "name" in item)
+  );
+}
+
+function hasWindowStorage() {
+  return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
+}
 
 function createDefaultCollection(): RequestCollection {
   const now = Date.now();
@@ -90,71 +102,7 @@ function tryParseStoredValue<T>(
   }
 }
 
-function isRequestDocumentArray(value: unknown): value is RequestDocument[] {
-  return (
-    Array.isArray(value) &&
-    value.length > 0 &&
-    value.every((item) => item && typeof item === "object" && "id" in item && "method" in item)
-  );
-}
-
-function isRequestCollectionArray(value: unknown): value is RequestCollection[] {
-  return (
-    Array.isArray(value) &&
-    value.length > 0 &&
-    value.every((item) => item && typeof item === "object" && "id" in item && "name" in item)
-  );
-}
-
-function hasWindowStorage() {
-  return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
-}
-
-function clearLegacyRequestStorage() {
-  if (!hasWindowStorage()) {
-    return;
-  }
-
-  [
-    LEGACY_REQUESTS_STORAGE_KEY,
-    LEGACY_REQUESTS_STORAGE_BACKUP_KEY,
-    LEGACY_ACTIVE_REQUEST_STORAGE_KEY,
-    LEGACY_COLLECTIONS_STORAGE_KEY,
-    LEGACY_COLLECTIONS_STORAGE_BACKUP_KEY,
-  ].forEach((key) => {
-    window.localStorage.removeItem(key);
-  });
-}
-
-function hasLegacyRequestStorage() {
-  if (!hasWindowStorage()) {
-    return false;
-  }
-
-  return [
-    LEGACY_REQUESTS_STORAGE_KEY,
-    LEGACY_REQUESTS_STORAGE_BACKUP_KEY,
-    LEGACY_ACTIVE_REQUEST_STORAGE_KEY,
-    LEGACY_COLLECTIONS_STORAGE_KEY,
-    LEGACY_COLLECTIONS_STORAGE_BACKUP_KEY,
-  ].some((key) => window.localStorage.getItem(key) !== null);
-}
-
-function loadLegacyHistory(): RequestHistoryEntry[] {
-  if (!hasWindowStorage()) {
-    return [];
-  }
-
-  const direct = window.localStorage.getItem(LEGACY_HISTORY_STORAGE_KEY);
-  const backup = window.localStorage.getItem(LEGACY_HISTORY_STORAGE_BACKUP_KEY);
-  return (
-    (direct ? tryParseStoredValue(direct, isRequestHistoryArray) : null) ??
-    (backup ? tryParseStoredValue(backup, isRequestHistoryArray) : null) ??
-    []
-  );
-}
-
-function loadLegacyWithBackup<T>(
+function loadLocalWithBackup<T>(
   storageKey: string,
   backupKey: string,
   label: string,
@@ -180,7 +128,7 @@ function loadLegacyWithBackup<T>(
       window.localStorage.setItem(storageKey, backupRaw);
       return {
         value: parsedBackup,
-        notice: `${label} restored from legacy backup`,
+        notice: `${label} restored from local backup`,
         tone: "info",
       };
     }
@@ -194,7 +142,7 @@ function loadLegacyWithBackup<T>(
   if (raw || backupRaw) {
     return {
       value: fallback,
-      notice: `${label} legacy cache was corrupted and has been reset`,
+      notice: `${label} cache was corrupted and reset`,
       tone: "error",
     };
   }
@@ -202,30 +150,28 @@ function loadLegacyWithBackup<T>(
   return { value: fallback };
 }
 
-function loadLegacyRequestWorkspaceState(): StorageLoadResult<RequestWorkspaceState> {
+function loadLocalRequestWorkspaceState(): StorageLoadResult<RequestWorkspaceState> {
   const fallbackWorkspace = createDefaultWorkspaceState();
-  const collectionsResult = loadLegacyWithBackup(
-    LEGACY_COLLECTIONS_STORAGE_KEY,
-    LEGACY_COLLECTIONS_STORAGE_BACKUP_KEY,
+  const collectionsResult = loadLocalWithBackup(
+    COLLECTIONS_STORAGE_KEY,
+    COLLECTIONS_STORAGE_BACKUP_KEY,
     "Collections",
     () => fallbackWorkspace.collections,
     isRequestCollectionArray,
   );
-  const fallbackCollectionId = collectionsResult.value[0]?.id ?? fallbackWorkspace.collections[0].id;
-  const requestsResult = loadLegacyWithBackup(
-    LEGACY_REQUESTS_STORAGE_KEY,
-    LEGACY_REQUESTS_STORAGE_BACKUP_KEY,
+  const fallbackCollectionId =
+    collectionsResult.value[0]?.id ?? fallbackWorkspace.collections[0].id;
+  const requestsResult = loadLocalWithBackup(
+    REQUESTS_STORAGE_KEY,
+    REQUESTS_STORAGE_BACKUP_KEY,
     "Requests",
-    () => [
-      createRequestDocument({
-        collectionId: fallbackCollectionId,
-      }),
-    ],
+    () => [createRequestDocument({ collectionId: fallbackCollectionId })],
     isRequestDocumentArray,
   );
+
   const requestIds = new Set(requestsResult.value.map((request) => request.id));
   const storedActiveId = hasWindowStorage()
-    ? window.localStorage.getItem(LEGACY_ACTIVE_REQUEST_STORAGE_KEY)
+    ? window.localStorage.getItem(ACTIVE_REQUEST_STORAGE_KEY)
     : null;
   const activeRequestId =
     storedActiveId && requestIds.has(storedActiveId)
@@ -249,6 +195,54 @@ function loadLegacyRequestWorkspaceState(): StorageLoadResult<RequestWorkspaceSt
           ? "info"
           : undefined,
   };
+}
+
+function saveLocalRequestWorkspaceState(state: RequestWorkspaceState) {
+  if (!hasWindowStorage()) {
+    return;
+  }
+
+  const serializedRequests = JSON.stringify(state.requests);
+  const serializedCollections = JSON.stringify(state.collections);
+  const existingRequests = window.localStorage.getItem(REQUESTS_STORAGE_KEY);
+  const existingCollections = window.localStorage.getItem(COLLECTIONS_STORAGE_KEY);
+
+  window.localStorage.setItem(
+    REQUESTS_STORAGE_BACKUP_KEY,
+    existingRequests ?? serializedRequests,
+  );
+  window.localStorage.setItem(REQUESTS_STORAGE_KEY, serializedRequests);
+  window.localStorage.setItem(
+    COLLECTIONS_STORAGE_BACKUP_KEY,
+    existingCollections ?? serializedCollections,
+  );
+  window.localStorage.setItem(COLLECTIONS_STORAGE_KEY, serializedCollections);
+  window.localStorage.setItem(ACTIVE_REQUEST_STORAGE_KEY, state.activeRequestId);
+}
+
+function loadLocalHistory(): RequestHistoryEntry[] {
+  if (!hasWindowStorage()) {
+    return [];
+  }
+
+  const direct = window.localStorage.getItem(HISTORY_STORAGE_KEY);
+  const backup = window.localStorage.getItem(HISTORY_STORAGE_BACKUP_KEY);
+  return (
+    (direct ? tryParseStoredValue(direct, isRequestHistoryArray) : null) ??
+    (backup ? tryParseStoredValue(backup, isRequestHistoryArray) : null) ??
+    []
+  );
+}
+
+function saveLocalHistory(history: RequestHistoryEntry[]) {
+  if (!hasWindowStorage()) {
+    return;
+  }
+
+  const serialized = JSON.stringify(history);
+  const existingHistory = window.localStorage.getItem(HISTORY_STORAGE_KEY);
+  window.localStorage.setItem(HISTORY_STORAGE_BACKUP_KEY, existingHistory ?? serialized);
+  window.localStorage.setItem(HISTORY_STORAGE_KEY, serialized);
 }
 
 async function persistNativeWorkspaceState(
@@ -298,19 +292,6 @@ async function loadNativeRequestWorkspaceState(): Promise<StorageLoadResult<Requ
   const hasNativeSnapshot = keys.some((key) => typeof entries[key] === "string");
 
   if (!hasNativeSnapshot) {
-    if (hasLegacyRequestStorage()) {
-      const legacyState = loadLegacyRequestWorkspaceState();
-      await persistNativeWorkspaceState(legacyState.value, {});
-      clearLegacyRequestStorage();
-      return {
-        value: legacyState.value,
-        notice: legacyState.notice
-          ? `${legacyState.notice}; legacy cache migrated into install directory`
-          : "Legacy cache migrated into install directory",
-        tone: legacyState.tone ?? "info",
-      };
-    }
-
     const fallback = createDefaultWorkspaceState();
     await persistNativeWorkspaceState(fallback, {});
     return { value: fallback };
@@ -358,11 +339,7 @@ async function loadNativeRequestWorkspaceState(): Promise<StorageLoadResult<Requ
       requestsNotice = "Requests restored from install-directory backup";
       requestsTone = "info";
     } else {
-      requests = [
-        createRequestDocument({
-          collectionId: fallbackCollectionId,
-        }),
-      ];
+      requests = [createRequestDocument({ collectionId: fallbackCollectionId })];
       requestsNotice = "Requests were corrupted and reset to defaults";
       requestsTone = "error";
     }
@@ -381,11 +358,7 @@ async function loadNativeRequestWorkspaceState(): Promise<StorageLoadResult<Requ
     activeRequestId,
   };
 
-  if (
-    !parsedCollections ||
-    !parsedRequests ||
-    (storedActiveId && !requestIds.has(storedActiveId))
-  ) {
+  if (!parsedCollections || !parsedRequests || (storedActiveId && !requestIds.has(storedActiveId))) {
     await persistNativeWorkspaceState(workspaceState, entries);
   }
 
@@ -407,7 +380,7 @@ async function loadNativeRequestWorkspaceState(): Promise<StorageLoadResult<Requ
 
 export async function loadRequestWorkspaceState(): Promise<StorageLoadResult<RequestWorkspaceState>> {
   if (!canUseNativePersistence()) {
-    return loadLegacyRequestWorkspaceState();
+    return loadLocalRequestWorkspaceState();
   }
 
   return loadNativeRequestWorkspaceState();
@@ -415,36 +388,16 @@ export async function loadRequestWorkspaceState(): Promise<StorageLoadResult<Req
 
 export async function saveRequestWorkspaceState(state: RequestWorkspaceState) {
   if (!canUseNativePersistence()) {
-    if (!hasWindowStorage()) {
-      return;
-    }
-
-    const serializedRequests = JSON.stringify(state.requests);
-    const serializedCollections = JSON.stringify(state.collections);
-    const existingRequests = window.localStorage.getItem(LEGACY_REQUESTS_STORAGE_KEY);
-    const existingCollections = window.localStorage.getItem(LEGACY_COLLECTIONS_STORAGE_KEY);
-
-    window.localStorage.setItem(
-      LEGACY_REQUESTS_STORAGE_BACKUP_KEY,
-      existingRequests ?? serializedRequests,
-    );
-    window.localStorage.setItem(LEGACY_REQUESTS_STORAGE_KEY, serializedRequests);
-    window.localStorage.setItem(
-      LEGACY_COLLECTIONS_STORAGE_BACKUP_KEY,
-      existingCollections ?? serializedCollections,
-    );
-    window.localStorage.setItem(LEGACY_COLLECTIONS_STORAGE_KEY, serializedCollections);
-    window.localStorage.setItem(LEGACY_ACTIVE_REQUEST_STORAGE_KEY, state.activeRequestId);
+    saveLocalRequestWorkspaceState(state);
     return;
   }
 
   await persistNativeWorkspaceState(state);
-  clearLegacyRequestStorage();
 }
 
 export async function loadRequestHistory() {
   if (!canUseNativePersistence()) {
-    return loadLegacyHistory();
+    return loadLocalHistory();
   }
 
   const entries = await loadPersistentEntries([HISTORY_STORAGE_KEY, HISTORY_STORAGE_BACKUP_KEY]);
@@ -456,40 +409,16 @@ export async function loadRequestHistory() {
       ? tryParseStoredValue(entries[HISTORY_STORAGE_BACKUP_KEY], isRequestHistoryArray)
       : null);
 
-  if (parsed) {
-    return parsed;
-  }
-
-  const legacy = loadLegacyHistory();
-  if (legacy.length > 0) {
-    await saveRequestHistory(legacy);
-    if (hasWindowStorage()) {
-      window.localStorage.removeItem(LEGACY_HISTORY_STORAGE_KEY);
-      window.localStorage.removeItem(LEGACY_HISTORY_STORAGE_BACKUP_KEY);
-    }
-    return legacy;
-  }
-
-  return [];
+  return parsed ?? [];
 }
 
 export async function saveRequestHistory(history: RequestHistoryEntry[]) {
-  const serialized = JSON.stringify(history);
-
   if (!canUseNativePersistence()) {
-    if (!hasWindowStorage()) {
-      return;
-    }
-
-    const existingHistory = window.localStorage.getItem(LEGACY_HISTORY_STORAGE_KEY);
-    window.localStorage.setItem(
-      LEGACY_HISTORY_STORAGE_BACKUP_KEY,
-      existingHistory ?? serialized,
-    );
-    window.localStorage.setItem(LEGACY_HISTORY_STORAGE_KEY, serialized);
+    saveLocalHistory(history);
     return;
   }
 
+  const serialized = JSON.stringify(history);
   const existingEntries = await loadPersistentEntries([HISTORY_STORAGE_KEY]);
   await savePersistentEntries([
     {
@@ -501,9 +430,4 @@ export async function saveRequestHistory(history: RequestHistoryEntry[]) {
       value: serialized,
     },
   ]);
-
-  if (hasWindowStorage()) {
-    window.localStorage.removeItem(LEGACY_HISTORY_STORAGE_KEY);
-    window.localStorage.removeItem(LEGACY_HISTORY_STORAGE_BACKUP_KEY);
-  }
 }

@@ -39,7 +39,7 @@ export const buildBlakeFamilyEasyLanguageRunner = (
 ): EasyLanguageRunner => {
   return {
     description,
-    parameters: [{ name: 'text', comment: '鍙傛暟1' }],
+    parameters: [{ name: 'text', comment: '参数1' }],
     evalExpression: `WT_Run(${quoteParam('text')})`,
     script: buildBlakeFamilyScript(params, algorithm),
   }

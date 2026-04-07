@@ -158,8 +158,8 @@ export const buildSm2EasyLanguageRunner = (params: EasyLanguageScriptParams): Ea
     return {
       description: 'WT-JS_SM2',
       parameters: [
-        { name: 'text', comment: '鍙傛暟1' },
-        { name: 'publicKey', comment: '鍙傛暟2' },
+        { name: 'text', comment: '参数1' },
+        { name: 'publicKey', comment: '参数2' },
       ],
       evalExpression: `WT_Run(${quoteParam('text')}, ${quoteParam('publicKey')})`,
       script: `${SM2_COMMON_HELPERS}
@@ -173,8 +173,8 @@ function WT_Run(text, publicKey) {
   return {
     description: 'WT-JS_SM2',
     parameters: [
-      { name: 'text', comment: '鍙傛暟1' },
-      { name: 'privateKey', comment: '鍙傛暟2' },
+      { name: 'text', comment: '参数1' },
+      { name: 'privateKey', comment: '参数2' },
     ],
     evalExpression: `WT_Run(${quoteParam('text')}, ${quoteParam('privateKey')})`,
     script: `${SM2_COMMON_HELPERS}
@@ -190,9 +190,9 @@ export const buildSm2SignEasyLanguageRunner = (params: EasyLanguageScriptParams)
     return {
       description: 'WT-JS_SM2_SIGN',
       parameters: [
-        { name: 'text', comment: '鍙傛暟1' },
-        { name: 'privateKey', comment: '鍙傛暟2' },
-        { name: 'userId', comment: '鍙傛暟3' },
+        { name: 'text', comment: '参数1' },
+        { name: 'privateKey', comment: '参数2' },
+        { name: 'userId', comment: '参数3' },
       ],
       evalExpression: `WT_Run(${quoteParam('text')}, ${quoteParam('privateKey')}, ${quoteParam('userId')})`,
       script: `${SM2_COMMON_HELPERS}
@@ -211,10 +211,10 @@ function WT_Run(text, privateKey, userId) {
   return {
     description: 'WT-JS_SM2_SIGN',
     parameters: [
-      { name: 'text', comment: '鍙傛暟1' },
-      { name: 'signature', comment: '鍙傛暟2' },
-      { name: 'publicKey', comment: '鍙傛暟3' },
-      { name: 'userId', comment: '鍙傛暟4' },
+      { name: 'text', comment: '参数1' },
+      { name: 'signature', comment: '参数2' },
+      { name: 'publicKey', comment: '参数3' },
+      { name: 'userId', comment: '参数4' },
     ],
     evalExpression: `WT_Run(${quoteParam('text')}, ${quoteParam('signature')}, ${quoteParam('publicKey')}, ${quoteParam('userId')})`,
     script: `${SM2_COMMON_HELPERS}

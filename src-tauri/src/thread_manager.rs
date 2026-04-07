@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -11,6 +12,76 @@ pub struct ThreadMetadata {
     pub created_at: i64,
     pub last_active: i64,
     pub working_dir: Option<String>,
+    #[serde(default)]
+    pub diagnostics: Option<ThreadDiagnostics>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ThreadRetryDiagnostics {
+  pub fallback_used: i64,
+  pub fallback_suppressed: i64,
+  pub retry_event_count: i64,
+    pub suppression_ratio_pct: i64,
+    #[serde(default)]
+    pub last_suppressed_reason: Option<String>,
+    #[serde(default)]
+    pub last_retry_strategy: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ThreadPermissionRiskDiagnostics {
+    pub critical: i64,
+    pub high_risk: i64,
+    pub interactive: i64,
+    pub path_outside: i64,
+    pub policy: i64,
+    pub scope_notices: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ThreadPermissionRiskProfileDiagnostics {
+    pub reversible: i64,
+    pub mixed: i64,
+    pub hard_to_reverse: i64,
+    pub local: i64,
+    pub workspace: i64,
+    pub shared: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ThreadPermissionDiagnostics {
+    #[serde(default)]
+    pub risk: ThreadPermissionRiskDiagnostics,
+    #[serde(default)]
+    pub profile: ThreadPermissionRiskProfileDiagnostics,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ThreadDiagnosisActivity {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub at: i64,
+    #[serde(default)]
+    pub command_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ThreadDiagnostics {
+    #[serde(default)]
+    pub retry: ThreadRetryDiagnostics,
+    #[serde(default)]
+    pub permission: Option<ThreadPermissionDiagnostics>,
+    #[serde(default)]
+    pub diagnosis_activity: Option<ThreadDiagnosisActivity>,
+    #[serde(default)]
+    pub diagnosis_history: Vec<ThreadDiagnosisActivity>,
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -33,7 +104,27 @@ pub struct ThreadEvent {
     pub at: i64,
 }
 
-fn get_threads_dir() -> Result<PathBuf, String> {
+const THREADS_INDEX_FILE: &str = "thread-index.json";
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct ThreadIndexEntry {
+    id: String,
+    storage_path: String,
+    working_dir: Option<String>,
+    name: String,
+    created_at: i64,
+    last_active: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct ThreadIndexFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    entries: Vec<ThreadIndexEntry>,
+}
+
+fn get_global_threads_dir() -> Result<PathBuf, String> {
     let data_root = get_user_data_root()?;
     let threads_dir = data_root.join("traceforge-react").join("threads");
 
@@ -45,6 +136,64 @@ fn get_threads_dir() -> Result<PathBuf, String> {
     migrate_legacy_threads_if_needed(&threads_dir);
 
     Ok(threads_dir)
+}
+
+fn get_thread_index_path() -> Result<PathBuf, String> {
+    Ok(get_global_threads_dir()?.join(THREADS_INDEX_FILE))
+}
+
+fn load_thread_index() -> Result<HashMap<String, ThreadIndexEntry>, String> {
+    let index_path = get_thread_index_path()?;
+    if !index_path.exists() {
+        return Ok(HashMap::new());
+    }
+    let content = fs::read_to_string(&index_path)
+        .map_err(|e| format!("Failed to read thread index {:?}: {}", index_path, e))?;
+    let parsed = serde_json::from_str::<ThreadIndexFile>(&content)
+        .map_err(|e| format!("Failed to parse thread index {:?}: {}", index_path, e))?;
+    let mut map = HashMap::new();
+    for entry in parsed.entries {
+        map.insert(entry.id.clone(), entry);
+    }
+    Ok(map)
+}
+
+fn save_thread_index(index: &HashMap<String, ThreadIndexEntry>) -> Result<(), String> {
+    let index_path = get_thread_index_path()?;
+    let mut entries: Vec<ThreadIndexEntry> = index.values().cloned().collect();
+    entries.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+    let payload = ThreadIndexFile {
+        version: 1,
+        entries,
+    };
+    let json = serde_json::to_string_pretty(&payload)
+        .map_err(|e| format!("Failed to serialize thread index: {}", e))?;
+    write_atomic(&index_path, &json)
+}
+
+fn get_workspace_threads_dir(working_dir: &str) -> PathBuf {
+    Path::new(working_dir)
+        .join(".traceforge")
+        .join("threads")
+}
+
+fn resolve_target_thread_file_path(id: &str, working_dir: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(dir) = working_dir {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            let target_dir = get_workspace_threads_dir(trimmed);
+            if !target_dir.exists() {
+                fs::create_dir_all(&target_dir).map_err(|e| {
+                    format!(
+                        "Failed to create workspace thread directory {:?}: {}",
+                        target_dir, e
+                    )
+                })?;
+            }
+            return Ok(target_dir.join(format!("{}.json", id)));
+        }
+    }
+    Ok(get_global_threads_dir()?.join(format!("{}.json", id)))
 }
 
 fn get_user_data_root() -> Result<PathBuf, String> {
@@ -128,7 +277,14 @@ fn migrate_legacy_threads_if_needed(new_threads_dir: &PathBuf) {
 }
 
 fn get_thread_file_path(id: &str) -> Result<PathBuf, String> {
-    let primary = get_threads_dir()?.join(format!("{}.json", id));
+    let index = load_thread_index().unwrap_or_default();
+    if let Some(entry) = index.get(id) {
+        let indexed_path = PathBuf::from(&entry.storage_path);
+        if indexed_path.exists() {
+            return Ok(indexed_path);
+        }
+    }
+    let primary = get_global_threads_dir()?.join(format!("{}.json", id));
     if primary.exists() {
         return Ok(primary);
     }
@@ -276,10 +432,43 @@ fn normalize_thread_data(mut data: ThreadData) -> ThreadData {
 
 #[tauri::command]
 pub fn list_threads() -> Result<Vec<ThreadMetadata>, String> {
-    let threads_dir = get_threads_dir()?;
+    let mut index = load_thread_index().unwrap_or_default();
     let mut threads = Vec::new();
+    let mut stale_ids = Vec::new();
 
-    for entry in fs::read_dir(threads_dir).map_err(|e| e.to_string())? {
+    // Primary source: index (supports workspace-local storage paths)
+    for (id, entry) in &index {
+        let path = PathBuf::from(&entry.storage_path);
+        if !path.exists() {
+            stale_ids.push(id.clone());
+            continue;
+        }
+
+        let content = match fs::read_to_string(&path) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("[thread_manager] skip unreadable thread file {:?}: {}", path, err);
+                stale_ids.push(id.clone());
+                continue;
+            }
+        };
+
+        match serde_json::from_str::<ThreadData>(&content) {
+            Ok(data) => {
+                let data = normalize_thread_data(data);
+                threads.push(data.metadata);
+            }
+            Err(err) => {
+                eprintln!("[thread_manager] skip invalid thread json {:?}: {}", path, err);
+                stale_ids.push(id.clone());
+            }
+        }
+    }
+
+    // Legacy fallback: global threads directory files that are not indexed yet.
+    let global_dir = get_global_threads_dir()?;
+    let mut index_dirty = false;
+    for entry in fs::read_dir(&global_dir).map_err(|e| e.to_string())? {
         let entry = match entry {
             Ok(v) => v,
             Err(err) => {
@@ -288,25 +477,60 @@ pub fn list_threads() -> Result<Vec<ThreadMetadata>, String> {
             }
         };
         let path = entry.path();
+        if path.file_name().and_then(|s| s.to_str()) == Some(THREADS_INDEX_FILE) {
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
 
-        if path.extension().and_then(|s| s.to_str()) == Some("json") {
-            let content = match fs::read_to_string(&path) {
-                Ok(v) => v,
-                Err(err) => {
-                    eprintln!("[thread_manager] skip unreadable thread file {:?}: {}", path, err);
-                    continue;
-                }
-            };
-            match serde_json::from_str::<ThreadData>(&content) {
-                Ok(data) => {
-                    let data = normalize_thread_data(data);
-                    threads.push(data.metadata)
-                }
-                Err(err) => {
-                    eprintln!("[thread_manager] skip invalid thread json {:?}: {}", path, err);
-                }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if index.contains_key(stem) {
+            continue;
+        }
+
+        let content = match fs::read_to_string(&path) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("[thread_manager] skip unreadable legacy thread {:?}: {}", path, err);
+                continue;
+            }
+        };
+
+        match serde_json::from_str::<ThreadData>(&content) {
+            Ok(data) => {
+                let data = normalize_thread_data(data);
+                index.insert(
+                    data.metadata.id.clone(),
+                    ThreadIndexEntry {
+                        id: data.metadata.id.clone(),
+                        storage_path: path.to_string_lossy().to_string(),
+                        working_dir: data.metadata.working_dir.clone(),
+                        name: data.metadata.name.clone(),
+                        created_at: data.metadata.created_at,
+                        last_active: data.metadata.last_active,
+                    },
+                );
+                index_dirty = true;
+                threads.push(data.metadata);
+            }
+            Err(err) => {
+                eprintln!("[thread_manager] skip invalid legacy thread json {:?}: {}", path, err);
             }
         }
+    }
+
+    if !stale_ids.is_empty() {
+        for id in stale_ids {
+            if index.remove(&id).is_some() {
+                index_dirty = true;
+            }
+        }
+    }
+    if index_dirty {
+        let _ = save_thread_index(&index);
     }
 
     threads.sort_by(|a, b| b.last_active.cmp(&a.last_active));
@@ -332,9 +556,9 @@ pub fn save_thread(
     name: String,
     messages: serde_json::Value,
     working_dir: Option<String>,
+    diagnostics: Option<ThreadDiagnostics>,
 ) -> Result<(), String> {
-    let threads_dir = get_threads_dir()?;
-    let file_path = threads_dir.join(format!("{}.json", id));
+    let target_path = resolve_target_thread_file_path(&id, working_dir.as_deref())?;
     let existing_path = get_thread_file_path(&id)?;
 
     let now = SystemTime::now()
@@ -342,21 +566,23 @@ pub fn save_thread(
         .map_err(|e| e.to_string())?
         .as_millis() as i64;
 
+    let mut created_at = now;
+    let mut existing_diagnostics: Option<ThreadDiagnostics> = None;
+    if existing_path.exists() {
+        let old_content = fs::read_to_string(&existing_path).unwrap_or_default();
+        if let Ok(old_data) = serde_json::from_str::<ThreadData>(&old_content) {
+            created_at = old_data.metadata.created_at;
+            existing_diagnostics = old_data.metadata.diagnostics;
+        }
+    }
+
     let metadata = ThreadMetadata {
         id: id.clone(),
         name,
-        created_at: if existing_path.exists() {
-            let old_content = fs::read_to_string(&existing_path).unwrap_or_default();
-            if let Ok(old_data) = serde_json::from_str::<ThreadData>(&old_content) {
-                old_data.metadata.created_at
-            } else {
-                now
-            }
-        } else {
-            now
-        },
+        created_at,
         last_active: now,
         working_dir,
+        diagnostics: diagnostics.or(existing_diagnostics),
     };
 
     let data = ThreadData {
@@ -367,7 +593,25 @@ pub fn save_thread(
         events: vec![],
     };
     let json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
-    write_atomic(&file_path, &json)?;
+    write_atomic(&target_path, &json)?;
+
+    if existing_path.exists() && existing_path != target_path {
+        let _ = fs::remove_file(&existing_path);
+    }
+
+    let mut index = load_thread_index().unwrap_or_default();
+    index.insert(
+        id.clone(),
+        ThreadIndexEntry {
+            id: id.clone(),
+            storage_path: target_path.to_string_lossy().to_string(),
+            working_dir: data.metadata.working_dir.clone(),
+            name: data.metadata.name.clone(),
+            created_at: data.metadata.created_at,
+            last_active: data.metadata.last_active,
+        },
+    );
+    save_thread_index(&index)?;
 
     Ok(())
 }
@@ -378,6 +622,11 @@ pub fn delete_thread(id: String) -> Result<(), String> {
 
     if file_path.exists() {
         fs::remove_file(file_path).map_err(|e| e.to_string())?;
+    }
+
+    let mut index = load_thread_index().unwrap_or_default();
+    if index.remove(&id).is_some() {
+        let _ = save_thread_index(&index);
     }
 
     Ok(())
@@ -404,6 +653,15 @@ pub fn rename_thread(id: String, new_name: String) -> Result<(), String> {
     let json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
     write_atomic(&file_path, &json)?;
 
+    let mut index = load_thread_index().unwrap_or_default();
+    if let Some(entry) = index.get_mut(&id) {
+        entry.name = data.metadata.name.clone();
+        entry.last_active = data.metadata.last_active;
+        entry.working_dir = data.metadata.working_dir.clone();
+        entry.storage_path = file_path.to_string_lossy().to_string();
+        let _ = save_thread_index(&index);
+    }
+
     Ok(())
 }
 
@@ -413,13 +671,13 @@ pub fn append_thread_events(
     name: String,
     events: Vec<ThreadEvent>,
     working_dir: Option<String>,
+    diagnostics: Option<ThreadDiagnostics>,
 ) -> Result<(), String> {
     if events.is_empty() {
         return Ok(());
     }
 
-    let threads_dir = get_threads_dir()?;
-    let file_path = threads_dir.join(format!("{}.json", id));
+    let target_path = resolve_target_thread_file_path(&id, working_dir.as_deref())?;
     let existing_path = get_thread_file_path(&id)?;
 
     let now = SystemTime::now()
@@ -441,6 +699,7 @@ pub fn append_thread_events(
             created_at: now,
             last_active: now,
             working_dir: working_dir.clone(),
+            diagnostics: diagnostics.clone(),
         },
         messages: serde_json::Value::Array(vec![]),
         schema_version: 2,
@@ -452,6 +711,9 @@ pub fn append_thread_events(
     data.metadata.last_active = now;
     if let Some(wd) = working_dir {
         data.metadata.working_dir = Some(wd);
+    }
+    if let Some(diag) = diagnostics {
+        data.metadata.diagnostics = Some(diag);
     }
     data.schema_version = 2;
     data.events.extend(events);
@@ -466,18 +728,51 @@ pub fn append_thread_events(
     }
 
     let json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
-    write_atomic(&file_path, &json)?;
+    write_atomic(&target_path, &json)?;
+    if existing_path.exists() && existing_path != target_path {
+        let _ = fs::remove_file(&existing_path);
+    }
+
+    let mut index = load_thread_index().unwrap_or_default();
+    index.insert(
+        id.clone(),
+        ThreadIndexEntry {
+            id,
+            storage_path: target_path.to_string_lossy().to_string(),
+            working_dir: data.metadata.working_dir.clone(),
+            name: data.metadata.name.clone(),
+            created_at: data.metadata.created_at,
+            last_active: data.metadata.last_active,
+        },
+    );
+    let _ = save_thread_index(&index);
     Ok(())
 }
 
 #[tauri::command]
-pub fn reveal_threads_dir() -> Result<(), String> {
-    let threads_dir = get_threads_dir()?;
+pub fn reveal_threads_dir(working_dir: Option<String>) -> Result<(), String> {
+    let target_dir = if let Some(dir) = working_dir {
+        let trimmed = dir.trim().to_string();
+        if trimmed.is_empty() {
+            get_global_threads_dir()?
+        } else {
+            let workspace_dir = PathBuf::from(trimmed);
+            if !workspace_dir.exists() {
+                return Err(format!(
+                    "Workspace directory does not exist: {}",
+                    workspace_dir.to_string_lossy()
+                ));
+            }
+            workspace_dir
+        }
+    } else {
+        get_global_threads_dir()?
+    };
     
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("explorer")
-            .arg(threads_dir)
+            .arg(target_dir)
             .spawn()
             .map_err(|e| e.to_string())?;
     }
@@ -485,7 +780,7 @@ pub fn reveal_threads_dir() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
-            .arg(threads_dir)
+            .arg(target_dir)
             .spawn()
             .map_err(|e| e.to_string())?;
     }
@@ -493,7 +788,7 @@ pub fn reveal_threads_dir() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("xdg-open")
-            .arg(threads_dir)
+            .arg(target_dir)
             .spawn()
             .map_err(|e| e.to_string())?;
     }

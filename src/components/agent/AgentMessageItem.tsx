@@ -1,64 +1,103 @@
-import { memo } from "react";
+import { Suspense, lazy, memo } from "react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { AgentStep } from "@/components/agent/AgentStep";
-import MarkdownBlock from "@/components/ui/MarkdownBlock";
 import { useThemeStore } from "@/hooks/useThemeStore";
+import { useLocaleStore } from "@/hooks/useLocaleStore";
+import { translate } from "@/lib/i18n";
 import type { AgentMessage } from "@/lib/agent/QueryEngine";
+
+const LazyMarkdownBlock = lazy(() => import("@/components/ui/MarkdownBlock"));
 
 interface AgentMessageItemProps {
   message: AgentMessage;
   contentSnapshot: string;
   statusSnapshot: string;
   stepsSnapshot: string;
+  previousCallArgsByTool?: Record<string, string>;
+  previousArgsSnapshot?: string;
 }
 
-function AgentMessageItemImpl({ message }: AgentMessageItemProps) {
+function AgentMessageItemImpl({ message, previousCallArgsByTool }: AgentMessageItemProps) {
   const { uiFontSize } = useThemeStore();
+  const { locale } = useLocaleStore();
+  const previousCallArgumentsByTool = new Map<string, string>(
+    Object.entries(previousCallArgsByTool ?? {}),
+  );
+  const isUser = message.role === "user";
+  const messageFontSize = isUser ? uiFontSize + 1.5 : uiFontSize + 0.5;
 
   return (
-    <div className="animate-in fade-in slide-in-from-bottom-3 duration-500">
-      <div className="flex flex-col space-y-4">
-        <div className="flex items-center gap-2">
+    <div
+      className={cn(
+        "animate-in fade-in slide-in-from-bottom-3 duration-500 flex",
+        isUser ? "justify-end" : "justify-start",
+      )}
+    >
+      <div className="flex w-full max-w-[92%] flex-col space-y-3">
+        <div className={cn("flex items-center gap-2", isUser ? "justify-end" : "justify-start")}>
           <span
             className={cn(
-              "font-bold tracking-tight",
-              message.role === "user" ? "text-muted-foreground/60" : "text-primary",
+              "font-medium",
+              isUser ? "text-muted-foreground/80" : "text-foreground/85",
             )}
             style={{ fontSize: `${uiFontSize - 1}px` }}
           >
-            {message.role === "user" ? "任务指令" : "分析助手"}
+            {isUser
+              ? translate(locale, "agent.taskInstruction")
+              : translate(locale, "agent.assistant")}
           </span>
-          {message.role === "assistant" && (
-            <span className="text-[10px] text-muted-foreground/30 font-mono tracking-tighter">
-              Agent::Analytical
-            </span>
+          {message.status === "rejected" && (
+            <Badge variant="outline" className="h-4 text-[8px] px-1 border-amber-500/40 text-amber-600">
+              {translate(locale, "agent.rejected")}
+            </Badge>
           )}
           {message.status === "error" && (
             <Badge variant="destructive" className="h-4 text-[8px] px-1">
-              执行异常
+              {translate(locale, "agent.error")}
             </Badge>
           )}
         </div>
 
-        {message.role === "assistant" && message.steps && message.steps.length > 0 && (
+        {!isUser && message.steps && message.steps.length > 0 && (
           <div className="flex flex-col -space-y-2 pb-2">
-            {message.steps.map((step) => (
-              <AgentStep key={step.id} title={step.title} status={step.status} logs={step.logs} />
-            ))}
+            {message.steps.map((step) => {
+              const toolName = step.toolRender?.toolName;
+              const previousCallArguments = toolName ? previousCallArgumentsByTool.get(toolName) : undefined;
+              if (toolName && step.toolRender?.callArguments) {
+                previousCallArgumentsByTool.set(toolName, step.toolRender.callArguments);
+              }
+              return (
+                <AgentStep
+                  key={step.id}
+                  title={step.title}
+                  status={step.status}
+                  logs={step.logs}
+                  toolRender={step.toolRender}
+                  previousCallArguments={previousCallArguments}
+                />
+              );
+            })}
           </div>
         )}
 
         <div
           className={cn(
             "font-sans transition-colors",
-            message.role === "assistant"
-              ? "text-foreground/90 font-medium"
-              : "text-muted-foreground/90 pl-1 border-l border-border/50",
+            !isUser
+              ? "text-foreground/90 font-normal"
+              : "ml-auto rounded-2xl border border-border/50 bg-muted/55 px-4 py-3 text-foreground/85 font-normal shadow-sm",
           )}
-          style={{ fontSize: `${uiFontSize + 1.5}px` }}
+          style={{ fontSize: `${messageFontSize}px` }}
         >
-          <MarkdownBlock content={message.content} isStreaming={message.status === "running"} />
+          <Suspense
+            fallback={<div className="whitespace-pre-wrap break-words">{message.content}</div>}
+          >
+            <LazyMarkdownBlock
+              content={message.content}
+              isStreaming={message.status === "running"}
+            />
+          </Suspense>
         </div>
       </div>
     </div>
@@ -70,5 +109,6 @@ export const AgentMessageItem = memo(
   (prev, next) =>
     prev.contentSnapshot === next.contentSnapshot &&
     prev.statusSnapshot === next.statusSnapshot &&
-    prev.stepsSnapshot === next.stepsSnapshot,
+    prev.stepsSnapshot === next.stepsSnapshot &&
+    prev.previousArgsSnapshot === next.previousArgsSnapshot,
 );

@@ -163,8 +163,8 @@ export const buildRsaEasyLanguageRunner = (params: EasyLanguageScriptParams): Ea
     return {
       description: 'WT-JS_RSA',
       parameters: [
-        { name: 'text', comment: '鍙傛暟1' },
-        { name: 'publicKey', comment: '鍙傛暟2' },
+        { name: 'text', comment: '参数1' },
+        { name: 'publicKey', comment: '参数2' },
       ],
       evalExpression: `WT_Run(${quoteParam('text')}, ${quoteParam('publicKey')})`,
       script: `${commonHelpers}
@@ -178,8 +178,8 @@ function WT_Run(text, publicKey) {
   return {
     description: 'WT-JS_RSA',
     parameters: [
-      { name: 'text', comment: '鍙傛暟1' },
-      { name: 'privateKey', comment: '鍙傛暟2' },
+      { name: 'text', comment: '参数1' },
+      { name: 'privateKey', comment: '参数2' },
     ],
     evalExpression: `WT_Run(${quoteParam('text')}, ${quoteParam('privateKey')})`,
     script: `${commonHelpers}
@@ -197,8 +197,8 @@ export const buildRsaSignEasyLanguageRunner = (params: EasyLanguageScriptParams)
     return {
       description: 'WT-JS_RSA_SIGN',
       parameters: [
-        { name: 'text', comment: '鍙傛暟1' },
-        { name: 'privateKey', comment: '鍙傛暟2' },
+        { name: 'text', comment: '参数1' },
+        { name: 'privateKey', comment: '参数2' },
       ],
       evalExpression: `WT_Run(${quoteParam('text')}, ${quoteParam('privateKey')})`,
       script: `${commonHelpers}
@@ -215,9 +215,9 @@ function WT_Run(text, privateKey) {
   return {
     description: 'WT-JS_RSA_SIGN',
     parameters: [
-      { name: 'text', comment: '鍙傛暟1' },
-      { name: 'signature', comment: '鍙傛暟2' },
-      { name: 'publicKey', comment: '鍙傛暟3' },
+      { name: 'text', comment: '参数1' },
+      { name: 'signature', comment: '参数2' },
+      { name: 'publicKey', comment: '参数3' },
     ],
     evalExpression: `WT_Run(${quoteParam('text')}, ${quoteParam('signature')}, ${quoteParam('publicKey')})`,
     script: `${commonHelpers}

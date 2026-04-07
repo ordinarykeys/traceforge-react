@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { useEffect } from "react";
-import type { AppLocale } from "@/lib/i18n";
+import { setI18nLocale, type AppLocale } from "@/lib/i18n";
 import {
   canUseNativePersistence,
   loadPersistentEntries,
@@ -22,7 +22,19 @@ function hasWindowStorage() {
 }
 
 function normalizeLocale(value: string | null | undefined): AppLocale {
-  return value === "en-US" ? "en-US" : "zh-CN";
+  if (
+    value === "zh-CN" ||
+    value === "en-US" ||
+    value === "ja-JP" ||
+    value === "ko-KR" ||
+    value === "fr-FR" ||
+    value === "de-DE" ||
+    value === "es-ES" ||
+    value === "ru-RU"
+  ) {
+    return value;
+  }
+  return "zh-CN";
 }
 
 async function persistLocale(locale: AppLocale) {
@@ -65,9 +77,11 @@ const useLocaleStoreBase = create<LocaleState>((set, get) => ({
       return;
     }
     const locale = await loadLocale();
+    setI18nLocale(locale);
     set({ locale, hydrated: true });
   },
   setLocale: (locale) => {
+    setI18nLocale(locale);
     set({ locale });
     void persistLocale(locale);
   },

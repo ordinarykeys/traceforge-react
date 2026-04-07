@@ -72,13 +72,6 @@ export default defineConfig([
 ])
 ```
 
-## Reverse Integrations
+## Lumo Coding
 
-This project also includes bundled reverse-engineering integrations:
-
-- `integrations/hello_js_reverse_skill`
-- `integrations/camoufox-reverse-mcp`
-
-Read setup and usage details in:
-
-- `docs/reverse-integrations.md`
+This repository powers the Lumo Coding desktop app (React + Tauri).

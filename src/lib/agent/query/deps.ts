@@ -15,6 +15,14 @@ export interface LLMCompletionResponse {
     };
     finish_reason?: string | null;
   }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+    };
+  };
 }
 
 export interface CallModelParams {
@@ -24,6 +32,10 @@ export interface CallModelParams {
   messages: unknown[];
   tools: unknown[];
   temperature?: number;
+  maxRetries?: number;
+  retryBaseDelayMs?: number;
+  retryMaxDelayMs?: number;
+  onRetryAttempt?: (attempt: number, error: unknown, nextDelayMs: number) => void;
   signal?: AbortSignal;
 }
 
@@ -40,6 +52,10 @@ export function productionDeps(): QueryDeps {
       messages,
       tools,
       temperature = 0.3,
+      maxRetries = 3,
+      retryBaseDelayMs = 1000,
+      retryMaxDelayMs = 15000,
+      onRetryAttempt,
       signal,
     }) =>
       withRetry(
@@ -66,10 +82,13 @@ export function productionDeps(): QueryDeps {
           return (await res.json()) as LLMCompletionResponse;
         },
         {
-          maxRetries: 3,
+          maxRetries,
+          baseDelay: retryBaseDelayMs,
+          maxDelay: retryMaxDelayMs,
           signal,
-          onRetry: (attempt, err) => {
+          onRetry: (attempt, err, nextDelayMs) => {
             console.warn(`Retry attempt ${attempt} due to:`, err);
+            onRetryAttempt?.(attempt, err, nextDelayMs);
           },
         },
       ),

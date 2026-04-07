@@ -1,3 +1,5 @@
+import { invoke } from "@tauri-apps/api/core";
+
 export type PersistentStateEntry = {
   key: string;
   value: string;
@@ -19,8 +21,7 @@ export function canUseNativePersistence() {
   return Boolean(getHostWindow()?.__TAURI_INTERNALS__);
 }
 
-async function invokeNative<T>(command: string, payload: Record<string, unknown>) {
-  const { invoke } = await import("@tauri-apps/api/core");
+function invokeNative<T>(command: string, payload: Record<string, unknown>) {
   return invoke<T>(command, payload);
 }
 

@@ -6,7 +6,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useLocaleStore } from "@/hooks/useLocaleStore";
 import { translate } from "@/lib/i18n";
-import { Globe } from "lucide-react";
 
 interface LoginViewProps {
   onLogin: (baseUrl: string, apiKey: string) => void;
@@ -23,27 +22,17 @@ export default function LoginView({
   isAuthenticating = false,
   statusText,
 }: LoginViewProps) {
-  const { locale, setLocale } = useLocaleStore();
+  const { locale } = useLocaleStore();
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
 
   const inputStyles =
     "h-12 rounded-lg bg-white border-[#e5e5e8] px-5 text-sm text-[#1a1a1a] transition-all duration-200 shadow-sm focus-visible:ring-1 focus-visible:ring-black/5";
 
-  const effectiveStatusText =
-    statusText || translate(locale, "login.status.connecting");
+  const effectiveStatusText = statusText || translate(locale, "login.status.connecting");
 
   return (
     <div className="flex min-h-screen w-full flex-col items-center overflow-hidden bg-[#f2f2f7] px-6 pb-8 pt-10 animate-in fade-in duration-700">
-      <div className="absolute right-6 top-6 flex items-center gap-2">
-        <button
-          onClick={() => setLocale(locale === "zh-CN" ? "en-US" : "zh-CN")}
-          className="flex items-center gap-1.5 rounded-full border border-black/5 bg-white px-3 py-1.5 text-[11px] font-bold text-[#1a1a1a] shadow-sm transition-all hover:bg-[#fafafa] active:scale-95"
-        >
-          <Globe size={12} className="opacity-60" />
-          <span>{locale === "zh-CN" ? "English" : "中文"}</span>
-        </button>
-      </div>
       <div className="flex w-full max-w-[380px] flex-col items-center space-y-8">
         <div className="flex flex-col items-center space-y-4">
           <TraceForgeLogo size={70} />
@@ -118,9 +107,7 @@ export default function LoginView({
               disabled={isAuthenticating}
               onClick={() => onLogin(baseUrl, apiKey)}
             >
-              {isAuthenticating
-                ? effectiveStatusText
-                : translate(locale, "common.continue")}
+              {isAuthenticating ? effectiveStatusText : translate(locale, "common.continue")}
             </Button>
           </div>
         </div>

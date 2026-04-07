@@ -691,4 +691,4 @@ function WT_Run(text, publicKey) {
   return sm2.doEncrypt(String(text), WT_Sm2NormalizePublicKey(publicKey), 0);
 }
 
-WScript.Echo(String(WT_Run("Hello <>&\"' 123", "0410c5125564b809846d331548a06ccfd8e13a6fe57b57c15ec69cc1f6a16ff0250934ce3a7cc735715bcbb5768a5e2a1ca8837be1d50363f48c8b06dd0acd401a")));
+WScript.Echo(String(WT_Run("Hello <>&\"' 123", "049e4b6474bd36ea03dddbeeeeba8977cafcff1c1849f42b3653f6d6044bda2bef62bf21c8182e95b43d466a35d87a94d51bd509b0a2b4c57143793eabd2dd98c9")));

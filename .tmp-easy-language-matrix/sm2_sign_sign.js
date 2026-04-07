@@ -696,4 +696,4 @@ function WT_Run(text, privateKey, userId) {
   return WT_Sm2RawToDer(rawSignature);
 }
 
-WScript.Echo(String(WT_Run("Hello <>&\"' 123", "4e98de23792445db6f97a3792b2ca3c48d4ea9ed6aef253bc82ba5894144dae3", "1234567812345678")));
+WScript.Echo(String(WT_Run("Hello <>&\"' 123", "4e745abb26e8807ca3db0b9797bdda32c10a9d5f7ec422f28e3c0de49380474c", "1234567812345678")));

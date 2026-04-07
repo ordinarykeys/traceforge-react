@@ -1,4 +1,9 @@
 import type { Tool } from "../types";
+import type {
+  PermissionBlastRadiusLevel,
+  PermissionReversibilityLevel,
+  PermissionRiskClass,
+} from "../query/events";
 
 export type ToolPermissionMode = "default" | "full_access";
 export type PermissionBehavior = "allow" | "ask" | "deny";
@@ -35,8 +40,15 @@ export interface PermissionSuggestion {
 export interface PermissionDecision {
   behavior: PermissionBehavior;
   reason: string;
+  riskClass?: PermissionRiskClass;
   matchedRuleId?: string;
   suggestions?: PermissionSuggestion[];
+}
+
+export interface PermissionRiskProfile {
+  riskClass?: PermissionRiskClass;
+  reversibility: PermissionReversibilityLevel;
+  blastRadius: PermissionBlastRadiusLevel;
 }
 
 interface PermissionCheckInput {
@@ -73,16 +85,41 @@ const READ_ONLY_COMMANDS = new Set([
   "tree",
 ]);
 const READ_ONLY_GIT_SUBCOMMANDS = new Set(["status", "log", "diff", "show", "branch", "rev-parse"]);
-const HARD_BLOCK_SHELL_PATTERNS: RegExp[] = [
-  /\brm\s+-rf\b/i,
-  /\bdel\s+\/f\b/i,
+const INTERACTIVE_COMMANDS = new Set([
+  "vim",
+  "vi",
+  "nano",
+  "top",
+  "htop",
+  "less",
+  "more",
+  "watch",
+  "powershell",
+  "pwsh",
+  "cmd",
+]);
+const CRITICAL_HARD_BLOCK_SHELL_PATTERNS: RegExp[] = [
   /\bformat\s+[a-z]:/i,
+  /\bdiskpart\b/i,
   /\bmkfs\b/i,
   /\bdd\b[^\n]*\bof=/i,
-  /\bshutdown\b/i,
   /\breg\s+delete\b/i,
-  /\bremove-item\b[^\n]*-recurse\b/i,
   /\bfsutil\b/i,
+];
+const HIGH_RISK_CONFIRM_SHELL_PATTERNS: RegExp[] = [
+  /\brm\s+-rf\b/i,
+  /\bremove-item\b[^\n]*-recurse\b[^\n]*-force\b/i,
+  /\brmdir\b[^\n]*\s\/s\b[^\n]*\s\/q\b/i,
+  /\b(del|erase)\b[^\n]*\s\/f\b/i,
+  /\bshutdown\b/i,
+  /\bgit\s+reset\s+--hard\b/i,
+  /\bgit\s+push\b[^\n]*(--force-with-lease|--force|-f)\b/i,
+  /\bgit\s+checkout\s+--\b/i,
+  /\bgit\s+branch\s+-D\b/i,
+  /\bgit\s+clean\b[^\n]*\s-f\b/i,
+  /\bgit\s+stash\s+(drop|clear)\b/i,
+  /\bdrop\s+(database|table)\b/i,
+  /\btruncate\s+table\b/i,
 ];
 
 function normalizeText(value: string): string {
@@ -91,6 +128,13 @@ function normalizeText(value: string): string {
 
 function normalizePath(path: string): string {
   return path.replace(/\\/g, "/").replace(/\/+/g, "/").trim().toLowerCase();
+}
+
+function isAbsolutePathLike(path: string): boolean {
+  const value = path.trim();
+  if (!value) return false;
+  if (value.startsWith("/") || value.startsWith("\\\\")) return true;
+  return /^[a-zA-Z]:[\\/]/.test(value);
 }
 
 function stripQuotes(token: string): string {
@@ -221,8 +265,87 @@ function getShellCommandLine(input: unknown): string {
   return [cmd, ...args].join(" ").trim();
 }
 
-function shellLooksHardDangerous(commandLine: string): boolean {
-  return HARD_BLOCK_SHELL_PATTERNS.some((p) => p.test(commandLine));
+function shellLooksCriticalHardDangerous(commandLine: string): boolean {
+  return CRITICAL_HARD_BLOCK_SHELL_PATTERNS.some((p) => p.test(commandLine));
+}
+
+function shellLooksHighRiskMutation(commandLine: string): boolean {
+  return HIGH_RISK_CONFIRM_SHELL_PATTERNS.some((pattern) => pattern.test(commandLine));
+}
+
+export function getPermissionRiskProfile(riskClass: PermissionRiskClass | undefined): PermissionRiskProfile {
+  switch (riskClass) {
+    case "critical":
+    case "high_risk":
+      return {
+        riskClass,
+        reversibility: "hard_to_reverse",
+        blastRadius: "shared",
+      };
+    case "interactive":
+      return {
+        riskClass,
+        reversibility: "mixed",
+        blastRadius: "workspace",
+      };
+    case "path_outside":
+      return {
+        riskClass,
+        reversibility: "mixed",
+        blastRadius: "shared",
+      };
+    case "policy":
+    default:
+      return {
+        riskClass,
+        reversibility: "reversible",
+        blastRadius: "local",
+      };
+  }
+}
+
+function shellLooksInteractive(commandLine: string): boolean {
+  const segments = splitCompoundShell(commandLine);
+  if (segments.length === 0) return false;
+
+  return segments.some((segment) => {
+    const tokens = unwrapShellWrappers(tokenizeCommandLine(segment));
+    if (tokens.length === 0) return false;
+    const command = stripQuotes(tokens[0]).toLowerCase();
+    if (!INTERACTIVE_COMMANDS.has(command)) return false;
+
+    if (command === "powershell" || command === "pwsh") {
+      const hasNonInteractiveSwitch = tokens.some((token) =>
+        ["-command", "-c", "-file", "-encodedcommand"].includes(stripQuotes(token).toLowerCase()),
+      );
+      return !hasNonInteractiveSwitch;
+    }
+
+    if (command === "cmd") {
+      return !tokens.some((token) => ["/c", "/k"].includes(stripQuotes(token).toLowerCase()));
+    }
+
+    return true;
+  });
+}
+
+function shellReferencesParentTraversal(commandLine: string): boolean {
+  return /(^|[\s"'`])\.\.(?:[\\/]|$)/.test(commandLine);
+}
+
+function extractShellPathCandidates(commandLine: string): string[] {
+  const tokens = tokenizeCommandLine(commandLine).map(stripQuotes);
+  const out = new Set<string>();
+
+  for (const token of tokens) {
+    const trimmed = token.trim();
+    if (!trimmed || trimmed.startsWith("-")) continue;
+    if (/[|;&><]/.test(trimmed)) continue;
+    if (!/[\\/]/.test(trimmed) && !/^[a-zA-Z]:/.test(trimmed)) continue;
+    out.add(trimmed);
+  }
+
+  return [...out];
 }
 
 function shellSegmentIsReadOnly(segment: string): boolean {
@@ -277,6 +400,10 @@ function getAllowedRoots(params: PermissionCheckInput): string[] {
 
 function isPathWithinRoots(path: string, roots: string[]): boolean {
   if (roots.length === 0) return true;
+  if (!isAbsolutePathLike(path)) {
+    // Relative paths are treated as workspace-relative.
+    return true;
+  }
   const current = normalizePath(path);
   return roots.some((root) => current === root || current.startsWith(`${root}/`));
 }
@@ -323,12 +450,24 @@ function buildShellSuggestions(params: PermissionCheckInput): PermissionSuggesti
   const first = segments[0] ?? line;
   const prefixTokens = tokenizeCommandLine(first).slice(0, 2).map(stripQuotes);
   const prefix = prefixTokens.join(" ").trim();
+  const linePreview = line.length > 96 ? `${line.slice(0, 96)}...` : line;
 
   if (!prefix) {
     return [];
   }
 
   return [
+    {
+      type: "allow_command_prefix",
+      summary: `Allow this exact shell command in default mode: "${linePreview}"`,
+      draft: {
+        tool: "shell",
+        behavior: "allow",
+        mode: "default",
+        matcher: { type: "exact_command", value: line },
+        description: `Allow exact shell command: ${line}`,
+      },
+    },
     {
       type: "allow_command_prefix",
       summary: `Allow future shell commands starting with "${prefix}" in default mode`,
@@ -357,20 +496,32 @@ function buildPathSuggestion(params: PermissionCheckInput, path: string): Permis
   };
 }
 
+function buildToolSuggestion(
+  params: PermissionCheckInput,
+  summary?: string,
+  description?: string,
+): PermissionSuggestion {
+  return {
+    type: "allow_tool",
+    summary: summary ?? `Allow tool "${params.tool.name}" in default mode`,
+    draft: {
+      tool: params.tool.name,
+      behavior: "allow",
+      mode: "default",
+      matcher: { type: "tool_only" },
+      description: description ?? `Allow tool: ${params.tool.name}`,
+    },
+  };
+}
+
 export function decideToolPermission(params: PermissionCheckInput): PermissionDecision {
   const denyRule = params.rules.find((rule) => rule.behavior === "deny" && matchesRule(rule, params));
   if (denyRule) {
     return {
       behavior: "deny",
       reason: `Permission denied by rule "${denyRule.id}".`,
+      riskClass: "policy",
       matchedRuleId: denyRule.id,
-    };
-  }
-
-  if (params.mode === "full_access") {
-    return {
-      behavior: "allow",
-      reason: "Full access mode enabled.",
     };
   }
 
@@ -383,6 +534,25 @@ export function decideToolPermission(params: PermissionCheckInput): PermissionDe
     };
   }
 
+  if (params.tool.name === "shell") {
+    const line = getShellCommandLine(params.input);
+    if (shellLooksInteractive(line)) {
+      return {
+        behavior: "ask",
+        reason: "Interactive shell command detected. Explicit confirmation required to avoid hanging UI sessions.",
+        riskClass: "interactive",
+        suggestions: buildShellSuggestions(params),
+      };
+    }
+  }
+
+  if (params.mode === "full_access") {
+    return {
+      behavior: "allow",
+      reason: "Full access mode enabled.",
+    };
+  }
+
   if (ALWAYS_ALLOWED_MUTATING_TOOLS.has(params.tool.name)) {
     return {
       behavior: "allow",
@@ -390,13 +560,29 @@ export function decideToolPermission(params: PermissionCheckInput): PermissionDe
     };
   }
 
+  const roots = getAllowedRoots(params);
+  if (roots.length === 0) {
+    return {
+      behavior: "ask",
+      reason: "No workspace is currently bound. Confirm this action before running tools outside a scoped project.",
+      riskClass: "path_outside",
+      suggestions: [
+        buildToolSuggestion(
+          params,
+          `Allow tool "${params.tool.name}" when no workspace is bound`,
+          `Allow ${params.tool.name} without workspace scope`,
+        ),
+      ],
+    };
+  }
+
   const primaryPath = getPrimaryPath(params.tool.name, params.input);
   if (primaryPath) {
-    const roots = getAllowedRoots(params);
     if (!isPathWithinRoots(primaryPath, roots)) {
       return {
         behavior: "ask",
         reason: `Path "${primaryPath}" is outside current workspace boundaries.`,
+        riskClass: "path_outside",
         suggestions: [buildPathSuggestion(params, primaryPath)],
       };
     }
@@ -404,10 +590,42 @@ export function decideToolPermission(params: PermissionCheckInput): PermissionDe
 
   if (params.tool.name === "shell") {
     const line = getShellCommandLine(params.input);
-    if (shellLooksHardDangerous(line)) {
+    const pathCandidates = extractShellPathCandidates(line);
+    const outsidePath = pathCandidates.find((candidate) => !isPathWithinRoots(candidate, roots));
+    if (outsidePath) {
+      return {
+        behavior: "ask",
+        reason: `Shell command references path outside workspace boundaries: "${outsidePath}".`,
+        riskClass: "path_outside",
+        suggestions: [...buildShellSuggestions(params), buildPathSuggestion(params, outsidePath)],
+      };
+    }
+    if (shellReferencesParentTraversal(line)) {
+      return {
+        behavior: "ask",
+        reason:
+          "Shell command includes parent-directory traversal ('..'). Confirm before continuing to avoid escaping workspace boundaries.",
+        riskClass: "path_outside",
+        suggestions: buildShellSuggestions(params),
+      };
+    }
+
+    if (shellLooksCriticalHardDangerous(line)) {
       return {
         behavior: "deny",
-        reason: "Hard-blocked dangerous shell command.",
+        reason:
+          "Hard-blocked critical shell command detected (format / diskpart / mkfs / dd of= / reg delete / fsutil).",
+        riskClass: "critical",
+      };
+    }
+
+    if (shellLooksHighRiskMutation(line)) {
+      return {
+        behavior: "ask",
+        reason:
+          "High-risk shell mutation detected. Explicit confirmation required (rm -rf / recursive force delete / destructive git mutation / DB drop or truncate).",
+        riskClass: "high_risk",
+        suggestions: buildShellSuggestions(params),
       };
     }
 
@@ -423,6 +641,7 @@ export function decideToolPermission(params: PermissionCheckInput): PermissionDe
     return {
       behavior: "ask",
       reason: "Shell command may modify system state. Approval rule required in default mode.",
+      riskClass: "policy",
       suggestions: buildShellSuggestions(params),
     };
   }
@@ -437,19 +656,7 @@ export function decideToolPermission(params: PermissionCheckInput): PermissionDe
   return {
     behavior: "ask",
     reason: `Tool "${params.tool.name}" requires explicit allow rule or full access mode.`,
-    suggestions: [
-      {
-        type: "allow_tool",
-        summary: `Allow tool "${params.tool.name}" in default mode`,
-        draft: {
-          tool: params.tool.name,
-          behavior: "allow",
-          mode: "default",
-          matcher: { type: "tool_only" },
-          description: `Allow tool: ${params.tool.name}`,
-        },
-      },
-    ],
+    riskClass: "policy",
+    suggestions: [buildToolSuggestion(params)],
   };
 }
-

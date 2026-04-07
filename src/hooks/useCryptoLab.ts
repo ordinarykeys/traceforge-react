@@ -14,16 +14,42 @@ import {
   SM4_MODES,
 } from "@/constants/cryptoTypes";
 import {
-  DEFAULT_SCRIPT_PARAMS,
-  generateExportArtifact,
   type ExportArtifact,
-  type ScriptParams,
 } from "@/lib/crypto";
-import { previewCrypto } from "@/lib/cryptoPreview";
+import type { ScriptParams } from "@/services/codeLoader";
 
 import { outputFormatTypes, symmetricTypes } from "@/features/crypto/cryptoLabOptions";
 
 type PreviewAction = "encrypt" | "decrypt" | "swap" | null;
+
+const DEFAULT_SCRIPT_PARAMS: ScriptParams = {
+  type: "md5",
+  subType: "SHA256",
+  outputFormat: "Hex",
+  isEncrypt: true,
+  input: "Hello World",
+  key: "1234567890123456",
+  iv: "1234567890123456",
+  mode: "CBC",
+  padding: "Pkcs7",
+  keyEncoding: "Utf8",
+  ivEncoding: "Utf8",
+  outputEncoding: "Base64",
+  rsaPadding: "OAEP",
+  salt: "salt",
+  keySize: 256,
+  iterations: 1000,
+  costFactor: 16384,
+  blockSizeFactor: 8,
+  parallelism: 1,
+  publicKey: "",
+  privateKey: "",
+  signature: "",
+  sm2CipherMode: 1,
+  userId: "1234567812345678",
+  protobufInputFormat: "hex",
+  xorInitialKey: 0,
+};
 
 const ENCODE_DECODE_TYPES = new Set([
   "base64",
@@ -259,6 +285,7 @@ export function useCryptoLab() {
     setError("");
 
     try {
+      const { generateExportArtifact } = await import("@/lib/crypto");
       const result = await generateExportArtifact({ ...params }, "js_source");
       setArtifact(result);
       setGeneratedCode(result.content);
@@ -274,6 +301,7 @@ export function useCryptoLab() {
   const copyEasyLanguageModule = useCallback(async () => {
     setEasyModuleLoading(true);
     try {
+      const { generateExportArtifact } = await import("@/lib/crypto");
       const result = await generateExportArtifact({ ...params }, "easy_module");
       await navigator.clipboard.writeText(result.content);
     } finally {
@@ -287,6 +315,7 @@ export function useCryptoLab() {
     setPreviewError("");
 
     try {
+      const { previewCrypto } = await import("@/lib/cryptoPreview");
       const result = await previewCrypto({ ...params, isEncrypt: encryptMode });
       setPreviewOutput(result.output);
       setPreviewDetails(result.details);

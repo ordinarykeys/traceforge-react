@@ -1,5 +1,4 @@
-import type { ScriptParams } from "@/services/codeLoader";
-import * as cryptoService from "@/services/crypto";
+﻿import type { ScriptParams } from "@/services/codeLoader";
 import { assertValidCryptoParams } from "@/lib/cryptoValidation";
 
 export type CryptoPreviewResult = {
@@ -7,7 +6,54 @@ export type CryptoPreviewResult = {
   details: Record<string, string>;
 };
 
-const boolText = (value: boolean) => (value ? "是" : "否");
+type PreviewCipherConfig = {
+  mode: string;
+  padding: string;
+  keyEncoding: string;
+  ivEncoding: string;
+  outputEncoding: string;
+  iv: string;
+};
+
+const boolText = (value: boolean) => (value ? "yes" : "no");
+const CORE_TYPES = new Set([
+  "md5",
+  "ripemd160",
+  "sha",
+  "hmac",
+  "aes",
+  "des",
+  "3des",
+  "rc4",
+  "rabbit",
+  "pbkdf2",
+  "evpkdf",
+  "scrypt",
+  "base64",
+  "base64url",
+  "url",
+  "hex",
+  "utf16",
+  "unicode",
+  "html",
+]);
+
+let coreServicePromise: Promise<typeof import("@/services/cryptoCore")> | null = null;
+let legacyServicePromise: Promise<typeof import("@/services/crypto")> | null = null;
+
+async function loadCryptoCore() {
+  if (!coreServicePromise) {
+    coreServicePromise = import("@/services/cryptoCore");
+  }
+  return coreServicePromise;
+}
+
+async function loadCryptoLegacy() {
+  if (!legacyServicePromise) {
+    legacyServicePromise = import("@/services/crypto");
+  }
+  return legacyServicePromise;
+}
 
 export async function previewCrypto(params: ScriptParams): Promise<CryptoPreviewResult> {
   assertValidCryptoParams(params, "preview");
@@ -16,14 +62,17 @@ export async function previewCrypto(params: ScriptParams): Promise<CryptoPreview
   const key = params.key;
   const details: Record<string, string> = {};
   let output = "";
+  const cryptoService: any = CORE_TYPES.has(params.type)
+    ? await loadCryptoCore()
+    : await loadCryptoLegacy();
 
   switch (params.type) {
     case "md5": {
       const result = cryptoService.md5Results(text);
-      details["32位小写"] = result.lower;
-      details["32位大写"] = result.upper;
-      details["16位小写"] = result.lower16;
-      details["16位大写"] = result.upper16;
+      details["md5.lower32"] = result.lower;
+      details["md5.upper32"] = result.upper;
+      details["md5.lower16"] = result.lower16;
+      details["md5.upper16"] = result.upper16;
       output = result.lower;
       break;
     }
@@ -39,7 +88,7 @@ export async function previewCrypto(params: ScriptParams): Promise<CryptoPreview
     case "aes":
     case "des":
     case "3des": {
-      const config: cryptoService.CipherConfig = {
+      const config: PreviewCipherConfig = {
         mode: params.mode,
         padding: params.padding,
         keyEncoding: params.keyEncoding,
@@ -74,7 +123,7 @@ export async function previewCrypto(params: ScriptParams): Promise<CryptoPreview
           params.subType,
           params.outputFormat,
         );
-        details["验证结果"] = valid ? "签名有效" : "签名无效";
+        details["verify.result"] = valid ? "valid" : "invalid";
         output = String(valid);
       }
       break;
@@ -197,7 +246,7 @@ export async function previewCrypto(params: ScriptParams): Promise<CryptoPreview
           params.publicKey,
           params.userId,
         );
-        details["验证结果"] = valid ? "签名有效" : "签名无效";
+        details["verify.result"] = valid ? "valid" : "invalid";
         output = String(valid);
       }
       break;
@@ -231,31 +280,31 @@ export async function previewCrypto(params: ScriptParams): Promise<CryptoPreview
   }
 
   if (params.type === "rsa") {
-    details["Padding"] = params.rsaPadding;
+    details["rsa.padding"] = params.rsaPadding;
   }
 
   if (params.type === "sm2") {
-    details["密文模式"] = params.sm2CipherMode === 1 ? "C1C3C2" : "C1C2C3";
+    details["sm2.cipherMode"] = params.sm2CipherMode === 1 ? "C1C3C2" : "C1C2C3";
   }
 
   if (params.type === "sm4") {
-    details["模式"] = params.mode;
+    details["sm4.mode"] = params.mode;
   }
 
   if (params.type === "xor-chain") {
-    details["初始异或值"] = String(params.xorInitialKey);
+    details["xor.initialKey"] = String(params.xorInitialKey);
   }
 
   if (params.type === "protobuf" && !params.isEncrypt) {
-    details["编码模式"] = "JSON -> Hex";
+    details["protobuf.encoding"] = "JSON -> Hex";
   }
 
   if (params.type === "protobuf" && params.isEncrypt) {
-    details["解析输入"] = params.protobufInputFormat;
+    details["protobuf.inputFormat"] = params.protobufInputFormat;
   }
 
   if (params.type === "rsa-sign" || params.type === "sm2-sign") {
-    details["验证模式"] = boolText(!params.isEncrypt);
+    details["verify.mode"] = boolText(!params.isEncrypt);
   }
 
   return { output, details };

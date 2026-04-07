@@ -1,20 +1,11 @@
 import { createHash, createHmac } from 'node:crypto';
 import { previewCrypto } from '../lib/cryptoPreview.ts';
 import { DEFAULT_SCRIPT_PARAMS } from '../lib/crypto.ts';
-import { SHA_TYPES, HMAC_TYPES, RSA_SIGN_ALGORITHMS } from '../constants/cryptoTypes.ts';
 
 const simpleText = 'abc';
 const sampleText = 'Hello <>&"\' 123';
 const fixedKey = '0123456789abcdef';
 const fixedIv = '0123456789abcdef';
-const protobufHex = '089601120474657374';
-const protobufJson = JSON.stringify({ field_1: 150, field_2: 'test' });
-
-const roundTripTypes = new Set([
-  'aes', 'aes-gcm', 'tea', 'xtea', 'des', '3des', 'rc4', 'rabbit', 'xxtea', 'sm4', 'xor-chain', 'rsa', 'sm2',
-  'base64', 'base64url', 'base58', 'base32', 'base85', 'base91', 'hex', 'url', 'utf16', 'unicode', 'html'
-]);
-
 const expectedHashes: Record<string, string> = {
   md5_lower32: createHash('md5').update(simpleText, 'utf8').digest('hex'),
   sha_sha1: createHash('sha1').update(simpleText, 'utf8').digest('hex'),
@@ -27,7 +18,7 @@ const expectedHashes: Record<string, string> = {
 const normalize = (text: string) => text.toLowerCase().trim();
 
 async function main() {
-  console.log('--- TraceForge React Crypto Parity Test (Legacy Methodology) ---');
+  console.log('--- Lumo Coding Crypto Parity Test (Legacy Methodology) ---');
   let passCount = 0;
   let failCount = 0;
 

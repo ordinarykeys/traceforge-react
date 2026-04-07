@@ -18,7 +18,7 @@ const expectedHashes: Record<string, string> = {
 const normalize = (text: string) => text.toLowerCase().trim();
 
 async function main() {
-  console.log('--- TraceForge React Crypto Parity Test (Legacy Methodology) ---');
+  console.log('--- Lumo Coding Crypto Parity Test (Legacy Methodology) ---');
   let passCount = 0;
   let failCount = 0;
 

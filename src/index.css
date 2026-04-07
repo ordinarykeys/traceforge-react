@@ -314,3 +314,73 @@
   border: 3px solid transparent;
   background-clip: padding-box;
 }
+
+.markdown-content pre,
+.markdown-content pre code,
+.markdown-content code {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+.markdown-content pre code.hljs {
+  background: transparent !important;
+}
+
+.markdown-content .hljs {
+  color: hsl(var(--foreground) / 0.9);
+}
+
+.markdown-content .hljs-comment,
+.markdown-content .hljs-quote {
+  color: hsl(var(--muted-foreground));
+  font-style: italic;
+}
+
+.markdown-content .hljs-keyword,
+.markdown-content .hljs-selector-tag,
+.markdown-content .hljs-literal,
+.markdown-content .hljs-doctag,
+.markdown-content .hljs-title,
+.markdown-content .hljs-section,
+.markdown-content .hljs-selector-id,
+.markdown-content .hljs-selector-class {
+  color: hsl(var(--primary));
+}
+
+.markdown-content .hljs-string,
+.markdown-content .hljs-regexp,
+.markdown-content .hljs-attribute,
+.markdown-content .hljs-addition,
+.markdown-content .hljs-template-tag {
+  color: hsl(145 63% 36%);
+}
+
+.dark .markdown-content .hljs-string,
+.dark .markdown-content .hljs-regexp,
+.dark .markdown-content .hljs-attribute,
+.dark .markdown-content .hljs-addition,
+.dark .markdown-content .hljs-template-tag {
+  color: hsl(145 45% 70%);
+}
+
+.markdown-content .hljs-number,
+.markdown-content .hljs-symbol,
+.markdown-content .hljs-bullet,
+.markdown-content .hljs-variable,
+.markdown-content .hljs-meta,
+.markdown-content .hljs-link {
+  color: hsl(35 90% 42%);
+}
+
+.dark .markdown-content .hljs-number,
+.dark .markdown-content .hljs-symbol,
+.dark .markdown-content .hljs-bullet,
+.dark .markdown-content .hljs-variable,
+.dark .markdown-content .hljs-meta,
+.dark .markdown-content .hljs-link {
+  color: hsl(35 80% 70%);
+}
+
+.markdown-content .hljs-deletion {
+  color: hsl(var(--destructive));
+}

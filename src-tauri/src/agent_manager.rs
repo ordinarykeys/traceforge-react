@@ -1,4 +1,9 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 
 #[derive(Deserialize)]
@@ -7,6 +12,7 @@ pub struct AgentCommandRequest {
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub timeout_ms: Option<u64>,
+    pub command_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -16,6 +22,619 @@ pub struct AgentCommandResponse {
     pub stderr: String,
     pub exit_code: Option<i32>,
     pub interrupted: bool,
+}
+
+#[derive(Deserialize)]
+pub struct AgentGitSnapshotRequest {
+    pub working_dir: String,
+    pub max_commits: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct AgentGitSnapshotResponse {
+    pub success: bool,
+    pub working_dir: String,
+    pub is_git_repo: bool,
+    pub branch: Option<String>,
+    pub default_branch: Option<String>,
+    pub status_short: Vec<String>,
+    pub recent_commits: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct FileCheckpointEntry {
+    seq: u64,
+    turn_id: String,
+    path: String,
+    existed_before: bool,
+    content_base64: Option<String>,
+    created_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct FileCheckpointStore {
+    version: u32,
+    next_seq: u64,
+    entries: Vec<FileCheckpointEntry>,
+}
+
+impl Default for FileCheckpointStore {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            next_seq: 1,
+            entries: vec![],
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AgentRewindRequest {
+    pub working_dir: String,
+    pub thread_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Serialize)]
+pub struct AgentRewindResponse {
+    pub success: bool,
+    pub restored_count: usize,
+    pub removed_count: usize,
+    pub affected_paths: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct AgentRewindPreviewResponse {
+    pub success: bool,
+    pub first_seq: Option<u64>,
+    pub restore_count: usize,
+    pub remove_count: usize,
+    pub affected_paths: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+fn current_timestamp_millis() -> Result<i64, String> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("System clock error: {error}"))?;
+    Ok(duration.as_millis() as i64)
+}
+
+fn sanitize_thread_id(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_path_for_compare(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn normalize_path_for_store(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn canonical_or_self(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn resolve_target_path(working_dir: &Path, candidate: &str) -> PathBuf {
+    let input_path = PathBuf::from(candidate);
+    if input_path.is_absolute() {
+        input_path
+    } else {
+        working_dir.join(input_path)
+    }
+}
+
+fn path_within_workspace(target: &Path, workspace: &Path) -> bool {
+    let workspace_canonical = canonical_or_self(workspace);
+    let workspace_norm = normalize_path_for_compare(&workspace_canonical);
+
+    if let Ok(target_canonical) = fs::canonicalize(target) {
+        let target_norm = normalize_path_for_compare(&target_canonical);
+        return target_norm == workspace_norm || target_norm.starts_with(&(workspace_norm.clone() + "/"));
+    }
+
+    if let Some(parent) = target.parent() {
+        if let Ok(parent_canonical) = fs::canonicalize(parent) {
+            let parent_norm = normalize_path_for_compare(&parent_canonical);
+            return parent_norm == workspace_norm || parent_norm.starts_with(&(workspace_norm.clone() + "/"));
+        }
+    }
+
+    let target_norm = normalize_path_for_compare(target);
+    target_norm == workspace_norm || target_norm.starts_with(&(workspace_norm + "/"))
+}
+
+fn ensure_checkpoint_store_path(working_dir: &Path, thread_id: &str) -> Result<PathBuf, String> {
+    let safe_thread = sanitize_thread_id(thread_id);
+    let dir = working_dir
+        .join(".traceforge")
+        .join("file-history")
+        .join(safe_thread);
+
+    if !dir.exists() {
+        fs::create_dir_all(&dir).map_err(|e| format!("Failed to create checkpoint directory {:?}: {}", dir, e))?;
+    }
+
+    Ok(dir.join("history.json"))
+}
+
+fn load_checkpoint_store(path: &Path) -> Result<FileCheckpointStore, String> {
+    if !path.exists() {
+        return Ok(FileCheckpointStore::default());
+    }
+
+    let raw = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read checkpoint store {:?}: {}", path, e))?;
+
+    serde_json::from_str::<FileCheckpointStore>(&raw)
+        .map_err(|e| format!("Failed to parse checkpoint store {:?}: {}", path, e))
+}
+
+fn save_checkpoint_store(path: &Path, store: &FileCheckpointStore) -> Result<(), String> {
+    let serialized = serde_json::to_string_pretty(store)
+        .map_err(|e| format!("Failed to serialize checkpoint store: {}", e))?;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Invalid checkpoint store path: {:?}", path))?;
+    if !parent.exists() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create checkpoint store parent {:?}: {}", parent, e))?;
+    }
+
+    let tmp_path = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("history"),
+        std::process::id(),
+        current_timestamp_millis().unwrap_or(0)
+    ));
+
+    fs::write(&tmp_path, serialized)
+        .map_err(|e| format!("Failed to write temp checkpoint store {:?}: {}", tmp_path, e))?;
+
+    if let Err(rename_err) = fs::rename(&tmp_path, path) {
+        if path.exists() {
+            fs::remove_file(path)
+                .map_err(|e| format!("Failed to replace old checkpoint store {:?}: {}", path, e))?;
+            fs::rename(&tmp_path, path).map_err(|e| {
+                format!(
+                    "Failed to promote temp checkpoint store {:?} to {:?}: {} (original rename error: {})",
+                    tmp_path, path, e, rename_err
+                )
+            })?;
+        } else {
+            return Err(format!(
+                "Failed to finalize checkpoint store {:?} via {:?}: {}",
+                path, tmp_path, rename_err
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn run_git_output(working_dir: &str, args: &[&str]) -> Result<(bool, String, String), String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(working_dir)
+        .output()
+        .map_err(|e| format!("Failed to execute git {}: {}", args.join(" "), e))?;
+
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    ))
+}
+
+fn parse_default_branch(symbolic_ref: &str) -> Option<String> {
+    let trimmed = symbolic_ref.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.split('/').next_back().map(|s| s.to_string())
+}
+
+fn capture_file_checkpoint_if_needed(
+    path: &str,
+    working_dir: Option<&str>,
+    thread_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(working_dir_raw) = working_dir else {
+        return Ok(());
+    };
+    let Some(thread_id_raw) = thread_id else {
+        return Ok(());
+    };
+    let Some(turn_id_raw) = turn_id else {
+        return Ok(());
+    };
+
+    let working_dir_trimmed = working_dir_raw.trim();
+    let thread_id_trimmed = thread_id_raw.trim();
+    let turn_id_trimmed = turn_id_raw.trim();
+
+    if working_dir_trimmed.is_empty() || thread_id_trimmed.is_empty() || turn_id_trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let workspace = PathBuf::from(working_dir_trimmed);
+    if !workspace.exists() {
+        return Ok(());
+    }
+
+    let target = resolve_target_path(&workspace, path);
+    if !path_within_workspace(&target, &workspace) {
+        return Ok(());
+    }
+
+    let store_path = ensure_checkpoint_store_path(&workspace, thread_id_trimmed)?;
+    let mut store = load_checkpoint_store(&store_path)?;
+    let target_normalized = normalize_path_for_store(&target);
+
+    if store
+        .entries
+        .iter()
+        .any(|entry| entry.turn_id == turn_id_trimmed && entry.path == target_normalized)
+    {
+        return Ok(());
+    }
+
+    let existed_before = target.exists();
+    let content_base64 = if existed_before {
+        let bytes = fs::read(&target)
+            .map_err(|e| format!("Failed to read file for checkpoint {:?}: {}", target, e))?;
+        Some(BASE64_STANDARD.encode(bytes))
+    } else {
+        None
+    };
+
+    let entry = FileCheckpointEntry {
+        seq: store.next_seq,
+        turn_id: turn_id_trimmed.to_string(),
+        path: target_normalized,
+        existed_before,
+        content_base64,
+        created_at: current_timestamp_millis()?,
+    };
+
+    store.next_seq = store.next_seq.saturating_add(1);
+    store.entries.push(entry);
+
+    if store.entries.len() > 5000 {
+        let overflow = store.entries.len() - 5000;
+        store.entries.drain(0..overflow);
+    }
+
+    save_checkpoint_store(&store_path, &store)
+}
+
+#[tauri::command]
+pub async fn invoke_agent_git_snapshot(
+    request: AgentGitSnapshotRequest,
+) -> Result<AgentGitSnapshotResponse, String> {
+    let working_dir = request.working_dir.trim().to_string();
+    if working_dir.is_empty() {
+        return Ok(AgentGitSnapshotResponse {
+            success: false,
+            working_dir,
+            is_git_repo: false,
+            branch: None,
+            default_branch: None,
+            status_short: vec![],
+            recent_commits: vec![],
+            error: Some("working_dir is empty".to_string()),
+        });
+    }
+
+    let probe = run_git_output(&working_dir, &["rev-parse", "--is-inside-work-tree"])?;
+    if !probe.0 || probe.1.trim() != "true" {
+        return Ok(AgentGitSnapshotResponse {
+            success: true,
+            working_dir,
+            is_git_repo: false,
+            branch: None,
+            default_branch: None,
+            status_short: vec![],
+            recent_commits: vec![],
+            error: None,
+        });
+    }
+
+    let branch = run_git_output(&working_dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok()
+        .and_then(|result| if result.0 { Some(result.1) } else { None });
+    let default_branch = run_git_output(&working_dir, &["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .ok()
+        .and_then(|result| if result.0 { parse_default_branch(&result.1) } else { None });
+
+    let status_output = run_git_output(&working_dir, &["status", "--short", "--branch"]);
+    let status_short = status_output
+        .as_ref()
+        .ok()
+        .map(|result| {
+            result
+                .1
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let commit_limit = request.max_commits.unwrap_or(5).clamp(1, 30);
+    let recent_commits = run_git_output(&working_dir, &["log", "--oneline", "-n", &commit_limit.to_string()])
+        .ok()
+        .map(|result| {
+            result
+                .1
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let error = status_output
+        .err()
+        .map(|e| format!("git status failed: {e}"));
+
+    Ok(AgentGitSnapshotResponse {
+        success: true,
+        working_dir,
+        is_git_repo: true,
+        branch,
+        default_branch,
+        status_short,
+        recent_commits,
+        error,
+    })
+}
+
+#[tauri::command]
+pub async fn invoke_agent_rewind_to_turn(
+    request: AgentRewindRequest,
+) -> Result<AgentRewindResponse, String> {
+    let workspace = PathBuf::from(request.working_dir.trim());
+    if !workspace.exists() {
+        return Err(format!(
+            "Working directory does not exist: {}",
+            request.working_dir
+        ));
+    }
+
+    if request.thread_id.trim().is_empty() {
+        return Err("thread_id is empty".to_string());
+    }
+    if request.turn_id.trim().is_empty() {
+        return Err("turn_id is empty".to_string());
+    }
+
+    let store_path = ensure_checkpoint_store_path(&workspace, request.thread_id.trim())?;
+    let mut store = load_checkpoint_store(&store_path)?;
+
+    if store.entries.is_empty() {
+        return Ok(AgentRewindResponse {
+            success: true,
+            restored_count: 0,
+            removed_count: 0,
+            affected_paths: vec![],
+            errors: vec![],
+        });
+    }
+
+    let Some(first_seq_for_turn) = store
+        .entries
+        .iter()
+        .find(|entry| entry.turn_id == request.turn_id)
+        .map(|entry| entry.seq)
+    else {
+        return Err(format!(
+            "No checkpoint entries found for turn_id {}",
+            request.turn_id
+        ));
+    };
+
+    let mut to_restore = store
+        .entries
+        .iter()
+        .filter(|entry| entry.seq >= first_seq_for_turn)
+        .cloned()
+        .collect::<Vec<_>>();
+    to_restore.sort_by(|left, right| right.seq.cmp(&left.seq));
+
+    let mut restored_count = 0usize;
+    let mut removed_count = 0usize;
+    let mut affected = Vec::new();
+    let mut affected_set = HashSet::new();
+    let mut errors = Vec::new();
+
+    for entry in &to_restore {
+        let target = PathBuf::from(&entry.path);
+        if !path_within_workspace(&target, &workspace) {
+            errors.push(format!(
+                "Skipped path outside workspace boundary: {}",
+                entry.path
+            ));
+            continue;
+        }
+
+        if entry.existed_before {
+            let decoded = entry
+                .content_base64
+                .as_deref()
+                .ok_or_else(|| format!("Missing checkpoint content for {}", entry.path))
+                .and_then(|encoded| {
+                    BASE64_STANDARD
+                        .decode(encoded)
+                        .map_err(|e| format!("Failed to decode checkpoint content for {}: {}", entry.path, e))
+                });
+
+            match decoded {
+                Ok(bytes) => {
+                    if let Some(parent) = target.parent() {
+                        if let Err(e) = fs::create_dir_all(parent) {
+                            errors.push(format!("Failed to create parent directory {:?}: {}", parent, e));
+                            continue;
+                        }
+                    }
+                    if let Err(e) = fs::write(&target, bytes) {
+                        errors.push(format!("Failed to restore file {:?}: {}", target, e));
+                        continue;
+                    }
+                    restored_count += 1;
+                }
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            }
+        } else if target.exists() {
+            if let Err(e) = fs::remove_file(&target) {
+                errors.push(format!("Failed to remove file {:?}: {}", target, e));
+                continue;
+            }
+            removed_count += 1;
+        }
+
+        if affected_set.insert(entry.path.clone()) {
+            affected.push(entry.path.clone());
+        }
+    }
+
+    store.entries.retain(|entry| entry.seq < first_seq_for_turn);
+    store.next_seq = store
+        .entries
+        .iter()
+        .map(|entry| entry.seq)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    save_checkpoint_store(&store_path, &store)?;
+
+    Ok(AgentRewindResponse {
+        success: errors.is_empty(),
+        restored_count,
+        removed_count,
+        affected_paths: affected,
+        errors,
+    })
+}
+
+#[tauri::command]
+pub async fn invoke_agent_rewind_preview(
+    request: AgentRewindRequest,
+) -> Result<AgentRewindPreviewResponse, String> {
+    let workspace = PathBuf::from(request.working_dir.trim());
+    if !workspace.exists() {
+        return Err(format!(
+            "Working directory does not exist: {}",
+            request.working_dir
+        ));
+    }
+
+    if request.thread_id.trim().is_empty() {
+        return Err("thread_id is empty".to_string());
+    }
+    if request.turn_id.trim().is_empty() {
+        return Err("turn_id is empty".to_string());
+    }
+
+    let store_path = ensure_checkpoint_store_path(&workspace, request.thread_id.trim())?;
+    let store = load_checkpoint_store(&store_path)?;
+
+    if store.entries.is_empty() {
+        return Ok(AgentRewindPreviewResponse {
+            success: true,
+            first_seq: None,
+            restore_count: 0,
+            remove_count: 0,
+            affected_paths: vec![],
+            warnings: vec![],
+        });
+    }
+
+    let Some(first_seq_for_turn) = store
+        .entries
+        .iter()
+        .find(|entry| entry.turn_id == request.turn_id)
+        .map(|entry| entry.seq)
+    else {
+        return Err(format!(
+            "No checkpoint entries found for turn_id {}",
+            request.turn_id
+        ));
+    };
+
+    let mut to_restore = store
+        .entries
+        .iter()
+        .filter(|entry| entry.seq >= first_seq_for_turn)
+        .cloned()
+        .collect::<Vec<_>>();
+    to_restore.sort_by(|left, right| right.seq.cmp(&left.seq));
+
+    let mut restore_count = 0usize;
+    let mut remove_count = 0usize;
+    let mut affected = Vec::new();
+    let mut affected_set = HashSet::new();
+    let mut warnings = Vec::new();
+
+    for entry in &to_restore {
+        let target = PathBuf::from(&entry.path);
+        if !path_within_workspace(&target, &workspace) {
+            warnings.push(format!(
+                "Skipped path outside workspace boundary: {}",
+                entry.path
+            ));
+            continue;
+        }
+
+        if entry.existed_before {
+            if entry.content_base64.is_none() {
+                warnings.push(format!(
+                    "Missing checkpoint content for {}, restore may fail",
+                    entry.path
+                ));
+            }
+            restore_count += 1;
+        } else if target.exists() {
+            remove_count += 1;
+        }
+
+        if affected_set.insert(entry.path.clone()) {
+            affected.push(entry.path.clone());
+        }
+    }
+
+    Ok(AgentRewindPreviewResponse {
+        success: warnings.is_empty(),
+        first_seq: Some(first_seq_for_turn),
+        restore_count,
+        remove_count,
+        affected_paths: affected,
+        warnings,
+    })
 }
 
 
@@ -32,9 +651,10 @@ pub async fn invoke_agent_task_execution(
     command.args(&request.args);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    let command_id = request.command_id.clone();
 
     // --- Automatic Tool Path Discovery ---
-    // Inject common paths for reverse engineering tools (Frida, ADB, Jadx, Python)
+    // Inject common user-level tool paths (Python scripts, platform tools, local tool dirs)
     let current_path = std::env::var("PATH").unwrap_or_default();
     
     // Get user profile path for AppData
@@ -78,6 +698,7 @@ pub async fn invoke_agent_task_execution(
         .ok_or_else(|| format!("Failed to capture stderr for command {}", request.cmd))?;
 
     let window_clone = window.clone();
+    let command_id_stdout = command_id.clone();
     let mut stdout_lines = Vec::new();
     let mut stderr_lines = Vec::new();
 
@@ -90,7 +711,8 @@ pub async fn invoke_agent_task_execution(
                 "agent-log",
                 serde_json::json!({
                     "source": "stdout",
-                    "line": line
+                    "line": line,
+                    "command_id": command_id_stdout
                 }),
             );
             if lines.len() < 5000 {
@@ -105,6 +727,7 @@ pub async fn invoke_agent_task_execution(
     });
 
     let window_clone = window.clone();
+    let command_id_stderr = command_id.clone();
     // Stream STDERR in a separate task (capped at 2000 lines)
     let stderr_handle = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
@@ -114,7 +737,8 @@ pub async fn invoke_agent_task_execution(
                 "agent-log",
                 serde_json::json!({
                     "source": "stderr",
-                    "line": line
+                    "line": line,
+                    "command_id": command_id_stderr
                 }),
             );
             if lines.len() < 2000 {
@@ -139,7 +763,11 @@ pub async fn invoke_agent_task_execution(
             exit_code = status.code();
         }
         Ok(Err(e)) => {
-            let _ = window.emit("agent-log", serde_json::json!({ "source": "error", "line": format!("Process error: {}", e) }));
+            let _ = window.emit("agent-log", serde_json::json!({
+                "source": "error",
+                "line": format!("Process error: {}", e),
+                "command_id": command_id
+            }));
         }
         Err(_) => {
             // Timeout occurred
@@ -147,7 +775,8 @@ pub async fn invoke_agent_task_execution(
             interrupted = true;
             let _ = window.emit("agent-log", serde_json::json!({
                 "source": "stderr",
-                "line": format!("\n[Timeout] Process killed after {}ms", timeout_ms)
+                "line": format!("\n[Timeout] Process killed after {}ms", timeout_ms),
+                "command_id": command_id
             }));
         }
     }
@@ -942,14 +1571,23 @@ pub struct AgentWriteFileRequest {
     pub path: String,
     pub content: String,
     pub create_backup: Option<bool>,
+    pub working_dir: Option<String>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
 }
 
 #[tauri::command]
 pub async fn invoke_agent_write_file(
     request: AgentWriteFileRequest,
 ) -> Result<String, String> {
-    use std::fs;
     use std::path::Path;
+
+    capture_file_checkpoint_if_needed(
+        &request.path,
+        request.working_dir.as_deref(),
+        request.thread_id.as_deref(),
+        request.turn_id.as_deref(),
+    )?;
 
     let path = Path::new(&request.path);
 

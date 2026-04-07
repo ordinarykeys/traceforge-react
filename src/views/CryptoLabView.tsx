@@ -1,13 +1,13 @@
-import { useEffect } from "react";
+import { Suspense, lazy } from "react";
 import {
   ArrowRightLeft
 } from "lucide-react";
 
-import Editor from "@monaco-editor/react";
-
 import { OUTPUT_ENCODING_OPTIONS } from "@/features/crypto/cryptoLabOptions";
 import { useCryptoLab } from "@/hooks/useCryptoLab";
 import { useThemeStore } from "@/hooks/useThemeStore";
+import { useLocaleStore } from "@/hooks/useLocaleStore";
+import { translate } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
@@ -31,19 +31,17 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 
+const LazyMonacoEditor = lazy(() => import("@monaco-editor/react"));
+
 export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisible?: boolean }) {
   const { isDark, codeFontSize, minimap, lineNumbers } = useThemeStore();
+  const { locale } = useLocaleStore();
   const cryptoLab = useCryptoLab();
-
-  // Initialize on mount: fetch code and initial preview
-  useEffect(() => {
-    cryptoLab.initialize();
-  }, []); // Only once on mount to prevent infinite loop
 
   const handleCopy = async (text: string, description: string) => {
     if (!text) return;
     await navigator.clipboard.writeText(text);
-    toast.success(`${description}已复制到剪贴板`);
+    toast.success(translate(locale, "crypto.toast.copied", { description }));
   };
 
   return (
@@ -91,44 +89,54 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
             <ResizablePanel defaultSize="20" minSize="60" >
               <div className="flex h-full flex-col">
                 <div className="flex-1 min-h-0">
-                  <Editor
-                    height="100%"
-                    language="javascript"
-                    value={cryptoLab.generatedCode || "// 请选择算法..."}
-                    theme={isDark ? "tf-dark" : "light"}
-                    onChange={(value) => cryptoLab.setGeneratedCode(value || "")}
-                    beforeMount={(monaco) => {
-                      monaco.editor.defineTheme('tf-dark', {
-                        base: 'vs-dark',
-                        inherit: true,
-                        rules: [],
-                        colors: {
-                          'editor.background': '#121314',
-                          'editor.lineHighlightBackground': '#1a1b1c',
-                          'editorLineNumber.foreground': '#606366',
-                          'editor.selectionBackground': '#264f78',
-                          'editorIndentGuide.background': '#1a1b1c',
-                          'editorGutter.background': '#121314',
+                  <Suspense
+                    fallback={
+                      <div className="flex h-full w-full items-center justify-center bg-muted/10">
+                        <span className="text-[11px] font-mono uppercase tracking-wide text-muted-foreground/70">
+                          {translate(locale, "agent.thinking")}
+                        </span>
+                      </div>
+                    }
+                  >
+                    <LazyMonacoEditor
+                      height="100%"
+                      language="javascript"
+                      value={cryptoLab.generatedCode || translate(locale, "crypto.placeholder.selectAlgorithm")}
+                      theme={isDark ? "tf-dark" : "light"}
+                      onChange={(value) => cryptoLab.setGeneratedCode(value || "")}
+                      beforeMount={(monaco) => {
+                        monaco.editor.defineTheme('tf-dark', {
+                          base: 'vs-dark',
+                          inherit: true,
+                          rules: [],
+                          colors: {
+                            'editor.background': '#121314',
+                            'editor.lineHighlightBackground': '#1a1b1c',
+                            'editorLineNumber.foreground': '#606366',
+                            'editor.selectionBackground': '#264f78',
+                            'editorIndentGuide.background': '#1a1b1c',
+                            'editorGutter.background': '#121314',
+                          }
+                        });
+                      }}
+                      options={{
+                        fontSize: codeFontSize,
+                        fontFamily: "'Cascadia Code', 'JetBrains Mono', Consolas, monospace",
+                        minimap: { enabled: minimap },
+                        scrollBeyondLastLine: false,
+                        automaticLayout: true,
+                        readOnly: false,
+                        lineNumbers: lineNumbers ? "on" : "off",
+                        padding: { top: 10, bottom: 10 },
+                        scrollbar: {
+                          vertical: 'visible',
+                          horizontal: 'visible',
+                          verticalScrollbarSize: 10,
+                          horizontalScrollbarSize: 10,
                         }
-                      });
-                    }}
-                    options={{
-                      fontSize: codeFontSize,
-                      fontFamily: "'Cascadia Code', 'JetBrains Mono', Consolas, monospace",
-                      minimap: { enabled: minimap },
-                      scrollBeyondLastLine: false,
-                      automaticLayout: true,
-                      readOnly: false,
-                      lineNumbers: lineNumbers ? "on" : "off",
-                      padding: { top: 10, bottom: 10 },
-                      scrollbar: {
-                        vertical: 'visible',
-                        horizontal: 'visible',
-                        verticalScrollbarSize: 10,
-                        horizontalScrollbarSize: 10,
-                      }
-                    }}
-                  />
+                      }}
+                    />
+                  </Suspense>
                 </div>
 
                 {/* Code Toolbar */}
@@ -136,7 +144,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                   <div className="flex items-center gap-3 overflow-x-auto no-scrollbar">
                     {cryptoLab.showOutputFormat && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[11px] font-medium text-muted-foreground">输出</span>
+                        <span className="text-[11px] font-medium text-muted-foreground">
+                          {translate(locale, "crypto.label.output")}
+                        </span>
                         <Select value={cryptoLab.params.outputFormat} onValueChange={(v) => cryptoLab.setParams(p => ({ ...p, outputFormat: v }))}>
                           <SelectTrigger className="h-6 w-16 text-[11px] border-none bg-background/50 shadow-none focus:ring-0"><SelectValue /></SelectTrigger>
                           <SelectContent>{cryptoLab.constants.OUTPUT_FORMATS.map(o => <SelectItem key={o} value={o} className="text-[11px]">{o}</SelectItem>)}</SelectContent>
@@ -145,7 +155,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                     )}
                     {cryptoLab.showOutputEncoding && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[11px] font-medium text-muted-foreground">编码</span>
+                        <span className="text-[11px] font-medium text-muted-foreground">
+                          {translate(locale, "crypto.label.encoding")}
+                        </span>
                         <Select value={cryptoLab.params.outputEncoding} onValueChange={(v) => cryptoLab.setParams(p => ({ ...p, outputEncoding: v }))}>
                           <SelectTrigger className="h-6 w-20 text-[11px] border-none bg-background/50 shadow-none focus:ring-0"><SelectValue /></SelectTrigger>
                           <SelectContent>{OUTPUT_ENCODING_OPTIONS.map(o => <SelectItem key={o} value={o} className="text-[11px]">{o}</SelectItem>)}</SelectContent>
@@ -165,7 +177,11 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                       disabled={cryptoLab.previewLoading}
                       onClick={async () => {
                         await cryptoLab.runEncryptPreview();
-                        toast.success(`${cryptoLab.encryptActionLabel}成功`);
+                        toast.success(
+                          translate(locale, "crypto.toast.actionSuccess", {
+                            action: cryptoLab.encryptActionLabel,
+                          }),
+                        );
                       }}
                     >
                       {cryptoLab.encryptActionLabel}
@@ -181,7 +197,11 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                         disabled={cryptoLab.previewLoading}
                         onClick={async () => {
                           await cryptoLab.runDecryptPreview();
-                          toast.success(`${cryptoLab.decryptActionLabel}成功`);
+                          toast.success(
+                            translate(locale, "crypto.toast.actionSuccess", {
+                              action: cryptoLab.decryptActionLabel,
+                            }),
+                          );
                         }}
                       >
                         {cryptoLab.decryptActionLabel}
@@ -196,13 +216,15 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                           disabled={cryptoLab.easyModuleLoading}
                           onClick={async () => {
                             await cryptoLab.copyEasyLanguageModule();
-                            toast.success("易语言模块已复制");
+                            toast.success(translate(locale, "crypto.toast.easyModuleCopied"));
                           }}
                         >
                           E
                         </Button>
                       </TooltipTrigger>
-                      <TooltipContent className="text-[11px] py-1 px-2">生成并复制易语言模块</TooltipContent>
+                      <TooltipContent className="text-[11px] py-1 px-2">
+                        {translate(locale, "crypto.tooltip.easyModule")}
+                      </TooltipContent>
                     </Tooltip>
                     <Tooltip>
                       <TooltipTrigger asChild>
@@ -216,13 +238,15 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                           disabled={cryptoLab.loading}
                           onClick={async () => {
                             await cryptoLab.generateCode();
-                            toast.success("JS代码生成成功");
+                            toast.success(translate(locale, "crypto.toast.jsGenerated"));
                           }}
                         >
-                          生成 JS 代码
+                          {translate(locale, "crypto.button.generateJs")}
                         </Button>
                       </TooltipTrigger>
-                      <TooltipContent className="text-[11px] py-1 px-2">根据算法和参数生成可运行的 JS 脚本</TooltipContent>
+                      <TooltipContent className="text-[11px] py-1 px-2">
+                        {translate(locale, "crypto.tooltip.generateJs")}
+                      </TooltipContent>
                     </Tooltip>
                     <Tooltip>
                       <TooltipTrigger asChild>
@@ -231,12 +255,14 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                           size="sm"
                           className="h-7 text-[11px] font-bold px-3 border-primary/30 text-primary hover:bg-primary/5"
                           disabled={!cryptoLab.generatedCode}
-                          onClick={() => handleCopy(cryptoLab.generatedCode, "JS 代码")}
+                          onClick={() => handleCopy(cryptoLab.generatedCode, translate(locale, "crypto.button.generateJs"))}
                         >
-                          复制 JS 脚本
+                          {translate(locale, "crypto.button.copyJs")}
                         </Button>
                       </TooltipTrigger>
-                      <TooltipContent className="text-[11px] py-1 px-2">复制当前生成的 JS 脚本</TooltipContent>
+                      <TooltipContent className="text-[11px] py-1 px-2">
+                        {translate(locale, "crypto.tooltip.copyJs")}
+                      </TooltipContent>
                     </Tooltip>
                   </div>
                 </footer>
@@ -254,7 +280,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                   <div className="flex h-9 items-center gap-4 px-3 bg-muted/10 border-b border-border overflow-x-auto no-scrollbar shrink-0">
                     {cryptoLab.showSubType && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <Label className="text-[11px] font-bold text-muted-foreground/60 uppercase">子类型</Label>
+                        <Label className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                          {translate(locale, "crypto.label.subtype")}
+                        </Label>
                         <Select value={cryptoLab.params.subType} onValueChange={(v) => cryptoLab.setParams(p => ({ ...p, subType: v }))}>
                           <SelectTrigger className="h-6 min-w-24 text-[11px] border-none bg-background/80"><SelectValue /></SelectTrigger>
                           <SelectContent className="max-h-[300px]">{cryptoLab.subTypeOptions.map(o => <SelectItem key={o} value={o} className="text-[11px]">{o}</SelectItem>)}</SelectContent>
@@ -263,7 +291,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                     )}
                     {cryptoLab.showMode && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">模式</span>
+                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                          {translate(locale, "crypto.label.mode")}
+                        </span>
                         <Select value={cryptoLab.params.mode} onValueChange={(v) => cryptoLab.setParams(p => ({ ...p, mode: v }))}>
                           <SelectTrigger className="h-6 w-16 text-[11px] border-none bg-background/80"><SelectValue /></SelectTrigger>
                           <SelectContent>{cryptoLab.modeOptions.map(o => <SelectItem key={o} value={o} className="text-[11px]">{o}</SelectItem>)}</SelectContent>
@@ -272,7 +302,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                     )}
                     {cryptoLab.showPadding && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">填充</span>
+                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                          {translate(locale, "crypto.label.padding")}
+                        </span>
                         <Select value={cryptoLab.params.padding} onValueChange={(v) => cryptoLab.setParams(p => ({ ...p, padding: v }))}>
                           <SelectTrigger className="h-6 w-24 text-[11px] border-none bg-background/80"><SelectValue /></SelectTrigger>
                           <SelectContent>{cryptoLab.constants.PADDING_TYPES.map(o => <SelectItem key={o} value={o} className="text-[11px]">{o}</SelectItem>)}</SelectContent>
@@ -281,7 +313,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                     )}
                     {cryptoLab.showKeyEncoding && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">Key编码</span>
+                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                          {translate(locale, "crypto.label.keyEncoding")}
+                        </span>
                         <Select value={cryptoLab.params.keyEncoding} onValueChange={(v) => cryptoLab.setParams(p => ({ ...p, keyEncoding: v }))}>
                           <SelectTrigger className="h-6 w-16 text-[11px] border-none bg-background/80"><SelectValue /></SelectTrigger>
                           <SelectContent>{cryptoLab.constants.ENCODING_TYPES.map(o => <SelectItem key={o} value={o} className="text-[11px]">{o}</SelectItem>)}</SelectContent>
@@ -290,7 +324,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                     )}
                     {cryptoLab.showIvEncoding && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">IV编码</span>
+                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                          {translate(locale, "crypto.label.ivEncoding")}
+                        </span>
                         <Select value={cryptoLab.params.ivEncoding} onValueChange={(v) => cryptoLab.setParams(p => ({ ...p, ivEncoding: v }))}>
                           <SelectTrigger className="h-6 w-16 text-[11px] border-none bg-background/80"><SelectValue /></SelectTrigger>
                           <SelectContent>{cryptoLab.constants.ENCODING_TYPES.map(o => <SelectItem key={o} value={o} className="text-[11px]">{o}</SelectItem>)}</SelectContent>
@@ -299,7 +335,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                     )}
                     {cryptoLab.showRsaPadding && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">填充模式</span>
+                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                          {translate(locale, "crypto.label.rsaPadding")}
+                        </span>
                         <Select value={cryptoLab.params.rsaPadding} onValueChange={(v) => cryptoLab.setParams(p => ({ ...p, rsaPadding: v }))}>
                           <SelectTrigger className="h-6 w-24 text-[11px] border-none bg-background/80"><SelectValue /></SelectTrigger>
                           <SelectContent>{cryptoLab.constants.RSA_PADDINGS.map(o => <SelectItem key={o} value={o} className="text-[11px]">{o}</SelectItem>)}</SelectContent>
@@ -308,7 +346,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                     )}
                     {cryptoLab.showKeySize && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">位数</span>
+                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                          {translate(locale, "crypto.label.keySize")}
+                        </span>
                         <Select value={cryptoLab.params.keySize.toString()} onValueChange={(v) => cryptoLab.setParams(p => ({ ...p, keySize: parseInt(v) }))}>
                           <SelectTrigger className="h-6 w-16 text-[11px] border-none bg-background/80"><SelectValue /></SelectTrigger>
                           <SelectContent>{cryptoLab.constants.KEY_SIZES.map(o => <SelectItem key={o.toString()} value={o.toString()} className="text-[11px]">{o}</SelectItem>)}</SelectContent>
@@ -317,7 +357,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                     )}
                     {cryptoLab.showProtobufInputFormat && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">输入格式</span>
+                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                          {translate(locale, "crypto.label.inputFormat")}
+                        </span>
                         <Select
                           value={cryptoLab.params.protobufInputFormat}
                           onValueChange={(v) =>
@@ -337,7 +379,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                     )}
                     {cryptoLab.showSm2CipherMode && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">SM2模式</span>
+                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                          {translate(locale, "crypto.label.sm2Mode")}
+                        </span>
                         <Select value={cryptoLab.params.sm2CipherMode.toString()} onValueChange={(v) => cryptoLab.setParams(p => ({ ...p, sm2CipherMode: parseInt(v) }))}>
                           <SelectTrigger className="h-6 w-24 text-[11px] border-none bg-background/80"><SelectValue /></SelectTrigger>
                           <SelectContent><SelectItem value="1" className="text-[11px]">C1C3C2</SelectItem><SelectItem value="0" className="text-[11px]">C1C2C3</SelectItem></SelectContent>
@@ -352,7 +396,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                     )}
                     {cryptoLab.showIv && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">向量</span>
+                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                          {translate(locale, "crypto.label.iv")}
+                        </span>
                         <Input className="h-6 min-w-32 max-w-48 border-none text-[11px] bg-background/80 px-2" value={cryptoLab.params.iv} onChange={(e) => cryptoLab.setParams(p => ({ ...p, iv: e.target.value }))} />
                       </div>
                     )}
@@ -364,7 +410,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                     )}
                     {cryptoLab.showIterations && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">迭代</span>
+                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                          {translate(locale, "crypto.label.iterations")}
+                        </span>
                         <Input type="number" className="h-6 w-16 border-none text-[11px] bg-background/80 px-2" value={cryptoLab.params.iterations} onChange={(e) => cryptoLab.setParams(p => ({ ...p, iterations: parseInt(e.target.value) }))} />
                       </div>
                     )}
@@ -394,7 +442,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                     )}
                     {cryptoLab.showXorInitialKey && (
                       <div className="flex items-center gap-1.5 shrink-0">
-                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">初始密钥</span>
+                        <span className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                          {translate(locale, "crypto.label.xorInitialKey")}
+                        </span>
                         <Input type="number" className="h-6 w-14 border-none text-[11px] bg-background/80 px-2" value={cryptoLab.params.xorInitialKey} onChange={(e) => cryptoLab.setParams(p => ({ ...p, xorInitialKey: parseInt(e.target.value) }))} />
                       </div>
                     )}
@@ -407,10 +457,17 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                     {/* Input */}
                     <section className="flex-1 flex flex-col min-w-0">
                       <header className="flex h-7 items-center justify-between px-3 bg-muted/5 border-b border-border/50">
-                        <Label className="text-[11px] font-bold text-muted-foreground/60 uppercase tracking-tighter">待处理内容</Label>
+                        <Label className="text-[11px] font-bold text-muted-foreground/60 uppercase tracking-tighter">
+                          {translate(locale, "crypto.label.input")}
+                        </Label>
                         <Badge variant="outline" className="h-4 px-1.5 text-[9px] font-mono border-muted-foreground/20 text-muted-foreground/60 rounded-full">{cryptoLab.params.input.length}</Badge>
                       </header>
-                      <Textarea className="flex-1 resize-none border-none p-3 font-mono text-[13px] bg-transparent focus-visible:ring-0 leading-relaxed" placeholder="在此输入要处理的内容..." value={cryptoLab.params.input} onChange={(e) => cryptoLab.setParams(p => ({ ...p, input: e.target.value }))} />
+                      <Textarea
+                        className="flex-1 resize-none border-none p-3 font-mono text-[13px] bg-transparent focus-visible:ring-0 leading-relaxed"
+                        placeholder={translate(locale, "crypto.placeholder.input")}
+                        value={cryptoLab.params.input}
+                        onChange={(e) => cryptoLab.setParams(p => ({ ...p, input: e.target.value }))}
+                      />
                     </section>
 
                     {/* Swap Button */}
@@ -421,15 +478,26 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                             <ArrowRightLeft size={12} className="group-hover:rotate-180 transition-transform duration-500" />
                           </Button>
                         </TooltipTrigger>
-                        <TooltipContent side="top">交换输入和输出</TooltipContent>
+                        <TooltipContent side="top">
+                          {translate(locale, "crypto.tooltip.swapIO")}
+                        </TooltipContent>
                       </Tooltip>
                     </div>
 
                     {/* Result Panel */}
                     <section className="flex-1 flex flex-col min-w-0 bg-muted/5">
                       <header className="flex h-7 items-center justify-between px-3 bg-muted/10 border-b border-border/50">
-                        <Label className="text-[11px] font-bold text-muted-foreground/60 uppercase tracking-tighter">运行结果</Label>
-                        <Button variant="ghost" size="sm" className="h-5 text-[11px] font-bold px-1.5" onClick={() => handleCopy(cryptoLab.previewDisplay, "运行结果")}>复制</Button>
+                        <Label className="text-[11px] font-bold text-muted-foreground/60 uppercase tracking-tighter">
+                          {translate(locale, "crypto.label.result")}
+                        </Label>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-5 text-[11px] font-bold px-1.5"
+                          onClick={() => handleCopy(cryptoLab.previewDisplay, translate(locale, "crypto.label.result"))}
+                        >
+                          {translate(locale, "crypto.button.copy")}
+                        </Button>
                       </header>
                       <ScrollArea className="flex-1">
                         <div className="p-3 space-y-4">
@@ -438,7 +506,9 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                           </div>
                           {cryptoLab.previewDetailText && (
                             <div className="space-y-1 animate-in fade-in duration-500">
-                              <Label className="text-[11px] font-bold text-primary/60 uppercase tracking-wider">预览细节</Label>
+                              <Label className="text-[11px] font-bold text-primary/60 uppercase tracking-wider">
+                                {translate(locale, "crypto.label.previewDetail")}
+                              </Label>
                               <pre className="font-mono text-[12px] leading-5 text-muted-foreground bg-background/20 p-2 rounded-sm border border-border/20">{cryptoLab.previewDetailText}</pre>
                             </div>
                           )}
@@ -453,8 +523,17 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                       {cryptoLab.showPublicKey && (
                         <section className="flex-1 flex flex-col min-w-0">
                           <header className="flex h-6 items-center justify-between px-2 bg-muted/20 border-b border-border/50">
-                            <Label className="text-[11px] font-bold text-muted-foreground/60 uppercase">公钥</Label>
-                            <Button variant="ghost" size="sm" className="h-4 text-[10px] px-1" onClick={() => handleCopy(cryptoLab.params.publicKey, "公钥")}>复制</Button>
+                            <Label className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                              {translate(locale, "crypto.label.publicKey")}
+                            </Label>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-4 text-[10px] px-1"
+                              onClick={() => handleCopy(cryptoLab.params.publicKey, translate(locale, "crypto.label.publicKey"))}
+                            >
+                              {translate(locale, "crypto.button.copy")}
+                            </Button>
                           </header>
                           <Textarea className="flex-1 resize-none border-none p-2 font-mono text-[11px] bg-transparent focus-visible:ring-0 leading-tight" placeholder="Paste Public Key here..." value={cryptoLab.params.publicKey} onChange={(e) => cryptoLab.setParams(p => ({ ...p, publicKey: e.target.value }))} />
                         </section>
@@ -462,8 +541,17 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                       {cryptoLab.showPrivateKey && (
                         <section className="flex-1 flex flex-col min-w-0 border-l border-border">
                           <header className="flex h-6 items-center justify-between px-2 bg-muted/20 border-b border-border/50">
-                            <Label className="text-[11px] font-bold text-muted-foreground/60 uppercase">私钥</Label>
-                            <Button variant="ghost" size="sm" className="h-4 text-[10px] px-1" onClick={() => handleCopy(cryptoLab.params.privateKey, "私钥")}>复制</Button>
+                            <Label className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                              {translate(locale, "crypto.label.privateKey")}
+                            </Label>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-4 text-[10px] px-1"
+                              onClick={() => handleCopy(cryptoLab.params.privateKey, translate(locale, "crypto.label.privateKey"))}
+                            >
+                              {translate(locale, "crypto.button.copy")}
+                            </Button>
                           </header>
                           <Textarea className="flex-1 resize-none border-none p-2 font-mono text-[11px] bg-transparent focus-visible:ring-0 leading-tight" placeholder="Paste Private Key here..." value={cryptoLab.params.privateKey} onChange={(e) => cryptoLab.setParams(p => ({ ...p, privateKey: e.target.value }))} />
                         </section>
@@ -471,8 +559,17 @@ export default function CryptoLabView({ isSiderVisible = true }: { isSiderVisibl
                       {cryptoLab.showSignature && (
                         <section className="flex-1 flex flex-col min-w-0 border-l border-border">
                           <header className="flex h-6 items-center justify-between px-2 bg-muted/20 border-b border-border/50">
-                            <Label className="text-[11px] font-bold text-muted-foreground/60 uppercase">签名结果</Label>
-                            <Button variant="ghost" size="sm" className="h-4 text-[10px] px-1" onClick={() => handleCopy(cryptoLab.params.signature, "签名结果")}>复制</Button>
+                            <Label className="text-[11px] font-bold text-muted-foreground/60 uppercase">
+                              {translate(locale, "crypto.label.signatureResult")}
+                            </Label>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-4 text-[10px] px-1"
+                              onClick={() => handleCopy(cryptoLab.params.signature, translate(locale, "crypto.label.signatureResult"))}
+                            >
+                              {translate(locale, "crypto.button.copy")}
+                            </Button>
                           </header>
                           <Textarea className="flex-1 resize-none border-none p-2 font-mono text-[11px] bg-transparent focus-visible:ring-0 leading-tight" placeholder="Paste Signature here..." value={cryptoLab.params.signature} onChange={(e) => cryptoLab.setParams(p => ({ ...p, signature: e.target.value }))} />
                         </section>

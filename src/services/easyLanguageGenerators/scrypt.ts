@@ -11,8 +11,8 @@ export const buildScryptEasyLanguageRunner = (params: EasyLanguageScriptParams):
   return {
     description: 'WT-JS_scrypt',
     parameters: [
-      { name: 'text', comment: '鍙傛暟1' },
-      { name: 'salt', comment: '鍙傛暟2' },
+      { name: 'text', comment: '参数1' },
+      { name: 'salt', comment: '参数2' },
     ],
     evalExpression: `WT_Run(${quoteParam('text')}, ${quoteParam('salt')})`,
     script: `${EASY_BINARY_HELPERS}

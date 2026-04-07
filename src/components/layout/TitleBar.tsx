@@ -26,17 +26,15 @@ export default function TitleBar({ isSiderVisible, onToggleSider }: TitleBarProp
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
 
   useEffect(() => {
-    // Initial check
     appWindow.isMaximized().then(setIsMaximized);
 
-    // Listen to resize events to update the icon
     const unlisten = appWindow.onResized(async () => {
       const maximized = await appWindow.isMaximized();
       setIsMaximized(maximized);
     });
 
     return () => {
-      unlisten.then(fn => fn());
+      unlisten.then((fn) => fn());
     };
   }, []);
 
@@ -45,22 +43,21 @@ export default function TitleBar({ isSiderVisible, onToggleSider }: TitleBarProp
   const handleClose = () => appWindow.close();
 
   return (
-    <div 
+    <div
       className="relative z-[9999] flex h-[38px] w-full items-center justify-between bg-card border-b border-border text-foreground select-none transition-colors duration-300"
       data-tauri-drag-region
     >
-      {/* Left: Expand/Collapse Toggle & Nav */}
       <div className="flex items-center">
-        <Button 
+        <Button
           variant="ghost"
           size="icon"
           onClick={onToggleSider}
           className="h-[38px] w-[48px] rounded-none text-muted-foreground hover:text-foreground transition-colors"
-          title={isSiderVisible ? "收起" : "展开"}
+          title={isSiderVisible ? "Collapse" : "Expand"}
         >
           {isSiderVisible ? <PanelRight size={16} /> : <PanelLeft size={16} />}
         </Button>
-        {/* Navigation Arrows - Using a dedicated hover hitbox */}
+
         <div className="group flex items-center h-full px-2 ml-0 cursor-default">
           <div className="flex items-center gap-0 h-5 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-300">
             <Button variant="ghost" size="icon" className="h-7 w-7 text-muted-foreground/60 hover:text-foreground bg-transparent hover:bg-transparent">
@@ -72,10 +69,9 @@ export default function TitleBar({ isSiderVisible, onToggleSider }: TitleBarProp
           </div>
         </div>
 
-        {/* IDE Menus - Controlled DropdownMenus for "one-click switch" behavior */}
         <div className="flex items-center ml-2 space-x-0">
           <DropdownMenu modal={false} open={activeMenu === "file"} onOpenChange={(open) => setActiveMenu(open ? "file" : null)}>
-            <DropdownMenuTrigger 
+            <DropdownMenuTrigger
               onPointerDown={(e) => {
                 e.preventDefault();
                 setActiveMenu(activeMenu === "file" ? null : "file");
@@ -85,16 +81,16 @@ export default function TitleBar({ isSiderVisible, onToggleSider }: TitleBarProp
               File
             </DropdownMenuTrigger>
             <DropdownMenuContent className="text-[12px] min-w-[120px]">
-              <DropdownMenuItem>New File <DropdownMenuShortcut>⌘N</DropdownMenuShortcut></DropdownMenuItem>
-              <DropdownMenuItem>Open File... <DropdownMenuShortcut>⌘O</DropdownMenuShortcut></DropdownMenuItem>
+              <DropdownMenuItem>New File <DropdownMenuShortcut>Ctrl+N</DropdownMenuShortcut></DropdownMenuItem>
+              <DropdownMenuItem>Open File... <DropdownMenuShortcut>Ctrl+O</DropdownMenuShortcut></DropdownMenuItem>
               <DropdownMenuSeparator />
-              <DropdownMenuItem>Save <DropdownMenuShortcut>⌘S</DropdownMenuShortcut></DropdownMenuItem>
+              <DropdownMenuItem>Save <DropdownMenuShortcut>Ctrl+S</DropdownMenuShortcut></DropdownMenuItem>
               <DropdownMenuItem>Exit</DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
 
           <DropdownMenu modal={false} open={activeMenu === "edit"} onOpenChange={(open) => setActiveMenu(open ? "edit" : null)}>
-            <DropdownMenuTrigger 
+            <DropdownMenuTrigger
               onPointerDown={(e) => {
                 e.preventDefault();
                 setActiveMenu(activeMenu === "edit" ? null : "edit");
@@ -104,16 +100,16 @@ export default function TitleBar({ isSiderVisible, onToggleSider }: TitleBarProp
               Edit
             </DropdownMenuTrigger>
             <DropdownMenuContent className="text-[12px] min-w-[120px]">
-              <DropdownMenuItem>Undo <DropdownMenuShortcut>⌘Z</DropdownMenuShortcut></DropdownMenuItem>
-              <DropdownMenuItem>Redo <DropdownMenuShortcut>⇧⌘Z</DropdownMenuShortcut></DropdownMenuItem>
+              <DropdownMenuItem>Undo <DropdownMenuShortcut>Ctrl+Z</DropdownMenuShortcut></DropdownMenuItem>
+              <DropdownMenuItem>Redo <DropdownMenuShortcut>Ctrl+Shift+Z</DropdownMenuShortcut></DropdownMenuItem>
               <DropdownMenuSeparator />
-              <DropdownMenuItem>Cut <DropdownMenuShortcut>⌘X</DropdownMenuShortcut></DropdownMenuItem>
-              <DropdownMenuItem>Copy <DropdownMenuShortcut>⌘C</DropdownMenuShortcut></DropdownMenuItem>
+              <DropdownMenuItem>Cut <DropdownMenuShortcut>Ctrl+X</DropdownMenuShortcut></DropdownMenuItem>
+              <DropdownMenuItem>Copy <DropdownMenuShortcut>Ctrl+C</DropdownMenuShortcut></DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
 
           <DropdownMenu modal={false} open={activeMenu === "view"} onOpenChange={(open) => setActiveMenu(open ? "view" : null)}>
-            <DropdownMenuTrigger 
+            <DropdownMenuTrigger
               onPointerDown={(e) => {
                 e.preventDefault();
                 setActiveMenu(activeMenu === "view" ? null : "view");
@@ -123,13 +119,13 @@ export default function TitleBar({ isSiderVisible, onToggleSider }: TitleBarProp
               View
             </DropdownMenuTrigger>
             <DropdownMenuContent className="text-[12px] min-w-[120px]">
-              <DropdownMenuItem>Toggle Sider <DropdownMenuShortcut>⌘B</DropdownMenuShortcut></DropdownMenuItem>
+              <DropdownMenuItem>Toggle Sider <DropdownMenuShortcut>Ctrl+B</DropdownMenuShortcut></DropdownMenuItem>
               <DropdownMenuItem>Full Screen</DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
 
           <DropdownMenu modal={false} open={activeMenu === "window"} onOpenChange={(open) => setActiveMenu(open ? "window" : null)}>
-            <DropdownMenuTrigger 
+            <DropdownMenuTrigger
               onPointerDown={(e) => {
                 e.preventDefault();
                 setActiveMenu(activeMenu === "window" ? null : "window");
@@ -141,7 +137,7 @@ export default function TitleBar({ isSiderVisible, onToggleSider }: TitleBarProp
           </DropdownMenu>
 
           <DropdownMenu modal={false} open={activeMenu === "help"} onOpenChange={(open) => setActiveMenu(open ? "help" : null)}>
-            <DropdownMenuTrigger 
+            <DropdownMenuTrigger
               onPointerDown={(e) => {
                 e.preventDefault();
                 setActiveMenu(activeMenu === "help" ? null : "help");
@@ -154,11 +150,10 @@ export default function TitleBar({ isSiderVisible, onToggleSider }: TitleBarProp
         </div>
       </div>
 
-      {/* Right: Theme Switcher & Window Controls */}
       <div className="flex h-full items-center">
         <ThemeSwitcher />
         <Separator orientation="vertical" className="h-4 mx-1 opacity-50" />
-        <Button 
+        <Button
           variant="ghost"
           size="icon"
           onClick={handleMinimize}
@@ -166,19 +161,15 @@ export default function TitleBar({ isSiderVisible, onToggleSider }: TitleBarProp
         >
           <Minus size={14} />
         </Button>
-        <Button 
+        <Button
           variant="ghost"
           size="icon"
           onClick={handleMaximize}
           className="h-full w-10 rounded-none text-muted-foreground hover:bg-muted transition-colors font-bold"
         >
-          {isMaximized ? (
-            <Copy size={13} className="rotate-90" />
-          ) : (
-            <Square size={10} />
-          )}
+          {isMaximized ? <Copy size={13} className="rotate-90" /> : <Square size={10} />}
         </Button>
-        <Button 
+        <Button
           variant="ghost"
           size="icon"
           onClick={handleClose}
