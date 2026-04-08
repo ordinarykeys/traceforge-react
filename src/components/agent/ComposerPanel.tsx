@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import type { QueuePriority, QueuedQueryItem, ToolPermissionMode } from "@/lib/agent/QueryEngine";
 import type { SlashCommandDescriptor } from "@/lib/agent/commands/types";
+import { formatSlashCommand, generateSlashCommandSuggestions } from "@/lib/agent/commands";
 
 interface ModelInfo {
   id: string;
@@ -65,12 +66,6 @@ interface ComposerPanelProps {
 }
 
 const permissionModes: ToolPermissionMode[] = ["default", "full_access"];
-const categoryOrder: SlashCommandDescriptor["category"][] = [
-  "core",
-  "tools",
-  "permissions",
-  "tasks",
-];
 
 function toFiniteAmount(value: unknown): number {
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -139,43 +134,10 @@ export function ComposerPanel({
     }
   };
 
-  const slashSuggestions = useMemo(() => {
-    const raw = input.trimStart();
-    if (!raw.startsWith("/")) {
-      return null;
-    }
-
-    const body = raw.slice(1);
-    if (/\s/.test(body)) {
-      return null;
-    }
-
-    const query = body.trim().toLowerCase();
-    const items = slashCommands
-      .filter((command) => {
-        if (!query) return true;
-        if (command.name.toLowerCase().includes(query)) return true;
-        return command.aliases.some((alias) => alias.toLowerCase().includes(query));
-      })
-      .sort((a, b) => {
-        const left = categoryOrder.indexOf(a.category);
-        const right = categoryOrder.indexOf(b.category);
-        if (left !== right) {
-          return left - right;
-        }
-        return a.name.localeCompare(b.name);
-      })
-      .slice(0, 10);
-
-    const groups = categoryOrder
-      .map((category) => {
-        const groupItems = items.filter((item) => item.category === category);
-        return { category, items: groupItems };
-      })
-      .filter((group) => group.items.length > 0);
-
-    return { query, items, groups };
-  }, [input, slashCommands]);
+  const slashSuggestions = useMemo(
+    () => generateSlashCommandSuggestions(input, slashCommands, { limit: 10 }),
+    [input, slashCommands],
+  );
 
   const visibleQueuedItems = useMemo(() => queuedItems.slice(0, 3), [queuedItems]);
   const queuedOverflowCount = Math.max(0, queuedItems.length - visibleQueuedItems.length);
@@ -232,7 +194,7 @@ export function ComposerPanel({
     const target = inputRef.current;
     if (!target) return;
 
-    const next = `/${command.name} `;
+    const next = formatSlashCommand(command.name);
     onInputChange(next, target);
     requestAnimationFrame(() => {
       target.focus();
@@ -259,7 +221,7 @@ export function ComposerPanel({
         const selected =
           slashSuggestions.items[activeCommandIndex] ?? slashSuggestions.items[0];
         if (selected) {
-          applyCommandSuggestion(selected);
+          applyCommandSuggestion(selected.command);
         }
         return;
       }
@@ -410,18 +372,23 @@ export function ComposerPanel({
                 </div>
               ) : (
                 <div className="space-y-1">
-                  {slashSuggestions.groups.map((group) => (
-                    <div key={group.category} className="space-y-1">
-                      <div className="px-1 pt-1 text-[10px] uppercase tracking-wide text-muted-foreground/55">
-                        {getSlashCategoryLabel(group.category)}
-                      </div>
-                      {group.items.map((command) => {
-                        const index = slashSuggestions.items.findIndex(
-                          (item) => item.name === command.name,
-                        );
+                      {slashSuggestions.groups.map((group) => (
+                        <div key={group.category} className="space-y-1">
+                          <div className="px-1 pt-1 text-[10px] uppercase tracking-wide text-muted-foreground/55">
+                            {getSlashCategoryLabel(group.category)}
+                          </div>
+                          {group.items.map((suggestion) => {
+                            const command = suggestion.command;
+                            const index = slashSuggestions.items.findIndex(
+                              (item) => item.id === suggestion.id,
+                            );
+                            const aliasesText = command.aliases.map((alias) => `/${alias}`).join(" ");
+                            const aliasHint = suggestion.matchedAlias
+                              ? `/${suggestion.matchedAlias} ${aliasesText}`
+                              : aliasesText;
                         return (
                           <button
-                            key={command.name}
+                                key={suggestion.id}
                             onClick={() => applyCommandSuggestion(command)}
                             className={cn(
                               "w-full rounded-md border border-transparent px-2 py-1.5 text-left transition-colors",
@@ -436,7 +403,7 @@ export function ComposerPanel({
                               </span>
                               {command.aliases.length > 0 && (
                                 <span className="text-[10px] text-muted-foreground/60">
-                                  {command.aliases.map((alias) => `/${alias}`).join(" ")}
+                                    {aliasHint}
                                 </span>
                               )}
                             </div>
@@ -448,8 +415,8 @@ export function ComposerPanel({
                             </div>
                           </button>
                         );
-                      })}
-                    </div>
+                          })}
+                        </div>
                   ))}
                 </div>
               )}
@@ -551,9 +518,8 @@ export function ComposerPanel({
               variant="ghost"
               size="sm"
               className="h-7 text-[10px] text-muted-foreground/50 hover:bg-muted flex items-center gap-2 px-2 rounded-lg bg-muted/20 shrink-0"
-              title={`${translate(locale, "agent.engineReady")}: ${toolCount} · ${translate(locale, "agent.queue")}: ${
-                queueLimit > 0 ? `${queuedCount}/${queueLimit}` : queuedCount
-              }`}
+              title={`${translate(locale, "agent.engineReady")}: ${toolCount} · ${translate(locale, "agent.queue")}: ${queueLimit > 0 ? `${queuedCount}/${queueLimit}` : queuedCount
+                }`}
             >
               <Activity size={12} className="opacity-70" /> {permissionLabel}
               <span className="rounded border border-border/40 px-1 font-mono text-[9px] opacity-70">

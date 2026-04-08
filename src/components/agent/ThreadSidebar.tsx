@@ -908,9 +908,9 @@ export const ThreadSidebar = memo(function ThreadSidebar({
                         const diagnosisTooltipLine =
                           diagnosisVisible || risk.diagnosisHistoryCount > 0
                             ? `${translate(locale, "agent.sidebarDiagnosisCaption")} status=${getDiagnosisStatusLabel(
-                                locale,
-                                risk.diagnosisStatus,
-                              )} | history=${risk.diagnosisHistoryCount}`
+                              locale,
+                              risk.diagnosisStatus,
+                            )} | history=${risk.diagnosisHistoryCount}`
                             : "";
                         const diagnosisHistoryBadgeLabel = translate(locale, "agent.sidebarDiagnosisHistoryBadge", {
                           count: risk.diagnosisHistoryCount,
@@ -919,26 +919,26 @@ export const ThreadSidebar = memo(function ThreadSidebar({
                           risk.severity === "normal"
                             ? ""
                             : [
-                                translate(locale, "agent.sidebarThreadRiskTooltip")
-                                  .replace("{ratio}", String(risk.suppressionRatioPct))
-                                  .replace("{suppressed}", String(risk.fallbackSuppressed))
-                                  .replace("{retries}", String(risk.retryEventCount))
-                                  .replace("{reason}", risk.reason || "-")
-                                  .replace("{strategy}", risk.strategy || "-"),
-                                risk.permissionCritical > 0 ||
+                              translate(locale, "agent.sidebarThreadRiskTooltip")
+                                .replace("{ratio}", String(risk.suppressionRatioPct))
+                                .replace("{suppressed}", String(risk.fallbackSuppressed))
+                                .replace("{retries}", String(risk.retryEventCount))
+                                .replace("{reason}", risk.reason || "-")
+                                .replace("{strategy}", risk.strategy || "-"),
+                              risk.permissionCritical > 0 ||
                                 risk.permissionHighRisk > 0 ||
                                 risk.permissionHardToReverse > 0 ||
                                 risk.permissionShared > 0
-                                  ? translate(locale, "agent.sidebarThreadRiskTooltipPermission")
-                                      .replace("{critical}", String(risk.permissionCritical))
-                                      .replace("{highRisk}", String(risk.permissionHighRisk))
-                                      .replace("{hardToReverse}", String(risk.permissionHardToReverse))
-                                      .replace("{shared}", String(risk.permissionShared))
-                                  : "",
-                                diagnosisTooltipLine,
-                              ]
-                                .filter(Boolean)
-                                .join(" | ");
+                                ? translate(locale, "agent.sidebarThreadRiskTooltipPermission")
+                                  .replace("{critical}", String(risk.permissionCritical))
+                                  .replace("{highRisk}", String(risk.permissionHighRisk))
+                                  .replace("{hardToReverse}", String(risk.permissionHardToReverse))
+                                  .replace("{shared}", String(risk.permissionShared))
+                                : "",
+                              diagnosisTooltipLine,
+                            ]
+                              .filter(Boolean)
+                              .join(" | ");
 
                         return (
                           <div

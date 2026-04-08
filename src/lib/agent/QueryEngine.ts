@@ -43,9 +43,12 @@ import {
   type PermissionSuggestion,
 } from "./permissions/toolPermissions";
 import { translate, type AppLocale } from "@/lib/i18n";
-import { createDefaultCommandRegistry, type CommandRegistry } from "./commands";
-import { parseSlashCommand } from "./commands/parser";
-import type { SlashCommandDescriptor } from "./commands/types";
+import {
+  createDefaultCommandRegistry,
+  parseSlashCommand,
+  type CommandRegistry,
+  type SlashCommandDescriptor,
+} from "./commands";
 import { AgentTaskManager } from "./tasks/TaskManager";
 import type { AgentTask, TaskOutputChunk } from "./tasks/types";
 

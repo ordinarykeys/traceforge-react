@@ -453,14 +453,14 @@ function AgentStepImpl({
       status === "running" && "border-l-primary/60"
     )}>
       {/* Step header - clickable */}
-      <div 
+      <div
         className="flex cursor-pointer items-center gap-3 py-1.5 transition-opacity hover:opacity-80 select-none"
         onClick={handleToggle}
       >
         <div className="flex items-center justify-center shrink-0">
           {getStatusIcon()}
         </div>
-        
+
         <span className={cn(
           "text-[12px] font-medium tracking-tight transition-colors font-sans flex-1 min-w-0",
           status === "running" ? "text-primary" : "text-muted-foreground group-hover/step:text-foreground/80"
@@ -493,11 +493,11 @@ function AgentStepImpl({
           </div>
         )}
 
-        <ChevronDown 
+        <ChevronDown
           className={cn(
             "ml-auto h-3.5 w-3.5 text-muted-foreground/30 transition-transform duration-300 shrink-0",
             isExpanded && "rotate-180"
-          )} 
+          )}
         />
       </div>
 
@@ -549,7 +549,7 @@ function AgentStepImpl({
                               copyState === "success" ? "text-green-600" : "text-destructive",
                             )}
                           >
-                          {copyStatusLabel}
+                            {copyStatusLabel}
                           </span>
                         )}
                       </div>
@@ -655,8 +655,8 @@ function AgentStepImpl({
                                   {visibleDiffEntries.length === 0 && diffEntries.length > 0 && !includeNoiseFields
                                     ? translate(locale, "agent.toolState.noiseOnlyChanges")
                                     : diffEntries.length === 0
-                                    ? translate(locale, "agent.toolState.noDiffChanges")
-                                    : translate(locale, "agent.toolState.noSearchResult")}
+                                      ? translate(locale, "agent.toolState.noDiffChanges")
+                                      : translate(locale, "agent.toolState.noSearchResult")}
                                 </div>
                               ) : (
                                 <div className="mt-2 space-y-2">
@@ -728,7 +728,7 @@ function AgentStepImpl({
             </div>
 
             {/* Scrollable log content */}
-            <div 
+            <div
               ref={scrollContainerRef}
               onScroll={handleScroll}
               onWheel={handleWheel}
@@ -759,12 +759,12 @@ function AgentStepImpl({
                         <span className={cn(
                           "whitespace-pre-wrap break-all",
                           isAddition ? "text-emerald-500/80" :
-                          isDeletion ? "text-rose-500/80" :
-                          log.startsWith("[Result]") ? "text-green-500/70" :
-                          log.startsWith("[Permission]") ? "text-amber-500/80" :
-                          log.startsWith("[Error]") || log.startsWith("[stderr]") ? "text-red-400/70" :
-                          log.includes("\u2713") || log.includes("success") ? "text-green-500/60" :
-                          "text-muted-foreground/70"
+                            isDeletion ? "text-rose-500/80" :
+                              log.startsWith("[Result]") ? "text-green-500/70" :
+                                log.startsWith("[Permission]") ? "text-amber-500/80" :
+                                  log.startsWith("[Error]") || log.startsWith("[stderr]") ? "text-red-400/70" :
+                                    log.includes("\u2713") || log.includes("success") ? "text-green-500/60" :
+                                      "text-muted-foreground/70"
                         )}>
                           {log}
                         </span>
