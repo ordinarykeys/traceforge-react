@@ -57,6 +57,69 @@ pub struct ThreadPermissionDiagnostics {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ThreadQueuePriorityDiagnostics {
+    pub now: i64,
+    pub next: i64,
+    pub later: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ThreadQueueReasonDiagnostics {
+    pub capacity: i64,
+    pub stale: i64,
+    pub manual: i64,
+    pub deduplicated: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ThreadQueueDiagnostics {
+    pub queue_limit: i64,
+    pub latest_depth: i64,
+    pub max_depth: i64,
+    pub pressure: String,
+    pub queued_count: i64,
+    pub dequeued_count: i64,
+    pub rejected_count: i64,
+    pub deduplicated_count: i64,
+    #[serde(default)]
+    pub reason: ThreadQueueReasonDiagnostics,
+    #[serde(default)]
+    pub queued_priority: ThreadQueuePriorityDiagnostics,
+    #[serde(default)]
+    pub dequeued_priority: ThreadQueuePriorityDiagnostics,
+    #[serde(default)]
+    pub rejected_priority: ThreadQueuePriorityDiagnostics,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ThreadRecoveryFailureDiagnostics {
+    pub query_end_aborted: i64,
+    pub query_end_error: i64,
+    pub query_end_max_iterations: i64,
+    pub query_end_stop_hook_prevented: i64,
+    pub lifecycle_failed: i64,
+    pub lifecycle_aborted: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ThreadRecoveryDiagnostics {
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub plan: String,
+    #[serde(default)]
+    pub interrupted_message_id: Option<String>,
+    #[serde(default)]
+    pub queued_recovery_id: Option<String>,
+    pub queue_count: i64,
+    pub queue_limit: i64,
+    #[serde(default)]
+    pub pressure: String,
+    #[serde(default)]
+    pub failure: ThreadRecoveryFailureDiagnostics,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ThreadDiagnosisActivity {
     #[serde(default)]
     pub kind: String,
@@ -76,6 +139,10 @@ pub struct ThreadDiagnostics {
     pub retry: ThreadRetryDiagnostics,
     #[serde(default)]
     pub permission: Option<ThreadPermissionDiagnostics>,
+    #[serde(default)]
+    pub queue: Option<ThreadQueueDiagnostics>,
+    #[serde(default)]
+    pub recovery: Option<ThreadRecoveryDiagnostics>,
     #[serde(default)]
     pub diagnosis_activity: Option<ThreadDiagnosisActivity>,
     #[serde(default)]

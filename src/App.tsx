@@ -86,6 +86,8 @@ function toFiniteNumber(value: unknown): number | null {
 }
 
 const GLOBAL_WAKE_SHORTCUT = "CommandOrControl+Shift+T";
+const AUTH_EFFECT_DUPLICATE_WINDOW_MS = 4_000;
+const authEffectBootAtByLabel = new Map<string, number>();
 
 function resolveTabFromDeepLink(raw: string): string | null {
   try {
@@ -125,6 +127,8 @@ function App() {
   const [isSiderVisible, setIsSiderVisible] = useState(true);
   const isLogoutProcessing = useRef(false);
   const hasFetchedOnMainOpenRef = useRef(false);
+  const localeRef = useRef(locale);
+  const authEffectInitializedRef = useRef(false);
 
   const [windowLabel, setWindowLabel] = useState<string>("");
   const [authStatus, setAuthStatus] = useState<
@@ -141,6 +145,10 @@ function App() {
   useEffect(() => {
     apiConfigRef.current = apiConfig;
   }, [apiConfig]);
+
+  useEffect(() => {
+    localeRef.current = locale;
+  }, [locale]);
 
   const setApiConfigStable = (next: ApiConfig | null) => {
     setApiConfig((prev) => {
@@ -229,7 +237,23 @@ function App() {
   useEffect(() => {
     const currentWindow = getCurrentWindow();
     const label = currentWindow.label;
-    debugAuth("effect:init", { label, locale });
+    const now = Date.now();
+    const lastBootAt = authEffectBootAtByLabel.get(label) ?? 0;
+    if (lastBootAt > 0 && now - lastBootAt < AUTH_EFFECT_DUPLICATE_WINDOW_MS) {
+      debugAuth("effect:init:skip-recent-window-bootstrap", {
+        label,
+        locale: localeRef.current,
+        elapsedMs: now - lastBootAt,
+      });
+      return;
+    }
+    authEffectBootAtByLabel.set(label, now);
+    if (authEffectInitializedRef.current) {
+      debugAuth("effect:init:skip-duplicate", { label, locale: localeRef.current });
+      return;
+    }
+    authEffectInitializedRef.current = true;
+    debugAuth("effect:init", { label, locale: localeRef.current });
     setWindowLabel(label);
     let isMounted = true;
     const unlistenPromises: Array<Promise<() => void>> = [];
@@ -261,7 +285,7 @@ function App() {
     const resetLoginUi = () => {
       setAuthStatus("unauthenticated");
       setLoginError(null);
-      setLoginStatusText(translate(locale, "login.status.connecting"));
+      setLoginStatusText(translate(localeRef.current, "login.status.connecting"));
     };
 
     if (label === "login") {
@@ -349,7 +373,12 @@ function App() {
             debugAuth("shortcut:wake:already-registered", { shortcut: GLOBAL_WAKE_SHORTCUT });
           }
         } catch (error) {
-          debugAuth("shortcut:wake:register-failed", error);
+          const message = error instanceof Error ? error.message : String(error);
+          if (message.toLowerCase().includes("already registered")) {
+            debugAuth("shortcut:wake:already-registered-race", { shortcut: GLOBAL_WAKE_SHORTCUT });
+          } else {
+            debugAuth("shortcut:wake:register-failed", error);
+          }
         }
       };
 
@@ -430,7 +459,7 @@ function App() {
         void unregisterGlobalShortcut(GLOBAL_WAKE_SHORTCUT).catch(() => undefined);
       }
     };
-  }, [locale, debugAuth, handleDeepLinkUrls, refreshUserInfo, routeAuthWindows, routeToLogin, switchToMainWindow]);
+  }, [debugAuth, handleDeepLinkUrls, refreshUserInfo, routeAuthWindows, routeToLogin, switchToMainWindow]);
 
   const isAgentMode = activeTab === "/agent";
 

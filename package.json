@@ -18,6 +18,7 @@
                     "verify:agent:guardrails":  "npx vite-node --script scripts/verify-agent-guardrails.ts",
                     "verify:agent:permissions":  "npx vite-node --script scripts/verify-agent-permissions.ts",
                     "verify:agent:commands":  "npx vite-node --script scripts/verify-agent-commands.ts",
+                    "verify:agent:persistence":  "npx vite-node --script scripts/verify-thread-persistence-runtime.ts",
                     "updater:publish":  "powershell -ExecutionPolicy Bypass -File scripts/publish-updater.ps1",
                     "updater:publish:flat":  "powershell -ExecutionPolicy Bypass -File scripts/publish-updater.ps1 -FlatLayout",
                     "tauri":  "npx tauri",

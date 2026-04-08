@@ -1,11 +1,9 @@
 ﻿import {
   AlertTriangle,
-  Archive,
   ChevronDown,
   ChevronRight,
   Folder,
   FolderOpen,
-  GitBranchPlus,
   MoreHorizontal,
   Pencil,
   Play,
@@ -141,6 +139,23 @@ const HIDDEN_WORKSPACE_KEYS_STORAGE_KEY = "traceforge.agent.hidden.workspace.key
 const WORKSPACE_SORT_MODE_STORAGE_KEY = "traceforge.agent.workspace.sort.mode.v1";
 const THREAD_RISK_FILTER_STORAGE_KEY = "traceforge.agent.thread.risk.filter.v1";
 const MAX_THREAD_DISPLAY_CHARS = 10;
+const SHOW_SIDEBAR_RISK_INSIGHTS = false;
+const EMPTY_THREAD_RISK_INFO: ThreadRiskInfo = {
+  score: 0,
+  severity: "normal",
+  suppressionRatioPct: 0,
+  fallbackSuppressed: 0,
+  fallbackUsed: 0,
+  retryEventCount: 0,
+  permissionHighRisk: 0,
+  permissionCritical: 0,
+  permissionHardToReverse: 0,
+  permissionShared: 0,
+  diagnosisStatus: null,
+  diagnosisHistoryCount: 0,
+  reason: null,
+  strategy: null,
+};
 
 function normalizeWorkspacePath(path: string): string {
   return path.trim().replace(/[\\/]+$/, "");
@@ -255,6 +270,10 @@ export const ThreadSidebar = memo(function ThreadSidebar({
   const [collapsedWorkspaceKeys, setCollapsedWorkspaceKeys] = useState<Set<string>>(new Set());
   const [workspaceSortMode, setWorkspaceSortMode] = useState<WorkspaceSortMode>("recent");
   const [threadRiskFilterMode, setThreadRiskFilterMode] = useState<ThreadRiskFilterMode>("all");
+  const effectiveWorkspaceSortMode: WorkspaceSortMode = SHOW_SIDEBAR_RISK_INSIGHTS ? workspaceSortMode : "recent";
+  const effectiveThreadRiskFilterMode: ThreadRiskFilterMode = SHOW_SIDEBAR_RISK_INSIGHTS
+    ? threadRiskFilterMode
+    : "all";
 
   useEffect(() => {
     try {
@@ -343,11 +362,6 @@ export const ThreadSidebar = memo(function ThreadSidebar({
     localStorage.setItem(WORKSPACE_ALIAS_STORAGE_KEY, JSON.stringify(next));
   };
 
-  const persistArchivedThreadIds = (next: Set<string>) => {
-    setArchivedThreadIds(next);
-    localStorage.setItem(ARCHIVED_THREAD_IDS_STORAGE_KEY, JSON.stringify(Array.from(next)));
-  };
-
   const persistHiddenWorkspaceKeys = (next: Set<string>) => {
     setHiddenWorkspaceKeys(next);
     localStorage.setItem(HIDDEN_WORKSPACE_KEYS_STORAGE_KEY, JSON.stringify(Array.from(next)));
@@ -391,7 +405,7 @@ export const ThreadSidebar = memo(function ThreadSidebar({
         const wsThreadsAll = [...(threadMap.get(workspacePath) ?? [])]
           .filter((thread) => !archivedThreadIds.has(thread.id))
           .sort((a, b) => {
-            if (workspaceSortMode === "risk") {
+            if (effectiveWorkspaceSortMode === "risk") {
               const riskA = getThreadRiskInfo(a);
               const riskB = getThreadRiskInfo(b);
               if (riskB.score !== riskA.score) return riskB.score - riskA.score;
@@ -403,7 +417,7 @@ export const ThreadSidebar = memo(function ThreadSidebar({
             return b.last_active - a.last_active;
           });
         const wsThreads =
-          threadRiskFilterMode === "high"
+          effectiveThreadRiskFilterMode === "high"
             ? wsThreadsAll.filter((thread) => getThreadRiskInfo(thread).severity === "high")
             : wsThreadsAll;
         const maxRiskScore = wsThreadsAll.reduce((max, thread) => {
@@ -427,12 +441,12 @@ export const ThreadSidebar = memo(function ThreadSidebar({
       });
 
     const filteredGroups =
-      threadRiskFilterMode === "high"
+      effectiveThreadRiskFilterMode === "high"
         ? groups.filter((group) => group.threads.length > 0 || group.key === selectedWorkspaceKey)
         : groups;
 
     return filteredGroups.sort((a, b) => {
-      if (workspaceSortMode === "risk") {
+      if (effectiveWorkspaceSortMode === "risk") {
         if (b.riskScore !== a.riskScore) return b.riskScore - a.riskScore;
         if (b.highRiskCount !== a.highRiskCount) return b.highRiskCount - a.highRiskCount;
       }
@@ -443,13 +457,16 @@ export const ThreadSidebar = memo(function ThreadSidebar({
     hiddenWorkspaceKeys,
     savedWorkspaces,
     selectedWorkspacePath,
-    threadRiskFilterMode,
+    effectiveThreadRiskFilterMode,
     threads,
     workspaceAliases,
-    workspaceSortMode,
+    effectiveWorkspaceSortMode,
   ]);
 
   const highRiskSpotlight = useMemo<SpotlightThreadItem[]>(() => {
+    if (!SHOW_SIDEBAR_RISK_INSIGHTS) {
+      return [];
+    }
     const list: SpotlightThreadItem[] = [];
     for (const workspace of workspaceGroups) {
       for (const thread of workspace.threads) {
@@ -521,14 +538,6 @@ export const ThreadSidebar = memo(function ThreadSidebar({
     }
   };
 
-  const handleCreatePermanentWorktree = (workspace: WorkspaceGroup) => {
-    if (!workspace.path) {
-      toast.error(translate(locale, "agent.sidebarWorkspacePathMissing"));
-      return;
-    }
-    toast.info(translate(locale, "agent.sidebarCreateWorktreeSoon"));
-  };
-
   const handleRenameWorkspace = (workspace: WorkspaceGroup) => {
     if (!workspace.path) {
       toast.error(translate(locale, "agent.sidebarWorkspacePathMissing"));
@@ -542,22 +551,6 @@ export const ThreadSidebar = memo(function ThreadSidebar({
     if (!trimmed) return;
     const nextAliases = { ...workspaceAliases, [workspace.path]: trimmed };
     persistWorkspaceAliases(nextAliases);
-  };
-
-  const handleArchiveWorkspaceThreads = (workspace: WorkspaceGroup) => {
-    if (workspace.threads.length === 0) return;
-    const next = new Set(archivedThreadIds);
-    let archivedCount = 0;
-    for (const thread of workspace.threads) {
-      if (!next.has(thread.id)) {
-        next.add(thread.id);
-        archivedCount += 1;
-      }
-    }
-    persistArchivedThreadIds(next);
-    toast.success(
-      translate(locale, "agent.sidebarArchiveThreadsDone").replace("{count}", String(archivedCount)),
-    );
   };
 
   const handleRemoveWorkspace = (workspace: WorkspaceGroup) => {
@@ -620,7 +613,7 @@ export const ThreadSidebar = memo(function ThreadSidebar({
   const noWorkspaceText = translate(locale, "agent.sidebarNoWorkspaces");
   const noThreadText = translate(locale, "agent.sidebarNoThreadsShort");
   const noHighRiskThreadText = translate(locale, "agent.sidebarNoHighRiskThreads");
-  const emptyWorkspaceListText = threadRiskFilterMode === "high" ? noHighRiskThreadText : noWorkspaceText;
+  const emptyWorkspaceListText = effectiveThreadRiskFilterMode === "high" ? noHighRiskThreadText : noWorkspaceText;
   const sortByRecentLabel = translate(locale, "agent.sidebarSortRecent");
   const sortByRiskLabel = translate(locale, "agent.sidebarSortRisk");
   const riskFilterAllLabel = translate(locale, "agent.sidebarRiskFilterAll");
@@ -634,49 +627,51 @@ export const ThreadSidebar = memo(function ThreadSidebar({
       <header className="flex h-11 items-center justify-between px-4">
         <span className="text-[12px] font-semibold text-foreground/80">{headerTitle}</span>
         <div className="flex items-center gap-1">
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7 text-muted-foreground/60 hover:text-foreground"
-                title={translate(locale, "agent.sidebarSortFilterTitle")}
-              >
-                <MoreHorizontal size={14} />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-[220px]">
-              <div className="px-2 py-1.5 text-[11px] font-medium text-muted-foreground/80">
-                {translate(locale, "agent.sidebarSortModeTitle")}
-              </div>
-              <DropdownMenuRadioGroup
-                value={workspaceSortMode}
-                onValueChange={(value) => {
-                  if (value === "risk" || value === "recent") {
-                    persistWorkspaceSortMode(value);
-                  }
-                }}
-              >
-                <DropdownMenuRadioItem value="recent">{sortByRecentLabel}</DropdownMenuRadioItem>
-                <DropdownMenuRadioItem value="risk">{sortByRiskLabel}</DropdownMenuRadioItem>
-              </DropdownMenuRadioGroup>
-              <DropdownMenuSeparator />
-              <div className="px-2 py-1.5 text-[11px] font-medium text-muted-foreground/80">
-                {translate(locale, "agent.sidebarRiskFilterTitle")}
-              </div>
-              <DropdownMenuRadioGroup
-                value={threadRiskFilterMode}
-                onValueChange={(value) => {
-                  if (value === "all" || value === "high") {
-                    persistThreadRiskFilterMode(value);
-                  }
-                }}
-              >
-                <DropdownMenuRadioItem value="all">{riskFilterAllLabel}</DropdownMenuRadioItem>
-                <DropdownMenuRadioItem value="high">{riskFilterHighLabel}</DropdownMenuRadioItem>
-              </DropdownMenuRadioGroup>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          {SHOW_SIDEBAR_RISK_INSIGHTS && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 text-muted-foreground/60 hover:text-foreground"
+                  title={translate(locale, "agent.sidebarSortFilterTitle")}
+                >
+                  <MoreHorizontal size={14} />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-[220px]">
+                <div className="px-2 py-1.5 text-[11px] font-medium text-muted-foreground/80">
+                  {translate(locale, "agent.sidebarSortModeTitle")}
+                </div>
+                <DropdownMenuRadioGroup
+                  value={workspaceSortMode}
+                  onValueChange={(value) => {
+                    if (value === "risk" || value === "recent") {
+                      persistWorkspaceSortMode(value);
+                    }
+                  }}
+                >
+                  <DropdownMenuRadioItem value="recent">{sortByRecentLabel}</DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="risk">{sortByRiskLabel}</DropdownMenuRadioItem>
+                </DropdownMenuRadioGroup>
+                <DropdownMenuSeparator />
+                <div className="px-2 py-1.5 text-[11px] font-medium text-muted-foreground/80">
+                  {translate(locale, "agent.sidebarRiskFilterTitle")}
+                </div>
+                <DropdownMenuRadioGroup
+                  value={threadRiskFilterMode}
+                  onValueChange={(value) => {
+                    if (value === "all" || value === "high") {
+                      persistThreadRiskFilterMode(value);
+                    }
+                  }}
+                >
+                  <DropdownMenuRadioItem value="all">{riskFilterAllLabel}</DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="high">{riskFilterHighLabel}</DropdownMenuRadioItem>
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
           <Button
             variant="ghost"
             size="icon"
@@ -817,7 +812,7 @@ export const ThreadSidebar = memo(function ThreadSidebar({
                       </span>
                     </div>
 
-                    {workspace.highRiskCount > 0 && (
+                    {SHOW_SIDEBAR_RISK_INSIGHTS && workspace.highRiskCount > 0 && (
                       <span
                         className="inline-flex items-center rounded border border-amber-500/40 bg-amber-500/10 px-1 py-0.5 text-[10px] text-amber-600 dark:text-amber-300"
                         title={translate(locale, "agent.sidebarRiskBadgeHigh").replace(
@@ -864,17 +859,9 @@ export const ThreadSidebar = memo(function ThreadSidebar({
                             <FolderOpen size={13} className="mr-2" />
                             {translate(locale, "agent.sidebarMenuOpenInExplorer")}
                           </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => handleCreatePermanentWorktree(workspace)}>
-                            <GitBranchPlus size={13} className="mr-2" />
-                            {translate(locale, "agent.sidebarMenuCreateWorktree")}
-                          </DropdownMenuItem>
                           <DropdownMenuItem onClick={() => handleRenameWorkspace(workspace)}>
                             <Pencil size={13} className="mr-2" />
                             {translate(locale, "agent.sidebarMenuEditName")}
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onClick={() => handleArchiveWorkspaceThreads(workspace)}>
-                            <Archive size={13} className="mr-2" />
-                            {translate(locale, "agent.sidebarMenuArchiveThreads")}
                           </DropdownMenuItem>
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
@@ -891,12 +878,12 @@ export const ThreadSidebar = memo(function ThreadSidebar({
 
                   {isCollapsed ? null : workspace.threads.length === 0 ? (
                     <div className="pl-6 pr-1 py-1 text-[12px] text-muted-foreground/55">
-                      {threadRiskFilterMode === "high" ? noHighRiskThreadText : noThreadText}
+                      {effectiveThreadRiskFilterMode === "high" ? noHighRiskThreadText : noThreadText}
                     </div>
                   ) : (
                     <div className="space-y-0.5 pl-3">
                       {workspace.threads.map((thread) => {
-                        const risk = getThreadRiskInfo(thread);
+                        const risk = SHOW_SIDEBAR_RISK_INSIGHTS ? getThreadRiskInfo(thread) : EMPTY_THREAD_RISK_INFO;
                         const permissionSignalCount =
                           risk.permissionCritical +
                           risk.permissionHighRisk +
@@ -904,6 +891,7 @@ export const ThreadSidebar = memo(function ThreadSidebar({
                           risk.permissionShared;
                         const diagnosisActivity = thread.diagnostics?.diagnosis_activity;
                         const diagnosisVisible =
+                          SHOW_SIDEBAR_RISK_INSIGHTS &&
                           typeof diagnosisActivity?.command === "string" &&
                           diagnosisActivity.command.trim().length > 0;
                         const diagnosisKindLabel = getDiagnosisKindLabel(locale, diagnosisActivity?.kind);
@@ -1014,7 +1002,7 @@ export const ThreadSidebar = memo(function ThreadSidebar({
                             </div>
 
                             <div className="flex items-center gap-1.5">
-                              {risk.diagnosisHistoryCount > 0 && (
+                              {SHOW_SIDEBAR_RISK_INSIGHTS && risk.diagnosisHistoryCount > 0 && (
                                 <span
                                   className="inline-flex max-w-[70px] items-center rounded border border-primary/35 bg-primary/10 px-1 py-0.5 text-[10px] text-primary/90"
                                   title={riskTooltip}
@@ -1022,7 +1010,7 @@ export const ThreadSidebar = memo(function ThreadSidebar({
                                   {diagnosisHistoryBadgeLabel}
                                 </span>
                               )}
-                              {risk.severity !== "normal" && (
+                              {SHOW_SIDEBAR_RISK_INSIGHTS && risk.severity !== "normal" && (
                                 <span
                                   className={cn(
                                     "inline-flex max-w-[64px] items-center rounded border px-1 py-0.5 text-[10px]",
@@ -1035,7 +1023,7 @@ export const ThreadSidebar = memo(function ThreadSidebar({
                                   {riskLabel}
                                 </span>
                               )}
-                              {permissionSignalCount > 0 && (
+                              {SHOW_SIDEBAR_RISK_INSIGHTS && permissionSignalCount > 0 && (
                                 <span
                                   className="inline-flex max-w-[70px] items-center rounded border border-violet-500/40 bg-violet-500/10 px-1 py-0.5 text-[10px] text-violet-600 dark:text-violet-300"
                                   title={riskTooltip}

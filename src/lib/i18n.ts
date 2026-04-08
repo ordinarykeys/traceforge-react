@@ -484,8 +484,20 @@ const enUS: Record<string, string> = {
   "agent.diff.diagnosisFallbackStarted": "Fallback investigation submitted.",
   "agent.diff.diagnosisFallbackQueued": "Fallback investigation queued.",
   "agent.diff.diagnosisFallbackMissingThread": "Current thread has no retry diagnostics yet.",
+  "agent.diff.diagnosisRiskPrepare": "Prepare risk investigate",
+  "agent.diff.diagnosisRiskRun": "Run risk investigate",
+  "agent.diff.diagnosisRiskPrepared": "Risk investigation command prepared.",
+  "agent.diff.diagnosisRiskStarted": "Risk investigation submitted.",
+  "agent.diff.diagnosisRiskQueued": "Risk investigation queued.",
+  "agent.diff.diagnosisRiskMissingThread": "Current thread has no risk diagnostics yet.",
   "agent.diff.diagnosisQueueTrack": "Diagnosis queue",
   "agent.diff.diagnosisQueueTrackEmpty": "No diagnosis commands queued.",
+  "agent.diff.diagnosisQueueRecorded":
+    "recorded | pressure {pressure} | latest Q{latest}/{limit} | peak Q{max}/{limit} | queued {queued} | dequeued {dequeued} | rejected {rejected} | deduplicated {deduplicated}",
+  "agent.diff.diagnosisQueueRecordedReasons":
+    "recorded reasons | capacity {capacity} | stale {stale} | manual {manual}",
+  "agent.diff.diagnosisQueueRecordedPriority":
+    "recorded queued priority | now {now} | next {next} | later {later}",
   "agent.diff.diagnosisRunbookActionsTitle": "Runbook actions",
   "agent.diff.diagnosisActionPrepare": "Prepare",
   "agent.diff.diagnosisActionRun": "Run",
@@ -495,6 +507,32 @@ const enUS: Record<string, string> = {
   "agent.diff.diagnosisRecommendationFallbackReason": "Fallback suppression is active; investigate retry policy first.",
   "agent.diff.diagnosisRecommendationHotspotReason": "Tool {tool} shows concentrated failures.",
   "agent.diff.diagnosisRecommendationFailedReason": "Replay the latest failed diagnosis to verify stability.",
+  "agent.diff.diagnosisRecommendationRecoverReason":
+    "Interrupted turn is pending; prioritize auto recovery before new work.",
+  "agent.diff.diagnosisRecommendationRecoverPlanReason":
+    "Generate a deterministic recovery runbook before execution to reduce accidental path switching.",
+  "agent.diff.diagnosisRecommendationRecoverExecuteStrictReason":
+    "Recovery needs deterministic verification; run strict execute gate for status and queue checks.",
+  "agent.diff.diagnosisRecommendationRecoverInvestigateReason":
+    "Recovery failure signals are accumulating; run targeted recover diagnostics.",
+  "agent.diff.diagnosisRecommendationQueueHealReason":
+    "Recovery is blocked by queue pressure; heal stale and duplicate queue items first.",
+  "agent.diff.diagnosisRecommendationQueueInvestigateReason":
+    "Queue pressure remains unstable; run /doctor queue investigate for deterministic queue remediation.",
+  "agent.diff.diagnosisRecoveryTitle": "Recovery snapshot",
+  "agent.diff.diagnosisRecoverySummary":
+    "state={state} | plan={plan} | queue={queue}/{limit} | pressure={pressure}",
+  "agent.diff.diagnosisRecoveryQueuedId": "queued recovery: {id}",
+  "agent.diff.diagnosisRecoveryFailure":
+    "failures: aborted={aborted}, error={error}, max_iter={maxIterations}, stop_hook={stopHook}, lifecycle_failed={lifecycleFailed}, lifecycle_aborted={lifecycleAborted}",
+  "agent.diff.diagnosisRecoverAutoRun": "Run /recover auto",
+  "agent.diff.diagnosisRecoverPlanRun": "Run /recover plan",
+  "agent.diff.diagnosisRecoverResumeRun": "Run /recover resume",
+  "agent.diff.diagnosisRecoverExecuteRun": "Run /recover execute",
+  "agent.diff.diagnosisRecoverExecuteStrictRun": "Run /recover execute --strict",
+  "agent.diff.diagnosisRecoverInvestigateRun": "Run /doctor recover investigate",
+  "agent.diff.diagnosisQueueHealRun": "Run /queue heal",
+  "agent.diff.diagnosisQueueInvestigateRun": "Run /doctor queue investigate",
   "agent.diff.diagnosisSeverityHigh": "High risk",
   "agent.diff.diagnosisSeverityMedium": "Medium risk",
   "agent.diff.diagnosisSeverityLow": "Low risk",
@@ -606,10 +644,158 @@ const enUS: Record<string, string> = {
   "agent.command.status.queuePriority":
     "Queue priority: {nowLabel}={now} {nextLabel}={next} {laterLabel}={later}",
   "agent.command.status.queuePressure": "Queue pressure: {pressure}",
+  "agent.command.status.recovery": "Recovery: {status}",
+  "agent.command.status.recoveryQueue": "Recovery queue: count={count}, first={id}",
+  "agent.command.status.recoveryPlan": "Recovery plan: {plan}",
+  "agent.command.status.recovery.none": "none",
+  "agent.command.status.recovery.awaiting_assistant": "awaiting assistant",
+  "agent.command.status.recovery.assistant_incomplete": "assistant incomplete",
   "agent.command.status.tasks": "Tasks: running {running} / total {total}",
   "agent.command.status.tools": "Tools: {count}",
   "agent.command.status.permissionMode": "Permission mode: {mode}",
   "agent.command.status.permissionRules": "Permission rules: {count}",
+  "agent.command.status.toolBudgetPolicy":
+    "Tool budget policy: readonly={readOnlyBase}, mutating={mutatingBase}, shell={shellBase}, min={minimum}, backoffStep={failureBackoffStep}",
+  "agent.command.status.failureClasses": "Recent failure classes: {details}",
+  "agent.command.status.budgetGuards": "Recent budget guards: {count}",
+  "agent.command.budget.description": "Inspect or tune tool call budget policy",
+  "agent.command.budget.usage":
+    "/budget [show|reset|set readonly=<n> mutating=<n> shell=<n> min=<n> backoff=<n>]",
+  "agent.command.budget.title": "Tool Budget Policy",
+  "agent.command.budget.policy":
+    "readonly={readOnlyBase}, mutating={mutatingBase}, shell={shellBase}, min={minimum}, backoffStep={failureBackoffStep}",
+  "agent.command.budget.updated": "Budget policy updated.",
+  "agent.command.budget.reset": "Budget policy reset to defaults.",
+  "agent.command.budget.setMissing":
+    "No valid fields provided. Example: /budget set readonly=28 mutating=18 shell=12 min=4 backoff=2",
+  "agent.command.budget.unknownKeys": "Ignored unknown keys: {keys}",
+  "agent.command.budget.invalidKeys": "Ignored invalid numeric values for: {keys}",
+  "agent.command.budget.invalidSubcommand":
+    "Unknown /budget subcommand: {subcommand}. Use /budget show, /budget reset, or /budget set ...",
+  "agent.command.queue.description": "Inspect or manage queued follow-up queries",
+  "agent.command.queue.usage":
+    "/queue [list|clear|ops [limit] [summary] [action=<...>] [reason=<...>] [priority=<...>]|heal|compact|remove <id>|priority <id> <now|next|later>|now <id>|next <id>|later <id>]",
+  "agent.command.queue.title": "Queued follow-up queries",
+  "agent.command.queue.summary":
+    "Queue {count}/{limit} | {nowLabel}={now} {nextLabel}={next} {laterLabel}={later}",
+  "agent.command.queue.empty": "Queue is empty.",
+  "agent.command.queue.item":
+    "- {id} [{priority}] at {queuedAt} | model={model} | {preview}",
+  "agent.command.queue.opsTitle": "Queue operations ({count})",
+  "agent.command.queue.opsEmpty": "No queue operations recorded yet.",
+  "agent.command.queue.opsLine":
+    "- {at} | {action} | Q{queueCount}/{queueLimit} | prio={priority} | reason={reason}",
+  "agent.command.queue.opsInvalidFilter":
+    "Invalid /queue ops filter. Use action=<queued|dequeued|rejected|all> reason=<capacity|stale|manual|deduplicated|none|all> priority=<now|next|later|none|all>.",
+  "agent.command.queue.opsSummaryWindow":
+    "summary | events={count} | pressure={pressure} | latest Q{latest}/{limit} | max Q{max}/{limit}",
+  "agent.command.queue.opsSummaryActions":
+    "actions | queued={queued} | dequeued={dequeued} | rejected={rejected}",
+  "agent.command.queue.opsSummaryReasons":
+    "reasons | capacity={capacity} | stale={stale} | manual={manual} | deduplicated={deduplicated} | none={none}",
+  "agent.command.queue.opsSummaryPriorities":
+    "priority | now={now} | next={next} | later={later} | none={none}",
+  "agent.command.queue.opsSummaryRecent": "recent events:",
+  "agent.command.queue.healNoChange": "Queue heal found no issues ({before} -> {after}).",
+  "agent.command.queue.healSummary": "Queue heal completed ({before} -> {after}).",
+  "agent.command.queue.healStaleRemoved": "stale removed={count} (older than {minutes}m)",
+  "agent.command.queue.healDuplicateRemoved": "duplicates removed={removed} across groups={groups}",
+  "agent.command.queue.healNextStep": "Next: run /queue ops summary to verify pressure trend.",
+  "agent.command.queue.cleared": "Queue cleared: removed {removed}, remaining {remaining}.",
+  "agent.command.queue.compactNoChange": "No duplicated queued queries found.",
+  "agent.command.queue.compactResult":
+    "Queue compacted: removed {removed} duplicated items across {groups} groups, remaining {remaining}.",
+  "agent.command.queue.missingId":
+    "Missing queue id. Usage: /queue remove <id> or /queue priority <id> <now|next|later>",
+  "agent.command.queue.notFound": "Queue item not found: {id}",
+  "agent.command.queue.removed": "Removed queue item: {id}",
+  "agent.command.queue.invalidPriority":
+    "Invalid priority: {value}. Expected now|next|later.",
+  "agent.command.queue.priorityUpdated": "Queue priority updated: {id} -> {priority}",
+  "agent.command.recover.description": "Inspect interrupted turn state or resume it",
+  "agent.command.recover.usage":
+    "/recover [status|plan|runbook|resume|auto|execute [--strict]|strict|investigate key=value ...]",
+  "agent.command.recover.title": "Turn recovery",
+  "agent.command.recover.state.none": "No interrupted turn detected.",
+  "agent.command.recover.state.interrupted":
+    "Interrupted turn detected: {reason} (message id: {id})",
+  "agent.command.recover.reason.awaiting_assistant": "awaiting assistant response",
+  "agent.command.recover.reason.assistant_incomplete": "assistant turn incomplete",
+  "agent.command.recover.statusPlan": "Recovery plan: {plan}",
+  "agent.command.recover.statusQueuedRecovery": "Queued recovery detected: id={id}, priority={priority}",
+  "agent.command.recover.statusHintPlan": "Run /recover plan for a step-by-step runbook before execution.",
+  "agent.command.recover.plan.none": "none",
+  "agent.command.recover.plan.queued_recovery": "reuse queued recovery",
+  "agent.command.recover.plan.resume_now": "resume immediately",
+  "agent.command.recover.plan.heal_then_resume": "heal queue, then resume",
+  "agent.command.recover.planTitle": "Recovery runbook",
+  "agent.command.recover.planScope":
+    "scope | state={state} | plan={plan} | queue={queue}/{limit} ({pressure})",
+  "agent.command.recover.planActionNone": "- No active interruption: no recovery action is required.",
+  "agent.command.recover.planActionQueued":
+    "- Keep existing queued recovery (id={id}, priority={priority}) and monitor with /recover status.",
+  "agent.command.recover.planActionHeal":
+    "- Step 0: run /queue heal to reduce queue pressure before resume.",
+  "agent.command.recover.planActionResume":
+    "- Step 1: run /recover auto to resume with queue-aware policy.",
+  "agent.command.recover.planActionStrict":
+    "- Step 2: run /recover execute --strict for deterministic status/queue gates.",
+  "agent.command.recover.planActionInvestigate":
+    "- If interruption persists, run /doctor recover investigate.",
+  "agent.command.recover.hint": "Run /recover resume to continue from where the turn stopped.",
+  "agent.command.recover.noInterruption": "No interrupted turn to resume.",
+  "agent.command.recover.continuePrompt": "Continue from where you left off.",
+  "agent.command.recover.resumeAutoPolicyNow":
+    "Auto recovery policy selected immediate resume (priority=now).",
+  "agent.command.recover.resumeAutoPolicyNext":
+    "Auto recovery policy selected queued resume under pressure (priority=next).",
+  "agent.command.recover.resumeQueueFull": "Cannot resume now: queue is full ({queue}/{limit}).",
+  "agent.command.recover.resumeQueueFullAfterPrune":
+    "Tried queue pre-cleanup: stale removed={count} (older than {minutes}m), but capacity is still full.",
+  "agent.command.recover.resumeQueueFullHintHeal":
+    "Next: run /queue heal to compact stale/duplicate queue entries, then retry /recover resume.",
+  "agent.command.recover.resumeQueueFullHintInvestigate":
+    "If this repeats, run /doctor recover investigate for targeted recovery diagnostics.",
+  "agent.command.recover.resumeFailed": "Failed to enqueue recovery prompt.",
+  "agent.command.recover.resumeFailedHintInvestigate":
+    "Run /doctor recover investigate to inspect interruption and terminal-failure signals.",
+  "agent.command.recover.resumeStarted": "Recovery started immediately.",
+  "agent.command.recover.resumeQueued": "Recovery prompt queued ({queue}/{limit}).",
+  "agent.command.recover.resumeQueuedId": "Queued recovery id: {id}",
+  "agent.command.recover.resumePrunedStale": "Queue pre-cleanup removed stale entries={count} (>{minutes}m).",
+  "agent.command.recover.resumeNextStep": "Next: run /recover status to verify interruption clears.",
+  "agent.command.recover.resumeAlreadyQueued":
+    "Recovery prompt already queued (id={id}) ({queue}/{limit}). Reusing existing queued recovery.",
+  "agent.command.recover.resumeAlreadyQueuedPromoted":
+    "Promoted queued recovery priority to now (id={id}).",
+  "agent.command.recover.resumeAlreadyQueuedHint":
+    "No duplicate recovery was enqueued. Wait for this recovery item, or inspect queue with /queue list.",
+  "agent.command.recover.executeTitle": "One-shot recovery execution",
+  "agent.command.recover.executeChecklistTitle": "Verification checklist:",
+  "agent.command.recover.executeChecklistStatus":
+    "1) Run /recover status and confirm interruption state clears.",
+  "agent.command.recover.executeChecklistQueueRequired":
+    "2) Queue pressure was high: run /queue ops summary (and /queue heal if needed).",
+  "agent.command.recover.executeChecklistQueueOptional":
+    "2) Optionally run /queue ops summary to confirm queue pressure trend.",
+  "agent.command.recover.executeChecklistInvestigate":
+    "3) If interruption persists, run /doctor recover investigate.",
+  "agent.command.recover.executeStrictTitle": "Strict gate:",
+  "agent.command.recover.executeStrictPass": "STRICT PASS: recovery submission accepted.",
+  "agent.command.recover.executeStrictNoop": "STRICT PASS: no interrupted turn remains.",
+  "agent.command.recover.executeStrictFail": "STRICT FAIL: recovery submission was not accepted.",
+  "agent.command.recover.executeStrictStatusCheck":
+    "Strict check: run /recover status and ensure interruption is cleared.",
+  "agent.command.recover.executeStrictQueueCheckRequired":
+    "Strict check: queue pressure was high, run /queue ops summary (and /queue heal if still congested).",
+  "agent.command.recover.executeStrictQueueCheckOptional":
+    "Strict check: optionally run /queue ops summary to confirm healthy queue trend.",
+  "agent.command.recover.invalidSubcommand":
+    "Unknown /recover subcommand: {subcommand}. Use /recover status, /recover plan, /recover runbook, /recover resume, /recover auto, /recover execute, /recover strict, or /recover investigate.",
+  "agent.recover.autoResumeDetected":
+    "Interrupted turn detected on thread load. Attempting automatic recovery...",
+  "agent.recover.autoResumeUnavailable":
+    "Automatic recovery is unavailable right now. You can run /recover resume manually.",
   "agent.command.permissions.description": "Inspect and manage permission rules",
   "agent.command.permissions.usage": "/permissions [allow-workspace|clear-rules]",
   "agent.command.permissions.summary.mode": "Mode: {mode}",
@@ -746,12 +932,16 @@ const enUS: Record<string, string> = {
     "fallback used {used}, suppressed {suppressed} | latest reason {reason} | strategy {strategy}",
   "agent.command.trace.summaryQueuePriority":
     "queue priority | {nowLabel} +{nowQueued}/-{nowDequeued}/!{nowRejected} | {nextLabel} +{nextQueued}/-{nextDequeued}/!{nextRejected} | {laterLabel} +{laterQueued}/-{laterDequeued}/!{laterRejected}",
+  "agent.command.trace.summaryFailureClasses": "failure classes | {details}",
+  "agent.command.trace.summaryBudgetGuards": "budget guards | {count}",
   "agent.command.trace.summaryGlobalHotspots": "global hotspots {hotspots}",
   "agent.command.trace.summaryGlobalFallback": "global fallback used {used}, suppressed {suppressed}",
   "agent.command.trace.summaryGlobalFallbackDetailed":
     "global fallback used {used}, suppressed {suppressed} | latest reason {reason} | strategy {strategy}",
   "agent.command.trace.summaryGlobalQueuePriority":
     "global queue priority | {nowLabel} +{nowQueued}/-{nowDequeued}/!{nowRejected} | {nextLabel} +{nextQueued}/-{nextDequeued}/!{nextRejected} | {laterLabel} +{laterQueued}/-{laterDequeued}/!{laterRejected}",
+  "agent.command.trace.summaryGlobalFailureClasses": "global failure classes | {details}",
+  "agent.command.trace.summaryGlobalBudgetGuards": "global budget guards | {count}",
   "agent.command.trace.riskProfile": "risk profile {risks}",
   "agent.command.trace.riskProfileMatrix":
     "risk profile matrix reversibility(reversible={reversible}, mixed={mixed}, hard-to-reverse={hardToReverse}) | blast-radius(local={local}, workspace={workspace}, shared={shared})",
@@ -769,7 +959,8 @@ const enUS: Record<string, string> = {
   "agent.command.trace.filterReversibility": "reversibility {value}",
   "agent.command.trace.filterBlastRadius": "blast-radius {value}",
   "agent.command.doctor.description": "Run runtime diagnostics",
-  "agent.command.doctor.usage": "/doctor [fallback investigate key=value ...]",
+  "agent.command.doctor.usage":
+    "/doctor [fallback investigate key=value ...|queue investigate key=value ...|recover investigate key=value ...]",
   "agent.command.doctor.title": "Lumo Coding Doctor",
   "agent.command.doctor.fallbackInvestigateTitle": "Fallback suppression investigation",
   "agent.command.doctor.fallbackInvestigateScope":
@@ -793,6 +984,65 @@ const enUS: Record<string, string> = {
   "agent.command.doctor.fallbackInvestigateVerifyDoctor": "- Re-run diagnostics: /doctor",
   "agent.command.doctor.fallbackInvestigateVerifyOutcome":
     "- Re-run the failing request once and confirm suppression trend improves.",
+  "agent.command.doctor.recoverInvestigateTitle": "Interrupted-turn recovery investigation",
+  "agent.command.doctor.recoverInvestigateScope":
+    "scope | recovery {state} | last message {message} | queue {queue}/{limit} ({pressure}) | running tasks {running} | query_end(aborted={aborted}, error={error}, max_iterations={maxIterations}, stop_hook={stopHook}) | lifecycle(failed={lifecycleFailed}, aborted={lifecycleAborted}) | queue_rejected={rejected}",
+  "agent.command.doctor.recoverInvestigateAssessmentHigh":
+    "Assessment: recovery risk exists. Resume interrupted turn first, then stabilize queue pressure and terminal failures.",
+  "agent.command.doctor.recoverInvestigateAssessmentNormal":
+    "Assessment: no active interruption detected; keep monitoring and only intervene if interruption reappears.",
+  "agent.command.doctor.recoverInvestigateDiagnosisHeader": "[Diagnosis]",
+  "agent.command.doctor.recoverInvestigateDiagnosisRecoverState":
+    "- Confirm interruption marker and anchor message: /recover status",
+  "agent.command.doctor.recoverInvestigateDiagnosisTraceSummary":
+    "- Review terminal failure trend for recent runs: /trace summary failure runs=6",
+  "agent.command.doctor.recoverInvestigateFixHeader": "[Minimal fix]",
+  "agent.command.doctor.recoverInvestigateFixResume":
+    "- Resume the interrupted turn with highest priority: /recover resume",
+  "agent.command.doctor.recoverInvestigateFixResumeIfNeeded":
+    "- If interruption reappears, resume immediately before sending unrelated prompts: /recover resume",
+  "agent.command.doctor.recoverInvestigateFixQueueHeal":
+    "- Queue rejection/churn detected. Heal queue before retrying: /queue heal",
+  "agent.command.doctor.recoverInvestigateFixQueueHealIfNeeded":
+    "- If queue pressure rises during recovery, run queue self-heal: /queue heal",
+  "agent.command.doctor.recoverInvestigateFixExecuteStrict":
+    "- Enforce strict gate before continuing: /recover execute --strict",
+  "agent.command.doctor.recoverInvestigateFixExecuteStrictIfNeeded":
+    "- Optional hardening after recovery: /recover execute --strict",
+  "agent.command.doctor.recoverInvestigateVerifyHeader": "[Verification]",
+  "agent.command.doctor.recoverInvestigateVerifyRecoverStatus":
+    "- Verify interruption state returns to healthy: /recover status",
+  "agent.command.doctor.recoverInvestigateVerifyDoctor":
+    "- Re-run full diagnostics to confirm no secondary regressions: /doctor",
+  "agent.command.doctor.recoverInvestigateVerifyOutcome":
+    "- Re-run one representative prompt and confirm end-to-end completion without interruption.",
+  "agent.command.doctor.queueInvestigateTitle": "Queue pressure investigation",
+  "agent.command.doctor.queueInvestigateScope":
+    "scope | pressure {pressure} | latest Q{latest}/{limit} | peak Q{max}/{limit} | queued {queued} | dequeued {dequeued} | rejected {rejected} | deduplicated {deduplicated} | capacity {capacity} | stale {stale} | manual {manual} | dominant priority {dominant}",
+  "agent.command.doctor.queueInvestigateAssessmentHigh":
+    "Assessment: queue pressure is elevated. Prioritize queue relief and submission deduplication first.",
+  "agent.command.doctor.queueInvestigateAssessmentNormal":
+    "Assessment: queue pressure is currently moderate; keep observing while applying minimal tuning.",
+  "agent.command.doctor.queueInvestigateDiagnosisHeader": "[Diagnosis]",
+  "agent.command.doctor.queueInvestigateDiagnosisQueueOps":
+    "- Review queue operations timeline: /queue ops 20",
+  "agent.command.doctor.queueInvestigateDiagnosisTraceHotspots":
+    "- Re-check queue-related trace hotspots: /trace hotspots queue warnings failure runs=3",
+  "agent.command.doctor.queueInvestigateFixHeader": "[Minimal fix]",
+  "agent.command.doctor.queueInvestigateFixHeal":
+    "- Run queue self-heal first to remove stale/duplicate backlog: /queue heal",
+  "agent.command.doctor.queueInvestigateFixHealIfNeeded":
+    "- If churn persists, run queue self-heal to remove stale/duplicate backlog: /queue heal",
+  "agent.command.doctor.queueInvestigateFixCompact":
+    "- Compact duplicated queued intents: /queue compact",
+  "agent.command.doctor.queueInvestigateFixPriority":
+    "- Prioritize urgent turns explicitly and avoid repeated 'now' bursts.",
+  "agent.command.doctor.queueInvestigateVerifyHeader": "[Verification]",
+  "agent.command.doctor.queueInvestigateVerifyStatus": "- Verify queue pressure and depth: /status",
+  "agent.command.doctor.queueInvestigateVerifyQueueOps":
+    "- Confirm queue trend stabilization: /queue ops 20",
+  "agent.command.doctor.queueInvestigateVerifyOutcome":
+    "- Re-submit one representative request and ensure it no longer suffers queue churn.",
   "agent.command.doctor.apiReady": "Model routing is ready (current model: {model})",
   "agent.command.doctor.apiMissing": "Model routing is not configured yet.",
   "agent.command.doctor.workspaceMissing": "No workspace selected for this thread.",
@@ -820,9 +1070,26 @@ const enUS: Record<string, string> = {
     "Prompt governance. owner(core={core}, safeguards={safeguards}, runtime={runtime}), immutable={immutable}, launch-calibrated={launch}",
   "agent.command.doctor.promptStatsMissing":
     "Prompt compiler stats unavailable (no recent prompt compilation event).",
+  "agent.command.doctor.toolFailureSummary":
+    "Tool failure diagnostics. total={total}, classes={details}",
+  "agent.command.doctor.toolBudgetGuardSummary":
+    "Tool budget guard diagnostics. total={total}, per-limit={perToolLimit}, failure-backoff={failureBackoff}, dominant={dominant}",
   "agent.command.doctor.queueHealthy": "Queue healthy. queued={queue}/{limit} ({pct}%)",
   "agent.command.doctor.queueHigh": "Queue pressure is high. queued={queue}/{limit} ({pct}%)",
   "agent.command.doctor.queueFull": "Queue is full. queued={queue}/{limit}. New requests may be rejected.",
+  "agent.command.doctor.queueDeduplicated":
+    "Queue deduplication activity. merged duplicates={count}",
+  "agent.command.doctor.recoveryHealthy": "Recovery state healthy: no interrupted turn detected.",
+  "agent.command.doctor.recoveryInterrupted":
+    "Interrupted turn detected. reason={reason}, message={id}",
+  "agent.command.doctor.recoveryLadderTitle": "Recovery ladder:",
+  "agent.command.doctor.recoveryLadderPlan": "1) Preview deterministic runbook: /recover plan",
+  "agent.command.doctor.recoveryLadderHeal": "2) Reduce queue pressure first: /queue heal",
+  "agent.command.doctor.recoveryLadderAuto": "3) Resume with queue-aware policy: /recover auto",
+  "agent.command.doctor.recoveryLadderResume": "2) Resume now: /recover resume",
+  "agent.command.doctor.recoveryLadderStrict": "4) Enforce strict gate: /recover execute --strict",
+  "agent.command.doctor.recoveryLadderInvestigate":
+    "5) If interruption persists, run targeted diagnostics: /doctor recover investigate",
   "agent.command.doctor.recommend.title": "Recommended actions:",
   "agent.command.doctor.recommend.selectWorkspace":
     "Select a workspace in the left sidebar so the agent can run file and git operations reliably.",
@@ -832,6 +1099,10 @@ const enUS: Record<string, string> = {
     "Check git availability and workspace permissions, then rerun /doctor.",
   "agent.command.doctor.recommend.relieveQueue":
     "Relieve queue pressure: wait for current run to finish or stop it before sending more.",
+  "agent.command.doctor.recommend.queueHeal":
+    "Run /queue heal first to prune stale and duplicated queued intents before deeper diagnosis.",
+  "agent.command.doctor.recommend.queueInvestigate":
+    "Run /doctor queue investigate for a targeted queue pressure and churn analysis plan.",
   "agent.command.doctor.recommend.relieveQueueForFallback":
     "Fallback is being suppressed under retry policy. Reduce queue/load (or wait for active runs) and retry.",
   "agent.command.doctor.recommend.configureFallbackModel":
@@ -847,6 +1118,36 @@ const enUS: Record<string, string> = {
     "Keep workspace boundaries tight; avoid approving path-outside actions unless required.",
   "agent.command.doctor.recommend.explicitConfirmationForIrreversible":
     "For hard-to-reverse or shared-impact actions, keep explicit per-action confirmation.",
+  "agent.command.doctor.recommend.fixPermissionRuleForTools":
+    "Permission-related tool failures observed. Add precise /permissions rules for blocked tools and retry.",
+  "agent.command.doctor.recommend.fixWorkspaceBoundaryFailures":
+    "Workspace-boundary failures observed. Keep calls inside selected workspace roots or update allowed workspace roots.",
+  "agent.command.doctor.recommend.reduceToolTimeoutPressure":
+    "Timeout-heavy failures observed. Reduce bursty tool batches, split large operations, and retry incrementally.",
+  "agent.command.doctor.recommend.checkNetworkAndEndpoint":
+    "Network failures observed. Verify endpoint reachability, proxy/DNS settings, and API stability before retrying.",
+  "agent.command.doctor.recommend.investigateMissingResources":
+    "Not-found failures observed. Re-check paths/resources and run /trace summary failure tool=<name> for exact misses.",
+  "agent.command.doctor.recommend.validateToolInputShape":
+    "Validation failures observed. Check tool argument schema and keep inputs minimal and explicit.",
+  "agent.command.doctor.recommend.inspectToolRuntimeErrors":
+    "Runtime tool errors observed. Inspect /trace failure details and fix the first concrete failing call before broad retries.",
+  "agent.command.doctor.recommend.tuneToolBudgetPolicy":
+    "Per-tool budget guards are active. Tune policy with /budget set ... if repeated caps are expected for this workload.",
+  "agent.command.doctor.recommend.waitForFailureBackoffRecovery":
+    "Failure-backoff guards are active. Fix the dominant tool failure first, then retry after backoff pressure drops.",
+  "agent.command.doctor.recommend.avoidDuplicateQueueSubmissions":
+    "Frequent duplicate queued requests detected. Wait for the current run or use /queue list before re-submitting.",
+  "agent.command.doctor.recommend.recoverAuto":
+    "Interrupted turn under queue pressure. Run /recover auto so resume policy can pick heal-then-resume automatically.",
+  "agent.command.doctor.recommend.recoverPlan":
+    "Run /recover plan first to inspect the deterministic recovery runbook before taking actions.",
+  "agent.command.doctor.recommend.resumeInterruptedTurn":
+    "Run /recover resume to continue the interrupted turn before sending unrelated prompts.",
+  "agent.command.doctor.recommend.recoverExecuteStrict":
+    "After resume, run /recover execute --strict to enforce status/queue gates before new tasks.",
+  "agent.command.doctor.recommend.recoverInvestigate":
+    "Run /doctor recover investigate for a targeted interrupted-turn recovery runbook.",
   "agent.command.doctor.tasks": "Task manager active. running={running}, total={total}",
   "agent.command.doctor.permissions": "Permission layer active. mode={mode}, rules={rules}",
   "agent.command.doctor.permissionRiskSummary":
@@ -1045,6 +1346,12 @@ const enUS: Record<string, string> = {
   "agent.trace.event.toolResult": "Tool result | {tool} | {outcome}",
   "agent.trace.event.toolRetryGuard":
     "Retry guard | repeated failing tool call detected | tool {tool} | streak {streak}",
+  "agent.trace.event.toolFailureClassified":
+    "Tool failure classified | {tool} | {failureClass} | streak {streak}{fastGuard}",
+  "agent.trace.event.toolFailureDiagnosis":
+    "Failure diagnosis injected | {errorCount}/{toolCount} | attempt {continuationCount} | {breakdown}",
+  "agent.trace.event.toolBudgetGuard":
+    "Tool budget guard | {tool} | {count}/{budget} | {reason}",
   "agent.trace.event.continue": "Continue | reason {reason}",
   "agent.trace.event.stopHookReview":
     "Stop-hook review | notes {notes} | continuation hints {continuation}",
@@ -1072,11 +1379,21 @@ const enUS: Record<string, string> = {
   "agent.trace.queueReason.capacity": "capacity",
   "agent.trace.queueReason.stale": "expired",
   "agent.trace.queueReason.manual": "cleared",
+  "agent.trace.queueReason.deduplicated": "deduplicated",
   "agent.trace.event.queryEnd": "Query end | {terminalReason} | {durationSec}s",
   "agent.trace.event.unknown": "Unknown event",
   "agent.trace.toolOutcome.result": "result",
   "agent.trace.toolOutcome.rejected": "rejected",
   "agent.trace.toolOutcome.error": "error",
+  "agent.trace.toolFailureClass.permission": "permission",
+  "agent.trace.toolFailureClass.workspace": "workspace",
+  "agent.trace.toolFailureClass.timeout": "timeout",
+  "agent.trace.toolFailureClass.not_found": "not-found",
+  "agent.trace.toolFailureClass.network": "network",
+  "agent.trace.toolFailureClass.validation": "validation",
+  "agent.trace.toolFailureClass.runtime": "runtime",
+  "agent.trace.toolBudgetReason.per_tool_limit": "per-tool-limit",
+  "agent.trace.toolBudgetReason.failure_backoff": "failure-backoff",
   "agent.trace.terminal.completed": "completed",
   "agent.trace.terminal.aborted": "aborted",
   "agent.trace.terminal.stopHookPrevented": "stop_hook_prevented",
@@ -1169,6 +1486,23 @@ const enUS: Record<string, string> = {
     "Repeated failure detected: tool {tool} failed {streak} times with the same arguments. Diagnose root cause before retrying.",
   "agent.runtime.retryGuardContinuation":
     "Diagnose repeated tool failures before trying the same call again. Check workspace path, permissions, and command arguments. Failing signatures: {details}.",
+  "agent.runtime.fastGuardLog":
+    "[FastGuard] Skip repeated failing call | tool={tool} | class={failureClass} | streak={streak}",
+  "agent.runtime.fastGuardStreakLog":
+    "[FastGuard] Failure streak observed | tool={tool} | class={failureClass} | streak={streak}",
+  "agent.runtime.fastGuardResult":
+    "Error: repeated {failureClass} failure for identical tool call ({tool}). Fast guard skipped re-running this call.\nDiagnose root cause first, then adjust arguments/path/permissions before retrying.\nRecent sample: {sample}",
+  "agent.runtime.batchFailureDiagnosisLog":
+    "Failure concentration detected: {errorCount}/{toolCount}.",
+  "agent.runtime.batchFailureDiagnosisBreakdown": "Breakdown: {details}",
+  "agent.runtime.batchFailureDiagnosisContinuation":
+    "Tool failures are concentrated ({errorCount}/{toolCount}). Before trying more tool calls, diagnose root cause from observed errors.\nReport: root cause -> minimal fix -> one verification command.\nFailure breakdown: {details}.",
+  "agent.runtime.toolBudgetReason.per_tool_limit": "per-tool limit",
+  "agent.runtime.toolBudgetReason.failure_backoff": "failure backoff",
+  "agent.runtime.toolBudgetGuardLog":
+    "[ToolBudget] Guarded | tool={tool} | count={count} | budget={budget} | reason={reason}",
+  "agent.runtime.toolBudgetGuardResult":
+    "Error: tool-call budget reached for {tool} ({count}/{budget}, reason: {reason}). Pause and diagnose before continuing repeated calls.",
   "agent.runtime.authorizationScopeReminderLog":
     "[Permission Scope] Reminder: prior approval for {tool} does not automatically authorize every future action (previous approvals: {count}).",
   "agent.runtime.failureGuardStep": "Failure Guard",
@@ -1618,8 +1952,20 @@ const zhCNOverrides: Record<string, string> = {
   "agent.diff.diagnosisFallbackStarted": "已提交回退调查。",
   "agent.diff.diagnosisFallbackQueued": "回退调查已入队。",
   "agent.diff.diagnosisFallbackMissingThread": "当前线程暂无重试诊断数据。",
+  "agent.diff.diagnosisRiskPrepare": "生成风险调查命令",
+  "agent.diff.diagnosisRiskRun": "执行风险调查",
+  "agent.diff.diagnosisRiskPrepared": "已生成风险调查命令。",
+  "agent.diff.diagnosisRiskStarted": "已提交风险调查。",
+  "agent.diff.diagnosisRiskQueued": "风险调查已入队。",
+  "agent.diff.diagnosisRiskMissingThread": "当前线程暂无风险诊断数据。",
   "agent.diff.diagnosisQueueTrack": "诊断队列轨迹",
   "agent.diff.diagnosisQueueTrackEmpty": "当前没有排队中的诊断命令。",
+  "agent.diff.diagnosisQueueRecorded":
+    "历史记录 | 压力 {pressure} | 当前 Q{latest}/{limit} | 峰值 Q{max}/{limit} | 入队 {queued} | 出队 {dequeued} | 拒绝 {rejected} | 去重 {deduplicated}",
+  "agent.diff.diagnosisQueueRecordedReasons":
+    "历史原因 | 容量拒绝 {capacity} | 超时淘汰 {stale} | 手动清理 {manual}",
+  "agent.diff.diagnosisQueueRecordedPriority":
+    "历史入队优先级 | 立即 {now} | 下一条 {next} | 稍后 {later}",
   "agent.diff.diagnosisRunbookActionsTitle": "Runbook 操作",
   "agent.diff.diagnosisActionPrepare": "准备",
   "agent.diff.diagnosisActionRun": "执行",
@@ -1629,6 +1975,29 @@ const zhCNOverrides: Record<string, string> = {
   "agent.diff.diagnosisRecommendationFallbackReason": "回退抑制已触发，建议先检查重试策略。",
   "agent.diff.diagnosisRecommendationHotspotReason": "工具 {tool} 出现集中失败信号。",
   "agent.diff.diagnosisRecommendationFailedReason": "建议重放最近失败诊断，验证是否稳定复现。",
+  "agent.diff.diagnosisRecommendationRecoverReason": "检测到中断回合，建议先执行自动恢复再开始新工作。",
+  "agent.diff.diagnosisRecommendationRecoverPlanReason":
+    "建议先生成恢复 runbook，再执行恢复动作，降低路径漂移和误切换风险。",
+  "agent.diff.diagnosisRecommendationRecoverExecuteStrictReason":
+    "恢复流程需要确定性校验，建议执行 strict 模式并检查状态与队列门禁。",
+  "agent.diff.diagnosisRecommendationRecoverInvestigateReason": "恢复失败信号在累积，建议执行定向恢复诊断。",
+  "agent.diff.diagnosisRecommendationQueueHealReason": "恢复路径受队列压力影响，建议先清理过期和重复排队项。",
+  "agent.diff.diagnosisRecommendationQueueInvestigateReason":
+    "队列压力仍不稳定，建议执行 /doctor queue investigate 做确定性排队诊断。",
+  "agent.diff.diagnosisRecoveryTitle": "恢复快照",
+  "agent.diff.diagnosisRecoverySummary":
+    "状态={state} | 计划={plan} | 队列={queue}/{limit} | 压力={pressure}",
+  "agent.diff.diagnosisRecoveryQueuedId": "恢复队列项：{id}",
+  "agent.diff.diagnosisRecoveryFailure":
+    "失败信号：aborted={aborted}，error={error}，max_iter={maxIterations}，stop_hook={stopHook}，lifecycle_failed={lifecycleFailed}，lifecycle_aborted={lifecycleAborted}",
+  "agent.diff.diagnosisRecoverAutoRun": "执行 /recover auto",
+  "agent.diff.diagnosisRecoverPlanRun": "执行 /recover plan",
+  "agent.diff.diagnosisRecoverResumeRun": "执行 /recover resume",
+  "agent.diff.diagnosisRecoverExecuteRun": "执行 /recover execute",
+  "agent.diff.diagnosisRecoverExecuteStrictRun": "执行 /recover execute --strict",
+  "agent.diff.diagnosisRecoverInvestigateRun": "执行 /doctor recover investigate",
+  "agent.diff.diagnosisQueueHealRun": "执行 /queue heal",
+  "agent.diff.diagnosisQueueInvestigateRun": "执行 /doctor queue investigate",
   "agent.diff.diagnosisSeverityHigh": "高风险",
   "agent.diff.diagnosisSeverityMedium": "中风险",
   "agent.diff.diagnosisSeverityLow": "低风险",
@@ -1835,6 +2204,23 @@ const zhCNOverrides: Record<string, string> = {
     "\u68c0\u6d4b\u5230\u91cd\u590d\u5931\u8d25\uff1a\u5de5\u5177 {tool} \u5728\u76f8\u540c\u53c2\u6570\u4e0b\u5df2\u5931\u8d25 {streak} \u6b21\uff0c\u8bf7\u5148\u8bca\u65ad\u6839\u56e0\u518d\u91cd\u8bd5\u3002",
   "agent.runtime.retryGuardContinuation":
     "\u8bf7\u5148\u8bca\u65ad\u91cd\u590d\u5931\u8d25\u7684\u5de5\u5177\u8c03\u7528\uff0c\u518d\u7ee7\u7eed\u76f8\u540c\u8c03\u7528\u3002\u8bf7\u68c0\u67e5\u5de5\u4f5c\u533a\u8def\u5f84\u3001\u6743\u9650\u548c\u547d\u4ee4\u53c2\u6570\u3002\u5931\u8d25\u7b7e\u540d\uff1a{details}\u3002",
+  "agent.runtime.fastGuardLog":
+    "[FastGuard] \u8df3\u8fc7\u91cd\u590d\u5931\u8d25\u8c03\u7528 | \u5de5\u5177={tool} | \u7c7b\u578b={failureClass} | \u8fde\u7eed={streak}",
+  "agent.runtime.fastGuardStreakLog":
+    "[FastGuard] \u6545\u969c\u8fde\u7eed\u8d8b\u52bf | \u5de5\u5177={tool} | \u7c7b\u578b={failureClass} | \u8fde\u7eed={streak}",
+  "agent.runtime.fastGuardResult":
+    "\u9519\u8bef\uff1a\u5de5\u5177 {tool} \u53d1\u751f\u91cd\u590d {failureClass} \u5931\u8d25\uff0c\u5df2\u88ab FastGuard \u963b\u65ad\u91cd\u8bd5\u3002\n\u8bf7\u5148\u8bca\u65ad\u6839\u56e0\uff0c\u518d\u8c03\u6574\u53c2\u6570/\u8def\u5f84/\u6743\u9650\u540e\u91cd\u8bd5\u3002\n\u6700\u8fd1\u6837\u4f8b\uff1a{sample}",
+  "agent.runtime.batchFailureDiagnosisLog":
+    "\u68c0\u6d4b\u5230\u6545\u969c\u96c6\u4e2d\uff1a{errorCount}/{toolCount}\u3002",
+  "agent.runtime.batchFailureDiagnosisBreakdown": "\u6545\u969c\u5206\u5e03\uff1a{details}",
+  "agent.runtime.batchFailureDiagnosisContinuation":
+    "\u5de5\u5177\u6545\u969c\u6bd4\u4f8b\u8fc7\u9ad8\uff08{errorCount}/{toolCount}\uff09\u3002\u8bf7\u5148\u57fa\u4e8e\u9519\u8bef\u7ed3\u679c\u5b8c\u6210\u6839\u56e0\u8bca\u65ad\uff0c\u518d\u7ee7\u7eed\u8c03\u7528\u5de5\u5177\u3002\n\u8bf7\u7ed9\u51fa\uff1a\u6839\u56e0 -> \u6700\u5c0f\u4fee\u590d -> \u4e00\u6761\u9a8c\u8bc1\u547d\u4ee4\u3002\n\u6545\u969c\u5206\u5e03\uff1a{details}\u3002",
+  "agent.runtime.toolBudgetReason.per_tool_limit": "\u5de5\u5177\u9650\u989d",
+  "agent.runtime.toolBudgetReason.failure_backoff": "\u6545\u969c\u9000\u907f",
+  "agent.runtime.toolBudgetGuardLog":
+    "[ToolBudget] \u5df2\u62e6\u622a | \u5de5\u5177={tool} | \u6b21\u6570={count} | \u4e0a\u9650={budget} | \u539f\u56e0={reason}",
+  "agent.runtime.toolBudgetGuardResult":
+    "\u9519\u8bef\uff1a\u5de5\u5177 {tool} \u8c03\u7528\u5df2\u8fbe\u9884\u7b97\u4e0a\u9650\uff08{count}/{budget}\uff0c\u539f\u56e0\uff1a{reason}\uff09\u3002\u8bf7\u5148\u8bca\u65ad\u518d\u7ee7\u7eed\u3002",
   "agent.runtime.authorizationScopeReminderLog":
     "[\u6743\u9650\u8303\u56f4] \u63d0\u9192\uff1a\u4e4b\u524d\u5bf9 {tool} \u7684\u6388\u6743\u4e0d\u7b49\u4e8e\u5bf9\u540e\u7eed\u6240\u6709\u64cd\u4f5c\u81ea\u52a8\u6388\u6743\uff08\u5386\u53f2\u6388\u6743 {count} \u6b21\uff09\u3002",
   "agent.runtime.failureGuardStep": "\u6545\u969c\u7194\u65ad",
@@ -1847,6 +2233,150 @@ const zhCNOverrides: Record<string, string> = {
   "agent.command.status.queuePriority":
     "队列优先级: {nowLabel}={now} {nextLabel}={next} {laterLabel}={later}",
   "agent.command.status.queuePressure": "队列压力: {pressure}",
+  "agent.command.status.recovery": "恢复状态: {status}",
+  "agent.command.status.recoveryQueue": "恢复队列: 数量={count}，首项={id}",
+  "agent.command.status.recoveryPlan": "恢复计划: {plan}",
+  "agent.command.status.recovery.none": "无",
+  "agent.command.status.recovery.awaiting_assistant": "等待助手回复",
+  "agent.command.status.recovery.assistant_incomplete": "助手回复未完成",
+  "agent.command.status.failureClasses": "最近故障分类: {details}",
+  "agent.command.status.budgetGuards": "最近预算拦截: {count}",
+  "agent.command.status.toolBudgetPolicy":
+    "工具预算策略: readonly={readOnlyBase}, mutating={mutatingBase}, shell={shellBase}, min={minimum}, backoffStep={failureBackoffStep}",
+  "agent.command.budget.description": "查看或调整工具调用预算策略",
+  "agent.command.budget.usage":
+    "/budget [show|reset|set readonly=<n> mutating=<n> shell=<n> min=<n> backoff=<n>]",
+  "agent.command.budget.title": "工具预算策略",
+  "agent.command.budget.policy":
+    "readonly={readOnlyBase}, mutating={mutatingBase}, shell={shellBase}, min={minimum}, backoffStep={failureBackoffStep}",
+  "agent.command.budget.updated": "预算策略已更新。",
+  "agent.command.budget.reset": "预算策略已重置为默认值。",
+  "agent.command.budget.setMissing":
+    "未提供有效字段。示例：/budget set readonly=28 mutating=18 shell=12 min=4 backoff=2",
+  "agent.command.budget.unknownKeys": "已忽略未知键：{keys}",
+  "agent.command.budget.invalidKeys": "已忽略无效数字键：{keys}",
+  "agent.command.budget.invalidSubcommand":
+    "未知 /budget 子命令：{subcommand}。请使用 /budget show、/budget reset 或 /budget set ...",
+  "agent.command.queue.description": "查看或管理后续请求队列",
+  "agent.command.queue.usage":
+    "/queue [list|clear|ops [limit] [summary] [action=<...>] [reason=<...>] [priority=<...>]|heal|compact|remove <id>|priority <id> <now|next|later>|now <id>|next <id>|later <id>]",
+  "agent.command.queue.title": "后续请求队列",
+  "agent.command.queue.summary":
+    "队列 {count}/{limit} | {nowLabel}={now} {nextLabel}={next} {laterLabel}={later}",
+  "agent.command.queue.empty": "队列为空。",
+  "agent.command.queue.item":
+    "- {id} [{priority}] 入队于 {queuedAt} | model={model} | {preview}",
+  "agent.command.queue.opsTitle": "队列操作记录（{count}）",
+  "agent.command.queue.opsEmpty": "暂无队列操作记录。",
+  "agent.command.queue.opsLine":
+    "- {at} | {action} | Q{queueCount}/{queueLimit} | 优先级={priority} | 原因={reason}",
+  "agent.command.queue.opsInvalidFilter":
+    "/queue ops 过滤参数无效。请使用 action=<queued|dequeued|rejected|all> reason=<capacity|stale|manual|deduplicated|none|all> priority=<now|next|later|none|all>。",
+  "agent.command.queue.opsSummaryWindow":
+    "汇总 | 事件数={count} | 压力={pressure} | 当前 Q{latest}/{limit} | 峰值 Q{max}/{limit}",
+  "agent.command.queue.opsSummaryActions":
+    "动作统计 | queued={queued} | dequeued={dequeued} | rejected={rejected}",
+  "agent.command.queue.opsSummaryReasons":
+    "原因统计 | capacity={capacity} | stale={stale} | manual={manual} | deduplicated={deduplicated} | none={none}",
+  "agent.command.queue.opsSummaryPriorities":
+    "优先级统计 | now={now} | next={next} | later={later} | none={none}",
+  "agent.command.queue.opsSummaryRecent": "最近事件：",
+  "agent.command.queue.healNoChange": "队列自愈未发现问题（{before} -> {after}）。",
+  "agent.command.queue.healSummary": "队列自愈完成（{before} -> {after}）。",
+  "agent.command.queue.healStaleRemoved": "清理过期项={count}（超过 {minutes} 分钟）",
+  "agent.command.queue.healDuplicateRemoved": "清理重复项={removed}（分组 {groups}）",
+  "agent.command.queue.healNextStep": "建议下一步：执行 /queue ops summary 复核压力趋势。",
+  "agent.command.queue.cleared": "队列已清空：移除 {removed} 条，剩余 {remaining} 条。",
+  "agent.command.queue.compactNoChange": "未发现重复排队请求。",
+  "agent.command.queue.compactResult":
+    "队列已压缩：移除重复项 {removed} 条（分组 {groups}），剩余 {remaining} 条。",
+  "agent.command.queue.missingId":
+    "缺少队列 id。用法：/queue remove <id> 或 /queue priority <id> <now|next|later>",
+  "agent.command.queue.notFound": "未找到队列项：{id}",
+  "agent.command.queue.removed": "已移除队列项：{id}",
+  "agent.command.queue.invalidPriority": "无效优先级：{value}。应为 now|next|later。",
+  "agent.command.queue.priorityUpdated": "队列优先级已更新：{id} -> {priority}",
+  "agent.command.recover.description": "查看中断回合状态或继续执行",
+  "agent.command.recover.usage":
+    "/recover [status|plan|runbook|resume|auto|execute [--strict]|strict|investigate key=value ...]",
+  "agent.command.recover.title": "回合恢复",
+  "agent.command.recover.state.none": "未检测到中断回合。",
+  "agent.command.recover.state.interrupted":
+    "检测到中断回合：{reason}（消息 ID: {id}）",
+  "agent.command.recover.reason.awaiting_assistant": "等待助手回复",
+  "agent.command.recover.reason.assistant_incomplete": "助手回合未完成",
+  "agent.command.recover.statusPlan": "恢复计划：{plan}",
+  "agent.command.recover.statusQueuedRecovery": "检测到恢复请求已排队：id={id}，优先级={priority}",
+  "agent.command.recover.statusHintPlan": "建议先执行 /recover plan，查看分步恢复 runbook。",
+  "agent.command.recover.plan.none": "无需恢复",
+  "agent.command.recover.plan.queued_recovery": "复用已排队恢复",
+  "agent.command.recover.plan.resume_now": "立即恢复",
+  "agent.command.recover.plan.heal_then_resume": "先自愈队列再恢复",
+  "agent.command.recover.planTitle": "恢复 runbook",
+  "agent.command.recover.planScope":
+    "范围 | 状态={state} | 计划={plan} | 队列={queue}/{limit}（{pressure}）",
+  "agent.command.recover.planActionNone": "- 当前无活动中断：无需执行恢复动作。",
+  "agent.command.recover.planActionQueued":
+    "- 保持现有恢复排队项（id={id}，优先级={priority}），并用 /recover status 观察状态。",
+  "agent.command.recover.planActionHeal":
+    "- 第 0 步：先执行 /queue heal，降低队列压力后再恢复。",
+  "agent.command.recover.planActionResume":
+    "- 第 1 步：执行 /recover auto，按队列压力自动选择恢复策略。",
+  "agent.command.recover.planActionStrict":
+    "- 第 2 步：执行 /recover execute --strict，完成状态与队列门禁校验。",
+  "agent.command.recover.planActionInvestigate":
+    "- 若中断仍存在，执行 /doctor recover investigate。",
+  "agent.command.recover.hint": "执行 /recover resume 可从中断处继续。",
+  "agent.command.recover.noInterruption": "当前没有可恢复的中断回合。",
+  "agent.command.recover.continuePrompt": "请从你中断的位置继续。",
+  "agent.command.recover.resumeAutoPolicyNow": "自动恢复策略：立即恢复（priority=now）。",
+  "agent.command.recover.resumeAutoPolicyNext": "自动恢复策略：当前有压力，改为排队恢复（priority=next）。",
+  "agent.command.recover.resumeQueueFull": "当前无法恢复：队列已满（{queue}/{limit}）。",
+  "agent.command.recover.resumeQueueFullAfterPrune":
+    "已尝试预清理队列：清理过期项={count}（超过 {minutes} 分钟），但容量仍然已满。",
+  "agent.command.recover.resumeQueueFullHintHeal":
+    "建议下一步：执行 /queue heal 压缩过期/重复项，再重试 /recover resume。",
+  "agent.command.recover.resumeQueueFullHintInvestigate":
+    "若仍反复出现，请执行 /doctor recover investigate 做定向恢复诊断。",
+  "agent.command.recover.resumeFailed": "恢复请求入队失败。",
+  "agent.command.recover.resumeFailedHintInvestigate":
+    "建议执行 /doctor recover investigate，检查中断与终止失败信号。",
+  "agent.command.recover.resumeStarted": "恢复已立即开始。",
+  "agent.command.recover.resumeQueued": "恢复请求已入队（{queue}/{limit}）。",
+  "agent.command.recover.resumeQueuedId": "恢复队列项 ID：{id}",
+  "agent.command.recover.resumePrunedStale": "队列预清理已移除过期项={count}（超过 {minutes} 分钟）。",
+  "agent.command.recover.resumeNextStep": "建议下一步：执行 /recover status 确认中断状态已清除。",
+  "agent.command.recover.resumeAlreadyQueued":
+    "恢复请求已在队列中（id={id}，{queue}/{limit}），将复用现有恢复项。",
+  "agent.command.recover.resumeAlreadyQueuedPromoted":
+    "已将该恢复项优先级提升为 now（id={id}）。",
+  "agent.command.recover.resumeAlreadyQueuedHint":
+    "不会重复入队恢复请求。可等待该项执行，或用 /queue list 查看队列。",
+  "agent.command.recover.executeTitle": "一键恢复执行",
+  "agent.command.recover.executeChecklistTitle": "校验清单：",
+  "agent.command.recover.executeChecklistStatus":
+    "1) 执行 /recover status，确认中断状态已清除。",
+  "agent.command.recover.executeChecklistQueueRequired":
+    "2) 队列压力偏高时，执行 /queue ops summary（必要时再执行 /queue heal）。",
+  "agent.command.recover.executeChecklistQueueOptional":
+    "2) 可选执行 /queue ops summary，确认队列压力趋势。",
+  "agent.command.recover.executeChecklistInvestigate":
+    "3) 若仍存在中断，执行 /doctor recover investigate。",
+  "agent.command.recover.executeStrictTitle": "严格门禁：",
+  "agent.command.recover.executeStrictPass": "STRICT PASS：恢复提交已接受。",
+  "agent.command.recover.executeStrictNoop": "STRICT PASS：当前已无中断回合。",
+  "agent.command.recover.executeStrictFail": "STRICT FAIL：恢复提交未被接受。",
+  "agent.command.recover.executeStrictStatusCheck":
+    "严格检查：执行 /recover status，确认中断状态已清除。",
+  "agent.command.recover.executeStrictQueueCheckRequired":
+    "严格检查：队列压力偏高，执行 /queue ops summary（若仍拥塞再执行 /queue heal）。",
+  "agent.command.recover.executeStrictQueueCheckOptional":
+    "严格检查：可选执行 /queue ops summary，确认队列趋势健康。",
+  "agent.command.recover.invalidSubcommand":
+    "未知 /recover 子命令：{subcommand}。请使用 /recover status、/recover plan、/recover runbook、/recover resume、/recover auto、/recover execute、/recover strict 或 /recover investigate。",
+  "agent.recover.autoResumeDetected": "检测到线程存在中断回合，正在尝试自动恢复...",
+  "agent.recover.autoResumeUnavailable":
+    "当前无法自动恢复。你可以手动执行 /recover resume。",
   "agent.command.permissions.workspaceMissing": "当前线程未配置工作区?",
   "agent.command.git.workspaceMissing": "当前线程未配置工作区?",
   "agent.command.task.usage": "/task <list|get|output|stop|prune|run-shell> ...",
@@ -1927,12 +2457,16 @@ const zhCNOverrides: Record<string, string> = {
     "回退使用 {used}，抑制 {suppressed} | 最近原因 {reason} | 策略 {strategy}",
   "agent.command.trace.summaryQueuePriority":
     "队列优先级 | {nowLabel} +{nowQueued}/-{nowDequeued}/!{nowRejected} | {nextLabel} +{nextQueued}/-{nextDequeued}/!{nextRejected} | {laterLabel} +{laterQueued}/-{laterDequeued}/!{laterRejected}",
+  "agent.command.trace.summaryFailureClasses": "故障分类 | {details}",
+  "agent.command.trace.summaryBudgetGuards": "预算拦截 | {count}",
   "agent.command.trace.summaryGlobalHotspots": "全局热点 {hotspots}",
   "agent.command.trace.summaryGlobalFallback": "全局回退使用 {used}，抑制 {suppressed}",
   "agent.command.trace.summaryGlobalFallbackDetailed":
     "全局回退使用 {used}，抑制 {suppressed} | 最近原因 {reason} | 策略 {strategy}",
   "agent.command.trace.summaryGlobalQueuePriority":
     "全局队列优先级 | {nowLabel} +{nowQueued}/-{nowDequeued}/!{nowRejected} | {nextLabel} +{nextQueued}/-{nextDequeued}/!{nextRejected} | {laterLabel} +{laterQueued}/-{laterDequeued}/!{laterRejected}",
+  "agent.command.trace.summaryGlobalFailureClasses": "全局故障分类 | {details}",
+  "agent.command.trace.summaryGlobalBudgetGuards": "全局预算拦截 | {count}",
   "agent.command.trace.riskProfile": "风险分布 {risks}",
   "agent.command.trace.riskProfileMatrix":
     "风险画像矩阵：可逆性(reversible={reversible}, mixed={mixed}, hard-to-reverse={hardToReverse}) | 影响范围(local={local}, workspace={workspace}, shared={shared})",
@@ -1949,7 +2483,8 @@ const zhCNOverrides: Record<string, string> = {
   "agent.command.trace.filterRisk": "风险 {risk}",
   "agent.command.trace.filterReversibility": "可逆性 {value}",
   "agent.command.trace.filterBlastRadius": "影响范围 {value}",
-  "agent.command.doctor.usage": "/doctor [fallback investigate key=value ...]",
+  "agent.command.doctor.usage":
+    "/doctor [fallback investigate key=value ...|queue investigate key=value ...|recover investigate key=value ...]",
   "agent.command.doctor.fallbackInvestigateTitle": "回退抑制调查",
   "agent.command.doctor.fallbackInvestigateScope":
     "范围 | 抑制 {suppressed} | 使用 {used} | 比例 {ratio}% | 重试事件 {retryEvents} | 最近原因 {reason} | 策略 {strategy} | 队列压力 {pressure}",
@@ -1972,6 +2507,65 @@ const zhCNOverrides: Record<string, string> = {
   "agent.command.doctor.fallbackInvestigateVerifyDoctor": "- 重新执行诊断：/doctor",
   "agent.command.doctor.fallbackInvestigateVerifyOutcome":
     "- 复现一次失败请求，确认抑制趋势下降。",
+  "agent.command.doctor.recoverInvestigateTitle": "中断回合恢复调查",
+  "agent.command.doctor.recoverInvestigateScope":
+    "范围 | 恢复状态 {state} | 锚点消息 {message} | 队列 {queue}/{limit}（{pressure}） | 运行任务 {running} | query_end(中止={aborted}, 错误={error}, 达到上限={maxIterations}, stop_hook={stopHook}) | lifecycle(失败={lifecycleFailed}, 中止={lifecycleAborted}) | 队列拒绝={rejected}",
+  "agent.command.doctor.recoverInvestigateAssessmentHigh":
+    "评估：存在恢复风险。请先恢复中断回合，再稳定队列压力与终止失败信号。",
+  "agent.command.doctor.recoverInvestigateAssessmentNormal":
+    "评估：当前未检测到活动中断，可继续观测，若中断再现再介入。",
+  "agent.command.doctor.recoverInvestigateDiagnosisHeader": "[诊断]",
+  "agent.command.doctor.recoverInvestigateDiagnosisRecoverState":
+    "- 先确认中断标记与锚点消息：/recover status",
+  "agent.command.doctor.recoverInvestigateDiagnosisTraceSummary":
+    "- 复核近期运行终止失败趋势：/trace summary failure runs=6",
+  "agent.command.doctor.recoverInvestigateFixHeader": "[最小修复]",
+  "agent.command.doctor.recoverInvestigateFixResume":
+    "- 优先恢复中断回合（最高优先级）：/recover resume",
+  "agent.command.doctor.recoverInvestigateFixResumeIfNeeded":
+    "- 若再次出现中断，先恢复后再发送无关请求：/recover resume",
+  "agent.command.doctor.recoverInvestigateFixQueueHeal":
+    "- 检测到队列拒绝/抖动，先做队列自愈再重试：/queue heal",
+  "agent.command.doctor.recoverInvestigateFixQueueHealIfNeeded":
+    "- 恢复过程中若队列压力上升，再执行队列自愈：/queue heal",
+  "agent.command.doctor.recoverInvestigateFixExecuteStrict":
+    "- 在继续新任务前执行严格门禁：/recover execute --strict",
+  "agent.command.doctor.recoverInvestigateFixExecuteStrictIfNeeded":
+    "- 可选加固：恢复后执行 /recover execute --strict",
+  "agent.command.doctor.recoverInvestigateVerifyHeader": "[验证]",
+  "agent.command.doctor.recoverInvestigateVerifyRecoverStatus":
+    "- 验证恢复状态回归健康：/recover status",
+  "agent.command.doctor.recoverInvestigateVerifyDoctor":
+    "- 重新执行全局诊断，确认无二次回归：/doctor",
+  "agent.command.doctor.recoverInvestigateVerifyOutcome":
+    "- 复测一条代表性请求，确认可端到端完成且不再中断。",
+  "agent.command.doctor.queueInvestigateTitle": "队列压力调查",
+  "agent.command.doctor.queueInvestigateScope":
+    "范围 | 压力 {pressure} | 当前 Q{latest}/{limit} | 峰值 Q{max}/{limit} | 入队 {queued} | 出队 {dequeued} | 拒绝 {rejected} | 去重 {deduplicated} | 容量拒绝 {capacity} | 超时淘汰 {stale} | 手动清理 {manual} | 主导优先级 {dominant}",
+  "agent.command.doctor.queueInvestigateAssessmentHigh":
+    "评估：队列压力偏高，优先缓解拥塞并减少重复提交。",
+  "agent.command.doctor.queueInvestigateAssessmentNormal":
+    "评估：队列压力处于中低水平，可在最小改动下持续观测。",
+  "agent.command.doctor.queueInvestigateDiagnosisHeader": "[诊断]",
+  "agent.command.doctor.queueInvestigateDiagnosisQueueOps":
+    "- 复核队列操作时间线：/queue ops 20",
+  "agent.command.doctor.queueInvestigateDiagnosisTraceHotspots":
+    "- 复核队列相关轨迹热点：/trace hotspots queue warnings failure runs=3",
+  "agent.command.doctor.queueInvestigateFixHeader": "[最小修复]",
+  "agent.command.doctor.queueInvestigateFixHeal":
+    "- 优先执行队列自愈，清理过期/重复排队：/queue heal",
+  "agent.command.doctor.queueInvestigateFixHealIfNeeded":
+    "- 若仍有抖动，再执行队列自愈清理过期/重复排队：/queue heal",
+  "agent.command.doctor.queueInvestigateFixCompact":
+    "- 清理重复意图排队：/queue compact",
+  "agent.command.doctor.queueInvestigateFixPriority":
+    "- 仅对紧急回合使用高优先级，避免连续突发 now 提交。",
+  "agent.command.doctor.queueInvestigateVerifyHeader": "[验证]",
+  "agent.command.doctor.queueInvestigateVerifyStatus": "- 验证队列压力与深度：/status",
+  "agent.command.doctor.queueInvestigateVerifyQueueOps":
+    "- 复核队列趋势是否稳定：/queue ops 20",
+  "agent.command.doctor.queueInvestigateVerifyOutcome":
+    "- 复测一次代表性请求，确认不再出现明显队列抖动。",
   "agent.command.doctor.workspaceMissing": "当前线程未选择工作区?",
   "agent.command.doctor.queueHealthy":
     "\u961f\u5217\u5065\u5eb7\uff0c\u5df2\u6392\u961f {queue}/{limit}\uff08{pct}%\uff09\u3002",
@@ -1979,6 +2573,19 @@ const zhCNOverrides: Record<string, string> = {
     "\u961f\u5217\u538b\u529b\u8f83\u9ad8\uff0c\u5df2\u6392\u961f {queue}/{limit}\uff08{pct}%\uff09\u3002",
   "agent.command.doctor.queueFull":
     "\u961f\u5217\u5df2\u6ee1\uff0c\u5df2\u6392\u961f {queue}/{limit}\uff0c\u65b0\u8bf7\u6c42\u53ef\u80fd\u88ab\u62d2\u7edd\u3002",
+  "agent.command.doctor.queueDeduplicated":
+    "队列去重活动：已合并重复请求 {count} 次。",
+  "agent.command.doctor.recoveryHealthy": "恢复状态正常：未检测到中断回合。",
+  "agent.command.doctor.recoveryInterrupted":
+    "检测到中断回合。原因={reason}，消息={id}",
+  "agent.command.doctor.recoveryLadderTitle": "恢复阶梯：",
+  "agent.command.doctor.recoveryLadderPlan": "1）先查看确定性 runbook：/recover plan",
+  "agent.command.doctor.recoveryLadderHeal": "2）先缓解队列压力：/queue heal",
+  "agent.command.doctor.recoveryLadderAuto": "3）按队列压力自动恢复：/recover auto",
+  "agent.command.doctor.recoveryLadderResume": "2）立即恢复：/recover resume",
+  "agent.command.doctor.recoveryLadderStrict": "4）执行严格门禁：/recover execute --strict",
+  "agent.command.doctor.recoveryLadderInvestigate":
+    "5）若仍中断，执行定向诊断：/doctor recover investigate",
   "agent.command.doctor.queryProfile":
     "\u6700\u8fd1\u8bf7\u6c42\u7b56\u7565\u3002\u8f66\u9053={lane}\uff0c\u91cd\u8bd5={retries}\uff0c\u56de\u9000={fallback}\uff0c\u7b56\u7565={strategy}",
   "agent.command.doctor.fallbackActivity":
@@ -1997,6 +2604,10 @@ const zhCNOverrides: Record<string, string> = {
     "\u63d0\u793a\u8bcd\u6cbb\u7406\u72b6\u6001\u3002owner(core={core}, safeguards={safeguards}, runtime={runtime})\uff0cimmutable={immutable}\uff0claunch-calibrated={launch}",
   "agent.command.doctor.promptStatsMissing":
     "\u63d0\u793a\u8bcd\u7f16\u8bd1\u7edf\u8ba1\u4e0d\u53ef\u7528\uff08\u6700\u8fd1\u6ca1\u6709 prompt_compiled \u4e8b\u4ef6\uff09\u3002",
+  "agent.command.doctor.toolFailureSummary":
+    "工具故障诊断。总计={total}，分类={details}",
+  "agent.command.doctor.toolBudgetGuardSummary":
+    "工具预算拦截诊断。总计={total}，单工具限额={perToolLimit}，故障退避={failureBackoff}，主因={dominant}",
   "agent.command.doctor.recommend.title": "\u5efa\u8bae\u540e\u7eed\u64cd\u4f5c\uff1a",
   "agent.command.doctor.recommend.selectWorkspace":
     "\u8bf7\u5148\u5728\u5de6\u4fa7\u8fb9\u680f\u9009\u62e9\u5de5\u4f5c\u533a\uff0c\u4ee5\u4fbf Agent \u53ef\u7a33\u5b9a\u6267\u884c\u6587\u4ef6\u548c Git \u64cd\u4f5c\u3002",
@@ -2006,6 +2617,10 @@ const zhCNOverrides: Record<string, string> = {
     "\u8bf7\u68c0\u67e5 Git \u662f\u5426\u53ef\u7528\u53ca\u5de5\u4f5c\u533a\u6743\u9650\uff0c\u7136\u540e\u91cd\u65b0\u6267\u884c /doctor\u3002",
   "agent.command.doctor.recommend.relieveQueue":
     "\u8bf7\u7f13\u89e3\u6392\u961f\u538b\u529b\uff1a\u7b49\u5f53\u524d\u8fd0\u884c\u5b8c\u6210\uff0c\u6216\u5148\u505c\u6b62\u540e\u518d\u53d1\u9001\u65b0\u8bf7\u6c42\u3002",
+  "agent.command.doctor.recommend.queueHeal":
+    "\u5efa\u8bae\u5148\u6267\u884c /queue heal\uff0c\u5148\u6e05\u7406\u8fc7\u671f\u4e0e\u91cd\u590d\u6392\u961f\u610f\u56fe\uff0c\u518d\u8fdb\u884c\u6df1\u5ea6\u8bca\u65ad\u3002",
+  "agent.command.doctor.recommend.queueInvestigate":
+    "\u5efa\u8bae\u6267\u884c /doctor queue investigate\uff0c\u83b7\u53d6\u9488\u5bf9\u6027\u7684\u961f\u5217\u62e5\u585e/\u6296\u52a8\u8bca\u65ad\u65b9\u6848\u3002",
   "agent.command.doctor.recommend.relieveQueueForFallback":
     "\u56de\u9000\u5728\u91cd\u8bd5\u7b56\u7565\u4e0b\u88ab\u6291\u5236\u3002\u8bf7\u964d\u4f4e\u961f\u5217/\u8d1f\u8f7d\uff08\u6216\u7b49\u5f85\u5f53\u524d\u8fd0\u884c\u5b8c\u6210\uff09\u540e\u518d\u91cd\u8bd5\u3002",
   "agent.command.doctor.recommend.configureFallbackModel":
@@ -2022,6 +2637,36 @@ const zhCNOverrides: Record<string, string> = {
     "\u4fdd\u6301\u5de5\u4f5c\u533a\u8fb9\u754c\u6536\u655b\uff0c\u9664\u975e\u786e\u6709\u5fc5\u8981\uff0c\u907f\u514d\u5141\u8bb8\u8de8\u8fb9\u754c\u8def\u5f84\u64cd\u4f5c\u3002",
   "agent.command.doctor.recommend.explicitConfirmationForIrreversible":
     "\u5bf9\u96be\u4ee5\u9006\u8f6c\u6216\u5171\u4eab\u7cfb\u7edf\u5f71\u54cd\u7684\u64cd\u4f5c\uff0c\u8bf7\u4fdd\u6301\u6309\u64cd\u4f5c\u663e\u5f0f\u786e\u8ba4\u3002",
+  "agent.command.doctor.recommend.fixPermissionRuleForTools":
+    "检测到权限类工具失败。请为受阻工具补充精确的 /permissions 规则后重试。",
+  "agent.command.doctor.recommend.fixWorkspaceBoundaryFailures":
+    "检测到工作区边界类失败。请确保调用路径位于已选工作区根内，或更新允许的工作区根。",
+  "agent.command.doctor.recommend.reduceToolTimeoutPressure":
+    "检测到超时型失败。请降低突发并发、拆分大操作，并以小步重试。",
+  "agent.command.doctor.recommend.checkNetworkAndEndpoint":
+    "检测到网络型失败。请先检查 endpoint 可达性、代理/DNS 配置与上游稳定性。",
+  "agent.command.doctor.recommend.investigateMissingResources":
+    "检测到 not_found 失败。请复核路径/资源，并用 /trace summary failure tool=<name> 查看具体缺失项。",
+  "agent.command.doctor.recommend.validateToolInputShape":
+    "检测到参数校验失败。请核对工具参数结构，保持输入最小且明确。",
+  "agent.command.doctor.recommend.inspectToolRuntimeErrors":
+    "检测到运行时失败。请先修复第一条具体失败调用，再继续批量重试。",
+  "agent.command.doctor.recommend.tuneToolBudgetPolicy":
+    "检测到单工具限额拦截。若该负载确需更多调用，可使用 /budget set ... 调整预算策略。",
+  "agent.command.doctor.recommend.waitForFailureBackoffRecovery":
+    "检测到故障退避拦截。请先修复主故障来源，待退避压力下降后再重试。",
+  "agent.command.doctor.recommend.avoidDuplicateQueueSubmissions":
+    "检测到重复排队较频繁。请先等待当前运行完成，或先用 /queue list 查看后再重复提交。",
+  "agent.command.doctor.recommend.recoverAuto":
+    "中断回合叠加队列压力时，建议执行 /recover auto，让恢复策略自动选择先自愈再恢复。",
+  "agent.command.doctor.recommend.recoverPlan":
+    "建议先执行 /recover plan，确认确定性的恢复 runbook，再执行具体动作。",
+  "agent.command.doctor.recommend.resumeInterruptedTurn":
+    "检测到中断回合时，先执行 /recover resume，再发送无关新请求。",
+  "agent.command.doctor.recommend.recoverExecuteStrict":
+    "恢复提交后，建议执行 /recover execute --strict，再继续新任务。",
+  "agent.command.doctor.recommend.recoverInvestigate":
+    "建议执行 /doctor recover investigate，获取针对中断回合的恢复 runbook。",
   "agent.command.doctor.permissionRiskSummary":
     "\u6743\u9650\u98ce\u9669\u77e9\u9635\uff1acritical={critical}\uff0chigh-risk={highRisk}\uff0cinteractive={interactive}\uff0cpath-outside={pathOutside}\uff0cpolicy={policy}\uff0cscope-reminders={scopeNotices}",
   "agent.command.doctor.permissionRiskProfileSummary":
@@ -2222,6 +2867,12 @@ const zhCNOverrides: Record<string, string> = {
   "agent.trace.event.toolResult": "\u5de5\u5177\u7ed3\u679c | {tool} | {outcome}",
   "agent.trace.event.toolRetryGuard":
     "\u91cd\u8bd5\u5b88\u536b | \u68c0\u6d4b\u5230\u76f8\u540c\u53c2\u6570\u7684\u91cd\u590d\u5931\u8d25 | \u5de5\u5177 {tool} | \u8fde\u7eed {streak} \u6b21",
+  "agent.trace.event.toolFailureClassified":
+    "\u5de5\u5177\u6545\u969c\u5206\u7c7b | {tool} | {failureClass} | \u8fde\u7eed {streak} \u6b21{fastGuard}",
+  "agent.trace.event.toolFailureDiagnosis":
+    "\u5df2\u6ce8\u5165\u6545\u969c\u8bca\u65ad\u7eed\u8f6e | {errorCount}/{toolCount} | \u7b2c {continuationCount} \u6b21 | {breakdown}",
+  "agent.trace.event.toolBudgetGuard":
+    "\u5de5\u5177\u8c03\u7528\u9884\u7b97\u5b88\u536b | {tool} | {count}/{budget} | {reason}",
   "agent.trace.event.stopHookReview":
     "\u505c\u6b62\u94a9\u5b50\u590d\u6838 | \u6ce8\u8bb0 {notes} | \u7eed\u8f6e\u63d0\u793a {continuation}",
   "agent.trace.event.authorizationScope":
@@ -2237,18 +2888,28 @@ const zhCNOverrides: Record<string, string> = {
   "agent.trace.toolOutcome.result": "\u6210\u529f",
   "agent.trace.toolOutcome.rejected": "\u62d2\u7edd",
   "agent.trace.toolOutcome.error": "\u9519\u8bef",
+  "agent.trace.toolFailureClass.permission": "\u6743\u9650",
+  "agent.trace.toolFailureClass.workspace": "\u5de5\u4f5c\u533a",
+  "agent.trace.toolFailureClass.timeout": "\u8d85\u65f6",
+  "agent.trace.toolFailureClass.not_found": "\u672a\u627e\u5230",
+  "agent.trace.toolFailureClass.network": "\u7f51\u7edc",
+  "agent.trace.toolFailureClass.validation": "\u53c2\u6570\u6821\u9a8c",
+  "agent.trace.toolFailureClass.runtime": "\u8fd0\u884c\u65f6",
+  "agent.trace.toolBudgetReason.per_tool_limit": "\u5de5\u5177\u9650\u989d",
+  "agent.trace.toolBudgetReason.failure_backoff": "\u6545\u969c\u9000\u907f",
   "agent.trace.queueAction.queued": "\u5165\u961f",
   "agent.trace.queueAction.dequeued": "\u51fa\u961f",
   "agent.trace.queueAction.rejected": "\u62d2\u7edd",
   "agent.trace.queueReason.capacity": "\u961f\u5217\u5df2\u6ee1",
   "agent.trace.queueReason.stale": "\u8d85\u65f6\u6dd8\u6c70",
   "agent.trace.queueReason.manual": "\u624b\u52a8\u6e05\u7a7a",
+  "agent.trace.queueReason.deduplicated": "\u91cd\u590d\u8bf7\u6c42\u5df2\u5408\u5e76",
   "agent.command.executionFailed": "命令执行失败：{error}",
 };
 
 const zhCN: Record<string, string> = {
   ...enUS,
-  ...zhCNOverrides,
+  ...sanitizeLocaleOverrides("zh-CN", zhCNOverrides),
 };
 
 const jaJPOverrides: Record<string, string> = {
@@ -3577,12 +4238,12 @@ const ruRUOverrides: Record<string, string> = {
   "agent.console.noneValue": "(нет)",
 };
 
-const jaJP: Record<string, string> = { ...enUS, ...jaJPOverrides };
-const koKR: Record<string, string> = { ...enUS, ...koKROverrides };
-const frFR: Record<string, string> = { ...enUS, ...frFROverrides };
-const deDE: Record<string, string> = { ...enUS, ...deDEOverrides };
-const esES: Record<string, string> = { ...enUS, ...esESOverrides };
-const ruRU: Record<string, string> = { ...enUS, ...ruRUOverrides };
+const jaJP: Record<string, string> = { ...enUS, ...sanitizeLocaleOverrides("ja-JP", jaJPOverrides) };
+const koKR: Record<string, string> = { ...enUS, ...sanitizeLocaleOverrides("ko-KR", koKROverrides) };
+const frFR: Record<string, string> = { ...enUS, ...sanitizeLocaleOverrides("fr-FR", frFROverrides) };
+const deDE: Record<string, string> = { ...enUS, ...sanitizeLocaleOverrides("de-DE", deDEOverrides) };
+const esES: Record<string, string> = { ...enUS, ...sanitizeLocaleOverrides("es-ES", esESOverrides) };
+const ruRU: Record<string, string> = { ...enUS, ...sanitizeLocaleOverrides("ru-RU", ruRUOverrides) };
 
 const translations: Record<AppLocale, Record<string, string>> = {
   "zh-CN": zhCN,
@@ -3629,11 +4290,27 @@ function interpolateTemplate(template: string, vars?: Record<string, string | nu
   return result;
 }
 
+function sanitizeLocaleOverrides(locale: AppLocale, overrides: Record<string, string>): Record<string, string> {
+  const sanitized: Record<string, string> = {};
+  for (const [key, value] of Object.entries(overrides)) {
+    if (!isLikelyCorruptedLocalizedText(locale, value)) {
+      sanitized[key] = value;
+    }
+  }
+  return sanitized;
+}
+
 function isLikelyCorruptedLocalizedText(locale: AppLocale, value: string): boolean {
   if (!value) return false;
-  if (locale !== "zh-CN") return false;
+  if (locale !== "zh-CN" && locale !== "ja-JP" && locale !== "ko-KR") return false;
   if (value.includes("�")) return true;
   if (/[\u4e00-\u9fff]\?|[?][\u4e00-\u9fff]/.test(value)) return true;
+  if (/[\u3040-\u30ff]\?|[?][\u3040-\u30ff]/.test(value)) return true;
+  if (/[\uac00-\ud7af]\?|[?][\uac00-\ud7af]/.test(value)) return true;
+  if (/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af].*\?|\?.*[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(value)) return true;
+  if (/^\?+$/.test(value.trim())) return true;
+  if (/\s\?$/.test(value)) return true;
+  if (/\{[a-zA-Z0-9_]+\}\?+/.test(value)) return true;
   return false;
 }
 

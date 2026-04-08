@@ -35,6 +35,7 @@ export interface CallModelParams {
   maxRetries?: number;
   retryBaseDelayMs?: number;
   retryMaxDelayMs?: number;
+  requestTimeoutMs?: number;
   onRetryAttempt?: (attempt: number, error: unknown, nextDelayMs: number) => void;
   signal?: AbortSignal;
 }
@@ -42,6 +43,57 @@ export interface CallModelParams {
 export type QueryDeps = {
   callModel: (params: CallModelParams) => Promise<LLMCompletionResponse>;
 };
+
+const REQUEST_TIMEOUT_DEFAULT_MS = 240_000;
+const REQUEST_TIMEOUT_MIN_MS = 10_000;
+const REQUEST_TIMEOUT_MAX_MS = 15 * 60_000;
+
+function clampRequestTimeoutMs(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return REQUEST_TIMEOUT_DEFAULT_MS;
+  }
+  const rounded = Math.round(value);
+  if (rounded < REQUEST_TIMEOUT_MIN_MS) return REQUEST_TIMEOUT_MIN_MS;
+  if (rounded > REQUEST_TIMEOUT_MAX_MS) return REQUEST_TIMEOUT_MAX_MS;
+  return rounded;
+}
+
+function createAttemptAbortSignal(parentSignal: AbortSignal | undefined, timeoutMs: number) {
+  const controller = new AbortController();
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  let timedOut = false;
+
+  const onParentAbort = () => {
+    controller.abort();
+  };
+
+  if (parentSignal?.aborted) {
+    controller.abort();
+  } else if (parentSignal) {
+    parentSignal.addEventListener("abort", onParentAbort, { once: true });
+  }
+
+  timeoutHandle = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  const cleanup = () => {
+    if (timeoutHandle !== null) {
+      clearTimeout(timeoutHandle);
+      timeoutHandle = null;
+    }
+    if (parentSignal) {
+      parentSignal.removeEventListener("abort", onParentAbort);
+    }
+  };
+
+  return {
+    signal: controller.signal,
+    cleanup,
+    didTimeout: () => timedOut,
+  };
+}
 
 export function productionDeps(): QueryDeps {
   return {
@@ -55,25 +107,38 @@ export function productionDeps(): QueryDeps {
       maxRetries = 3,
       retryBaseDelayMs = 1000,
       retryMaxDelayMs = 15000,
+      requestTimeoutMs = REQUEST_TIMEOUT_DEFAULT_MS,
       onRetryAttempt,
       signal,
     }) =>
       withRetry(
         async () => {
-          const res = await fetch(`${baseUrl}/chat/completions`, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${apiKey}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              model,
-              messages,
-              tools,
-              temperature,
-            }),
-            signal,
-          });
+          const timeoutMs = clampRequestTimeoutMs(requestTimeoutMs);
+          const attemptAbort = createAttemptAbortSignal(signal, timeoutMs);
+          let res: Response;
+          try {
+            res = await fetch(`${baseUrl}/chat/completions`, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${apiKey}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                model,
+                messages,
+                tools,
+                temperature,
+              }),
+              signal: attemptAbort.signal,
+            });
+          } catch (error) {
+            if (attemptAbort.didTimeout() && !signal?.aborted) {
+              throw new Error(`LLM request timeout after ${timeoutMs}ms`);
+            }
+            throw error;
+          } finally {
+            attemptAbort.cleanup();
+          }
 
           if (!res.ok) {
             const errorData = await res.json().catch(() => ({}));

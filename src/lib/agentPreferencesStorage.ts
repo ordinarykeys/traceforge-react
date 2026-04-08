@@ -6,9 +6,18 @@ import {
 
 export type AgentPermissionMode = "default" | "full_access";
 
+export type AgentToolBudgetPolicySnapshot = {
+  readOnlyBase: number;
+  mutatingBase: number;
+  shellBase: number;
+  failureBackoffStep: number;
+  minimum: number;
+};
+
 export type AgentPreferencesSnapshot = {
   currentModel: string;
   permissionMode: AgentPermissionMode;
+  toolCallBudgetPolicy: AgentToolBudgetPolicySnapshot;
 };
 
 type AgentPreferencesState = {
@@ -21,9 +30,18 @@ const LEGACY_MODEL_KEY = "tf-agent-current-model";
 const LEGACY_PERMISSION_MODE_KEY = "tf-agent-permission-mode";
 const DEFAULT_SCOPE = "__default__";
 
+const DEFAULT_TOOL_CALL_BUDGET_POLICY: AgentToolBudgetPolicySnapshot = {
+  readOnlyBase: 28,
+  mutatingBase: 18,
+  shellBase: 12,
+  failureBackoffStep: 2,
+  minimum: 4,
+};
+
 const DEFAULT_AGENT_PREFERENCES: AgentPreferencesSnapshot = {
   currentModel: "deepseek-ai/DeepSeek-V3",
   permissionMode: "default",
+  toolCallBudgetPolicy: DEFAULT_TOOL_CALL_BUDGET_POLICY,
 };
 
 function hasWindowStorage() {
@@ -45,10 +63,45 @@ function normalizeModel(model: unknown): string {
   return trimmed || DEFAULT_AGENT_PREFERENCES.currentModel;
 }
 
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  const rounded = Math.round(parsed);
+  if (rounded < min) {
+    return min;
+  }
+  if (rounded > max) {
+    return max;
+  }
+  return rounded;
+}
+
+function normalizeToolCallBudgetPolicy(
+  value: Partial<AgentToolBudgetPolicySnapshot> | null | undefined,
+): AgentToolBudgetPolicySnapshot {
+  const base = DEFAULT_TOOL_CALL_BUDGET_POLICY;
+  const readOnlyBase = clampInt(value?.readOnlyBase, base.readOnlyBase, 1, 500);
+  const mutatingBase = clampInt(value?.mutatingBase, base.mutatingBase, 1, 500);
+  const shellBase = clampInt(value?.shellBase, base.shellBase, 1, 500);
+  const failureBackoffStep = clampInt(value?.failureBackoffStep, base.failureBackoffStep, 0, 200);
+  const candidateMin = clampInt(value?.minimum, base.minimum, 1, 500);
+  const minimum = Math.min(candidateMin, readOnlyBase, mutatingBase, shellBase);
+  return {
+    readOnlyBase,
+    mutatingBase,
+    shellBase,
+    failureBackoffStep,
+    minimum,
+  };
+}
+
 function normalizeSnapshot(value: Partial<AgentPreferencesSnapshot> | null | undefined): AgentPreferencesSnapshot {
   return {
     currentModel: normalizeModel(value?.currentModel),
     permissionMode: normalizePermissionMode(value?.permissionMode),
+    toolCallBudgetPolicy: normalizeToolCallBudgetPolicy(value?.toolCallBudgetPolicy),
   };
 }
 

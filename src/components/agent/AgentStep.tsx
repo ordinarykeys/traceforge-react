@@ -47,6 +47,55 @@ const NOISE_FIELD_KEYS = new Set([
   "expires_at",
 ]);
 
+const SHARED_STEP_DURATION_TICK_MS = 1_000;
+let sharedStepClockNow = Date.now();
+let sharedStepClockTimer: number | null = null;
+const sharedStepClockListeners = new Set<() => void>();
+
+function startSharedStepClock() {
+  if (sharedStepClockTimer !== null || typeof window === "undefined") return;
+  sharedStepClockTimer = window.setInterval(() => {
+    sharedStepClockNow = Date.now();
+    for (const listener of sharedStepClockListeners) {
+      listener();
+    }
+  }, SHARED_STEP_DURATION_TICK_MS);
+}
+
+function stopSharedStepClockIfIdle() {
+  if (sharedStepClockListeners.size > 0 || sharedStepClockTimer === null || typeof window === "undefined") return;
+  window.clearInterval(sharedStepClockTimer);
+  sharedStepClockTimer = null;
+}
+
+function subscribeSharedStepClock(listener: () => void) {
+  sharedStepClockListeners.add(listener);
+  startSharedStepClock();
+  return () => {
+    sharedStepClockListeners.delete(listener);
+    stopSharedStepClockIfIdle();
+  };
+}
+
+function getSharedStepClockSnapshot() {
+  return sharedStepClockNow;
+}
+
+function useSharedStepClock(enabled: boolean) {
+  const subscribe = React.useCallback((onStoreChange: () => void) => {
+    if (!enabled) {
+      return () => undefined;
+    }
+    return subscribeSharedStepClock(onStoreChange);
+  }, [enabled]);
+
+  const getSnapshot = React.useCallback(() => {
+    return enabled ? getSharedStepClockSnapshot() : 0;
+  }, [enabled]);
+
+  return React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
 function normalizePathSegment(segment: string): string {
   return segment.replace(/\[\d+\]/g, "").replace(/\s+/g, "").toLowerCase();
 }
@@ -138,7 +187,26 @@ function parseCallArguments(raw: string): { text: string; isJson: boolean; value
   }
 }
 
-export function AgentStep({
+function getLogsRenderSignature(logs: string[] | undefined): string {
+  if (!logs || logs.length === 0) return "0";
+  const first = logs[0] ?? "";
+  const last = logs[logs.length - 1] ?? "";
+  return `${logs.length}:${first.slice(0, 24)}:${last.slice(-24)}`;
+}
+
+function areToolRenderEqual(left?: AgentToolRenderData, right?: AgentToolRenderData): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return (
+    left.toolName === right.toolName &&
+    left.argsSummary === right.argsSummary &&
+    left.callArguments === right.callArguments &&
+    left.outcome === right.outcome &&
+    left.outcomePreview === right.outcomePreview
+  );
+}
+
+function AgentStepImpl({
   title,
   status,
   logs = [],
@@ -156,24 +224,36 @@ export function AgentStep({
   const [copyState, setCopyState] = React.useState<"idle" | "success" | "error">("idle");
   const scrollContainerRef = React.useRef<HTMLDivElement>(null);
   const isUserAtBottomRef = React.useRef(true);
-  const [duration, setDuration] = React.useState<number>(0);
+  const [completedDuration, setCompletedDuration] = React.useState<number>(0);
   const startTimeRef = React.useRef<number | null>(null);
   const copyTimerRef = React.useRef<number | null>(null);
+  const sharedClock = useSharedStepClock(status === "running");
 
-  // Duration timer
   React.useEffect(() => {
     if (status === "running") {
-      if (!startTimeRef.current) startTimeRef.current = Date.now();
-      const interval = setInterval(() => {
-        setDuration(Math.floor((Date.now() - (startTimeRef.current || Date.now())) / 1000));
-      }, 1000);
-      return () => clearInterval(interval);
-    } else if (status === "completed" || status === "rejected" || status === "error") {
-      if (startTimeRef.current) {
-        setDuration(Math.floor((Date.now() - startTimeRef.current) / 1000));
+      if (!startTimeRef.current) {
+        startTimeRef.current = Date.now();
       }
+      return;
     }
+    if (status === "completed" || status === "rejected" || status === "error") {
+      if (startTimeRef.current) {
+        setCompletedDuration(Math.floor((Date.now() - startTimeRef.current) / 1000));
+      }
+      return;
+    }
+    startTimeRef.current = null;
+    setCompletedDuration(0);
   }, [status]);
+
+  const duration = React.useMemo(() => {
+    if (status === "running") {
+      if (!startTimeRef.current) return 0;
+      const now = sharedClock || Date.now();
+      return Math.max(0, Math.floor((now - startTimeRef.current) / 1000));
+    }
+    return completedDuration;
+  }, [status, sharedClock, completedDuration]);
 
   // Smart Auto-scroll: Only scroll if user is near the bottom
   React.useEffect(() => {
@@ -208,7 +288,7 @@ export function AgentStep({
       else if (trimmed.startsWith("-") && !trimmed.startsWith("---")) deletions++;
     }
     return { additions, deletions };
-  }, [logs]);
+  }, [logs.length, logs[0], logs[logs.length - 1]]);
 
   const handleToggle = () => {
     setIsExpanded(!isExpanded);
@@ -372,7 +452,7 @@ export function AgentStep({
       getStatusColor(),
       status === "running" && "border-l-primary/60"
     )}>
-      {/* Step header 閳?clickable */}
+      {/* Step header - clickable */}
       <div 
         className="flex cursor-pointer items-center gap-3 py-1.5 transition-opacity hover:opacity-80 select-none"
         onClick={handleToggle}
@@ -701,4 +781,16 @@ export function AgentStep({
     </div>
   );
 }
+
+export const AgentStep = React.memo(
+  AgentStepImpl,
+  (prev, next) =>
+    prev.title === next.title &&
+    prev.status === next.status &&
+    prev.isExpanded === next.isExpanded &&
+    prev.previousCallArguments === next.previousCallArguments &&
+    prev.children === next.children &&
+    getLogsRenderSignature(prev.logs) === getLogsRenderSignature(next.logs) &&
+    areToolRenderEqual(prev.toolRender, next.toolRender),
+);
 

@@ -14,6 +14,14 @@ export type QueryRetryStrategy =
   | "queue_pressure"
   | "background_conservative"
   | "background_load_shed";
+export type ToolFailureClass =
+  | "permission"
+  | "workspace"
+  | "timeout"
+  | "not_found"
+  | "network"
+  | "validation"
+  | "runtime";
 
 export type PromptSectionOwner = "core" | "safeguards" | "runtime";
 export type PromptSectionKind = "static" | "dynamic";
@@ -121,6 +129,30 @@ export type QueryStreamEvent =
       at: number;
     }
   | {
+      type: "tool_failure_classified";
+      tool: string;
+      failureClass: ToolFailureClass;
+      streak: number;
+      fastGuarded?: boolean;
+      at: number;
+    }
+  | {
+      type: "tool_failure_diagnosis";
+      errorCount: number;
+      toolCount: number;
+      breakdown: string;
+      continuationCount: number;
+      at: number;
+    }
+  | {
+      type: "tool_budget_guard";
+      tool: string;
+      count: number;
+      budget: number;
+      reason: "per_tool_limit" | "failure_backoff";
+      at: number;
+    }
+  | {
       type: "continue";
       transition: Continue;
       iteration: number;
@@ -168,7 +200,7 @@ export type QueryStreamEvent =
       action: "queued" | "dequeued" | "rejected";
       queueCount: number;
       queueLimit: number;
-      reason?: "capacity" | "stale" | "manual";
+      reason?: "capacity" | "stale" | "manual" | "deduplicated";
       priority?: QueryQueuePriority;
       at: number;
     }

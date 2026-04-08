@@ -18,6 +18,7 @@ import type {
   QueryRetryStrategy,
   QueryStreamEvent,
   QueryStreamSnapshot,
+  ToolFailureClass,
 } from "./query/events";
 import {
   checkTokenBudget,
@@ -156,6 +157,24 @@ export interface UsageSnapshot {
   byModel: UsageByModel[];
 }
 
+export interface ToolCallBudgetPolicy {
+  readOnlyBase: number;
+  mutatingBase: number;
+  shellBase: number;
+  failureBackoffStep: number;
+  minimum: number;
+}
+
+export type ToolBudgetGuardReason = "per_tool_limit" | "failure_backoff";
+
+export const DEFAULT_TOOL_CALL_BUDGET_POLICY: ToolCallBudgetPolicy = {
+  readOnlyBase: 28,
+  mutatingBase: 18,
+  shellBase: 12,
+  failureBackoffStep: 2,
+  minimum: 4,
+};
+
 // ============================================================
 // Constants
 // ============================================================
@@ -173,6 +192,11 @@ const UI_FLUSH_INTERVAL_MS = 32;
 const STEP_LOG_FLUSH_INTERVAL_MS = 80;
 const MAX_STEP_LOG_LINES = 600;
 const STEP_LOG_TRUNCATED_MARKER = "[system] older logs truncated to keep the session responsive.";
+const STEP_LOG_HISTORY_HEAD_LINES = 60;
+const STEP_LOG_HISTORY_TAIL_LINES = 120;
+const STEP_LOG_HISTORY_MAX_LINES =
+  1 + STEP_LOG_HISTORY_HEAD_LINES + STEP_LOG_HISTORY_TAIL_LINES + 1;
+const MESSAGE_UPDATE_SIGNATURE_TEXT_SAMPLE_CHARS = 24;
 const MAX_STOP_HOOK_CONTINUATIONS = 2;
 const MAX_CONTEXT_MESSAGE_CHARS = 6_000;
 const CONTEXT_HEAD_CHARS = 3_500;
@@ -183,27 +207,108 @@ const CONTEXT_TOOL_RESULT_HEAD_CHARS = 2_500;
 const CONTEXT_TOOL_RESULT_TAIL_CHARS = 1_000;
 const REPEATED_TOOL_SIGNATURE_FAILURE_THRESHOLD = 3;
 const MAX_TRACKED_COMMAND_LIFECYCLE = 160;
+const QUEUE_PRIORITY_AGING_INTERVAL_MS = 90_000;
+const MAX_CONSECUTIVE_NOW_DEQUEUES = 4;
+const QUEUE_MAINTENANCE_INTERVAL_MS = 30_000;
+const TOOL_FAILURE_FAST_GUARD_STREAK = 2;
+const TOOL_FAILURE_FAST_GUARD_WINDOW_MS = 2 * 60_000;
+const TOOL_FAILURE_DIAGNOSIS_MIN_BATCH_ERRORS = 2;
+const TOOL_FAILURE_DIAGNOSIS_MIN_RATIO = 0.5;
+const TOOL_FAILURE_DIAGNOSIS_MAX_CONTINUATIONS = 2;
 const QUEUE_PRIORITY_RANK: Record<QueuePriority, number> = {
   now: 0,
   next: 1,
   later: 2,
 };
 
-function compareQueueItemsByDispatchOrder(left: QueuedQueryItem, right: QueuedQueryItem): number {
-  const leftRank = QUEUE_PRIORITY_RANK[left.priority];
-  const rightRank = QUEUE_PRIORITY_RANK[right.priority];
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  const rounded = Math.round(parsed);
+  if (rounded < min) {
+    return min;
+  }
+  if (rounded > max) {
+    return max;
+  }
+  return rounded;
+}
+
+function normalizeToolCallBudgetPolicy(
+  policy?: Partial<ToolCallBudgetPolicy> | null,
+): ToolCallBudgetPolicy {
+  const base = DEFAULT_TOOL_CALL_BUDGET_POLICY;
+  const readOnlyBase = clampInt(policy?.readOnlyBase, base.readOnlyBase, 1, 500);
+  const mutatingBase = clampInt(policy?.mutatingBase, base.mutatingBase, 1, 500);
+  const shellBase = clampInt(policy?.shellBase, base.shellBase, 1, 500);
+  const failureBackoffStep = clampInt(policy?.failureBackoffStep, base.failureBackoffStep, 0, 200);
+  const candidateMin = clampInt(policy?.minimum, base.minimum, 1, 500);
+  const minBase = Math.min(readOnlyBase, mutatingBase, shellBase);
+  const minimum = Math.min(candidateMin, minBase);
+  return {
+    readOnlyBase,
+    mutatingBase,
+    shellBase,
+    failureBackoffStep,
+    minimum,
+  };
+}
+
+function areToolCallBudgetPoliciesEqual(left: ToolCallBudgetPolicy, right: ToolCallBudgetPolicy): boolean {
+  return (
+    left.readOnlyBase === right.readOnlyBase &&
+    left.mutatingBase === right.mutatingBase &&
+    left.shellBase === right.shellBase &&
+    left.failureBackoffStep === right.failureBackoffStep &&
+    left.minimum === right.minimum
+  );
+}
+
+function computeEffectiveQueuePriorityRank(item: QueuedQueryItem, now = Date.now()): number {
+  const baseRank = QUEUE_PRIORITY_RANK[item.priority];
+  const waitedMs = Math.max(0, now - item.queuedAt);
+  const promotions = Math.floor(waitedMs / QUEUE_PRIORITY_AGING_INTERVAL_MS);
+  return Math.max(0, baseRank - promotions);
+}
+
+function compareQueueItemsByDispatchOrder(
+  left: QueuedQueryItem,
+  right: QueuedQueryItem,
+  now = Date.now(),
+): number {
+  const leftRank = computeEffectiveQueuePriorityRank(left, now);
+  const rightRank = computeEffectiveQueuePriorityRank(right, now);
   if (leftRank !== rightRank) {
     return leftRank - rightRank;
   }
   if (left.queuedAt !== right.queuedAt) {
     return left.queuedAt - right.queuedAt;
   }
+  const leftBaseRank = QUEUE_PRIORITY_RANK[left.priority];
+  const rightBaseRank = QUEUE_PRIORITY_RANK[right.priority];
+  if (leftBaseRank !== rightBaseRank) {
+    return leftBaseRank - rightBaseRank;
+  }
   return left.id.localeCompare(right.id);
+}
+
+function normalizeQueuedQueryForFingerprint(query: string): string {
+  return query.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 export type ToolPermissionMode = "default" | "full_access";
 export type QueuePriority = "now" | "next" | "later";
 type QueryExecutionLane = "foreground" | "background";
+
+interface ToolFailureState {
+  tool: string;
+  failureClass: ToolFailureClass;
+  streak: number;
+  lastAt: number;
+  sample: string;
+}
 
 interface RetryProfile {
   maxRetries: number;
@@ -335,6 +440,95 @@ export interface QueryRuntimeSnapshot {
   lastEventAt: number | null;
 }
 
+export function areRuntimeQueuePriorityCountersEqual(
+  left: Readonly<Record<QueuePriority, number>>,
+  right: Readonly<Record<QueuePriority, number>>,
+): boolean {
+  return (
+    left.now === right.now &&
+    left.next === right.next &&
+    left.later === right.later
+  );
+}
+
+export function areRuntimeQueuedQuerySnapshotsEqual(
+  left: readonly QueuedQueryItem[],
+  right: readonly QueuedQueryItem[],
+): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (left.length !== right.length) {
+    return false;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    const leftItem = left[index];
+    const rightItem = right[index];
+    if (!leftItem || !rightItem) {
+      return false;
+    }
+    if (
+      leftItem.id !== rightItem.id ||
+      leftItem.query !== rightItem.query ||
+      leftItem.model !== rightItem.model ||
+      leftItem.permissionMode !== rightItem.permissionMode ||
+      leftItem.queuedAt !== rightItem.queuedAt ||
+      leftItem.commandId !== rightItem.commandId ||
+      leftItem.commandLabel !== rightItem.commandLabel ||
+      leftItem.priority !== rightItem.priority
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function shouldPublishRuntimeSnapshot(
+  previousSnapshot: QueryRuntimeSnapshot,
+  nextSnapshotSeed: {
+    queueCount: number;
+    queueLimit: number;
+    queueByPriority: Readonly<Record<QueuePriority, number>>;
+    queuedQueries: readonly QueuedQueryItem[];
+    recentEvents: readonly QueryStreamEvent[];
+    latestEvent: QueryStreamEvent | null;
+    lastEventAt: number | null;
+  },
+): boolean {
+  if (previousSnapshot.queueCount !== nextSnapshotSeed.queueCount) {
+    return true;
+  }
+  if (previousSnapshot.queueLimit !== nextSnapshotSeed.queueLimit) {
+    return true;
+  }
+  if (previousSnapshot.recentEvents !== nextSnapshotSeed.recentEvents) {
+    return true;
+  }
+  if (previousSnapshot.latestEvent !== nextSnapshotSeed.latestEvent) {
+    return true;
+  }
+  if (previousSnapshot.lastEventAt !== nextSnapshotSeed.lastEventAt) {
+    return true;
+  }
+  if (
+    !areRuntimeQueuePriorityCountersEqual(
+      previousSnapshot.queueByPriority,
+      nextSnapshotSeed.queueByPriority,
+    )
+  ) {
+    return true;
+  }
+  if (
+    !areRuntimeQueuedQuerySnapshotsEqual(
+      previousSnapshot.queuedQueries,
+      nextSnapshotSeed.queuedQueries,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
 interface CommandLifecycleContext {
   id: string;
   command: string;
@@ -356,6 +550,7 @@ interface QueryEngineOptions {
   deps?: QueryDeps;
   stopHooks?: StopHook[];
   tokenBudget?: TokenBudgetConfig;
+  toolCallBudgetPolicy?: Partial<ToolCallBudgetPolicy> | null;
   fallbackModel?: string;
   workingDir?: string;
   threadId?: string;
@@ -363,6 +558,7 @@ interface QueryEngineOptions {
   additionalWorkingDirectories?: string[];
   locale?: AppLocale;
   onPermissionRequest?: (request: PermissionPromptRequest) => Promise<PermissionPromptDecision>;
+  onToolCallBudgetPolicyChange?: (policy: ToolCallBudgetPolicy) => void;
 }
 
 function mapTerminalToCommandLifecycleState(
@@ -433,7 +629,7 @@ export class QueryEngine {
   private lastTerminal: Terminal | null = null;
   private lastContinue: Continue | null = null;
   private queryEvents: QueryStreamEvent[] = [];
-  private readonly maxQueryEvents = 80;
+  private readonly maxQueryEvents = 240;
   private stopHooks: StopHook[];
   private useDefaultStopHooks = false;
   private tokenBudget: TokenBudgetConfig | null;
@@ -442,15 +638,18 @@ export class QueryEngine {
   private threadId?: string;
   private permissionRules: PermissionRule[] = [];
   private additionalWorkingDirectories: string[] = [];
+  private toolCallBudgetPolicy: ToolCallBudgetPolicy = { ...DEFAULT_TOOL_CALL_BUDGET_POLICY };
   private readonly taskManager: AgentTaskManager;
   private readonly commandRegistry: CommandRegistry;
   private locale: AppLocale = "zh-CN";
   private currentModel?: string;
   private onPermissionRequest?: (request: PermissionPromptRequest) => Promise<PermissionPromptDecision>;
+  private onToolCallBudgetPolicyChange?: (policy: ToolCallBudgetPolicy) => void;
   private uiFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private uiUpdatePending = false;
   private stepLogFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private queuedStepLogs = new Map<string, { step: AgentStepData; lines: string[] }>();
+  private lastPublishedMessageSignature: string | null = null;
   private pendingAbortSource: AbortSource | null = null;
   private activeTurnId?: string;
   private activeAssistantMessage: AgentMessage | null = null;
@@ -475,8 +674,13 @@ export class QueryEngine {
     latestEvent: null,
     lastEventAt: null,
   };
+  private queryEventsVersion = 0;
+  private recentEventsSnapshotVersion = -1;
+  private recentEventsSnapshot: readonly QueryStreamEvent[] = Object.freeze([] as QueryStreamEvent[]);
   private commandLifecycleById = new Map<string, CommandLifecycleSnapshot>();
   private commandLifecycleOrder: string[] = [];
+  private consecutiveNowDequeues = 0;
+  private queueMaintenanceTimer: ReturnType<typeof setTimeout> | null = null;
 
 
   constructor(
@@ -504,6 +708,8 @@ export class QueryEngine {
     this.additionalWorkingDirectories = [...(options.additionalWorkingDirectories ?? [])];
     this.locale = options.locale ?? "zh-CN";
     this.onPermissionRequest = options.onPermissionRequest;
+    this.toolCallBudgetPolicy = normalizeToolCallBudgetPolicy(options.toolCallBudgetPolicy);
+    this.onToolCallBudgetPolicyChange = options.onToolCallBudgetPolicyChange;
     this.taskManager = new AgentTaskManager(() => {
       this.updateUI();
     });
@@ -548,6 +754,89 @@ export class QueryEngine {
     };
   }
 
+  private sampleTextForMessageSignature(value: string | undefined): string {
+    if (!value) {
+      return "0";
+    }
+    const maxChars = MESSAGE_UPDATE_SIGNATURE_TEXT_SAMPLE_CHARS;
+    const midIndex = Math.floor(value.length / 2);
+    const midCode = value.charCodeAt(midIndex) || 0;
+    const head = value.slice(0, maxChars);
+    const tail = value.slice(-maxChars);
+    return `${value.length}:${midCode}:${head}:${tail}`;
+  }
+
+  private mixMessageSignatureHash(hash: number, value: string): number {
+    let next = hash >>> 0;
+    for (let index = 0; index < value.length; index += 1) {
+      next ^= value.charCodeAt(index);
+      next = Math.imul(next, 16777619);
+      next >>>= 0;
+    }
+    return next;
+  }
+
+  private mixMessageSignatureNumber(hash: number, value: number): number {
+    const normalized = Number.isFinite(value) ? Math.trunc(value) >>> 0 : 0;
+    let next = (hash ^ normalized) >>> 0;
+    next = Math.imul(next, 16777619);
+    return next >>> 0;
+  }
+
+  private computeMessageUpdateSignature(): string {
+    if (this.messages.length === 0) {
+      return "0";
+    }
+    let hash = 2166136261;
+    hash = this.mixMessageSignatureNumber(hash, this.messages.length);
+    for (let index = 0; index < this.messages.length; index += 1) {
+      const message = this.messages[index];
+      if (!message) {
+        continue;
+      }
+      hash = this.mixMessageSignatureHash(hash, message.id);
+      hash = this.mixMessageSignatureHash(hash, message.role);
+      hash = this.mixMessageSignatureHash(hash, message.status ?? "");
+      hash = this.mixMessageSignatureHash(hash, this.sampleTextForMessageSignature(message.content));
+      hash = this.mixMessageSignatureHash(hash, this.sampleTextForMessageSignature(message.report));
+      const steps = message.steps ?? [];
+      hash = this.mixMessageSignatureNumber(hash, steps.length);
+      if (steps.length > 0) {
+        const sampledSteps = [steps[0], steps[steps.length - 1]].filter(
+          (step, stepIndex, array): step is AgentStepData => Boolean(step) && array.indexOf(step) === stepIndex,
+        );
+        for (const step of sampledSteps) {
+          hash = this.mixMessageSignatureHash(hash, step.id);
+          hash = this.mixMessageSignatureHash(hash, step.status);
+          const logs = step.logs ?? [];
+          hash = this.mixMessageSignatureNumber(hash, logs.length);
+          const lastLog = logs.length > 0 ? logs[logs.length - 1] : "";
+          hash = this.mixMessageSignatureHash(hash, this.sampleTextForMessageSignature(lastLog));
+          if (step.toolRender) {
+            hash = this.mixMessageSignatureHash(hash, step.toolRender.toolName);
+            hash = this.mixMessageSignatureHash(hash, step.toolRender.outcome);
+            hash = this.mixMessageSignatureHash(
+              hash,
+              this.sampleTextForMessageSignature(step.toolRender.callArguments),
+            );
+            hash = this.mixMessageSignatureHash(
+              hash,
+              this.sampleTextForMessageSignature(step.toolRender.outcomePreview),
+            );
+          }
+        }
+      }
+    }
+    const tailMessage = this.messages[this.messages.length - 1];
+    return [
+      String(this.messages.length),
+      hash.toString(16),
+      tailMessage?.id ?? "",
+      tailMessage?.status ?? "",
+      this.sampleTextForMessageSignature(tailMessage?.content),
+    ].join("#");
+  }
+
   private scheduleUIUpdate() {
     this.uiUpdatePending = true;
     if (this.uiFlushTimer !== null) {
@@ -564,6 +853,11 @@ export class QueryEngine {
       return;
     }
     this.uiUpdatePending = false;
+    const nextSignature = this.computeMessageUpdateSignature();
+    if (this.lastPublishedMessageSignature === nextSignature) {
+      return;
+    }
+    this.lastPublishedMessageSignature = nextSignature;
     this.onUpdate([...this.messages]);
   }
 
@@ -656,6 +950,7 @@ export class QueryEngine {
       const merged = coalesceTraceEvents(previous, event);
       if (merged) {
         this.queryEvents[this.queryEvents.length - 1] = merged;
+        this.markQueryEventsChanged();
         this.refreshRuntimeSnapshot();
         return;
       }
@@ -664,11 +959,67 @@ export class QueryEngine {
     if (this.queryEvents.length > this.maxQueryEvents) {
       this.queryEvents = this.queryEvents.slice(this.queryEvents.length - this.maxQueryEvents);
     }
+    this.markQueryEventsChanged();
+    this.refreshRuntimeSnapshot();
+  }
+
+  private markQueryEventsChanged() {
+    this.queryEventsVersion += 1;
+  }
+
+  private getRecentEventsSnapshot(): readonly QueryStreamEvent[] {
+    if (this.recentEventsSnapshotVersion === this.queryEventsVersion) {
+      return this.recentEventsSnapshot;
+    }
+    const clonedEvents = this.queryEvents.map(
+      (event) => Object.freeze({ ...event }) as QueryStreamEvent,
+    );
+    this.recentEventsSnapshot = Object.freeze(clonedEvents);
+    this.recentEventsSnapshotVersion = this.queryEventsVersion;
+    return this.recentEventsSnapshot;
+  }
+
+  private clearQueueMaintenanceTimer() {
+    if (this.queueMaintenanceTimer !== null) {
+      clearTimeout(this.queueMaintenanceTimer);
+      this.queueMaintenanceTimer = null;
+    }
+  }
+
+  private scheduleQueueMaintenance() {
+    if (this.messageQueue.length === 0 || this.queueMaintenanceTimer !== null) {
+      return;
+    }
+    this.queueMaintenanceTimer = setTimeout(() => {
+      this.queueMaintenanceTimer = null;
+      this.runQueueMaintenance();
+    }, QUEUE_MAINTENANCE_INTERVAL_MS);
+  }
+
+  private runQueueMaintenance(now = Date.now()) {
+    if (this.messageQueue.length === 0) {
+      this.refreshRuntimeSnapshot();
+      return;
+    }
+    const staleRemoved = this.pruneStaleQueuedQueries(now);
+    if (staleRemoved > 0) {
+      this.pushQueryEvent({
+        type: "queue_update",
+        action: "rejected",
+        queueCount: this.messageQueue.length,
+        queueLimit: MAX_QUEUED_QUERIES,
+        reason: "stale",
+        at: now,
+      });
+      return;
+    }
+    // No structural change, but effective queue rank ages with time; refresh ordering snapshot.
     this.refreshRuntimeSnapshot();
   }
 
   private refreshRuntimeSnapshot() {
-    const latestEvent = this.queryEvents.length > 0 ? this.queryEvents[this.queryEvents.length - 1] ?? null : null;
+    const recentEvents = this.getRecentEventsSnapshot();
+    const latestEvent = recentEvents.length > 0 ? recentEvents[recentEvents.length - 1] ?? null : null;
     const queueByPriority: Record<QueuePriority, number> = {
       now: 0,
       next: 0,
@@ -677,17 +1028,40 @@ export class QueryEngine {
     for (const item of this.messageQueue) {
       queueByPriority[item.priority] += 1;
     }
+    const snapshotNow = Date.now();
     const queuedByDispatchOrder = [...this.messageQueue]
-      .sort(compareQueueItemsByDispatchOrder)
+      .sort((left, right) => compareQueueItemsByDispatchOrder(left, right, snapshotNow))
       .map((item) => ({ ...item }));
+    const previousSnapshot = this.runtimeSnapshot;
+    const lastEventAt = latestEvent?.at ?? null;
+    const queueCount = this.messageQueue.length;
+    const queueLimit = MAX_QUEUED_QUERIES;
+    if (
+      !shouldPublishRuntimeSnapshot(previousSnapshot, {
+        queueCount,
+        queueLimit,
+        queueByPriority,
+        queuedQueries: queuedByDispatchOrder,
+        recentEvents,
+        latestEvent,
+        lastEventAt,
+      })
+    ) {
+      if (this.messageQueue.length > 0) {
+        this.scheduleQueueMaintenance();
+      } else {
+        this.clearQueueMaintenanceTimer();
+      }
+      return;
+    }
     const nextSnapshot: QueryRuntimeSnapshot = {
-      queueCount: this.messageQueue.length,
-      queueLimit: MAX_QUEUED_QUERIES,
+      queueCount,
+      queueLimit,
       queuedQueries: Object.freeze(queuedByDispatchOrder),
       queueByPriority: Object.freeze(queueByPriority),
-      recentEvents: Object.freeze(this.queryEvents.map((event) => ({ ...event }))),
+      recentEvents,
       latestEvent,
-      lastEventAt: latestEvent?.at ?? null,
+      lastEventAt,
     };
     this.runtimeSnapshot = nextSnapshot;
     for (const listener of this.runtimeSnapshotListeners) {
@@ -696,6 +1070,11 @@ export class QueryEngine {
       } catch (error) {
         console.warn("[lumo-agent] runtimeSnapshot listener failed:", error);
       }
+    }
+    if (this.messageQueue.length > 0) {
+      this.scheduleQueueMaintenance();
+    } else {
+      this.clearQueueMaintenanceTimer();
     }
   }
 
@@ -827,7 +1206,7 @@ export class QueryEngine {
 
         if (assistantMsg.steps) {
           const step = assistantMsg.steps.find(s => s.title.includes(toolCall.function.name));
-          if (step && step.status === "running") step.status = "error";
+          if (step && step.status === "running") this.setStepStatus(step, "error");
         }
       }
     }
@@ -1001,6 +1380,176 @@ export class QueryEngine {
       return "rejected";
     }
     return this.isToolResultError(result) ? "error" : "completed";
+  }
+
+  private classifyToolFailure(result: string, status: AgentStepStatus): ToolFailureClass | null {
+    if (status !== "error" && status !== "rejected") {
+      return null;
+    }
+    const lower = result.toLowerCase();
+    if (
+      lower.includes("permission denied") ||
+      lower.startsWith("permission ask:") ||
+      lower.startsWith("permission deny:") ||
+      lower.includes("denied by user")
+    ) {
+      return "permission";
+    }
+    if (lower.includes("[workspaceguard]") || lower.includes("outside workspace boundaries")) {
+      return "workspace";
+    }
+    if (lower.includes("timeout") || lower.includes("interrupted due to timeout")) {
+      return "timeout";
+    }
+    if (
+      lower.includes("not found") ||
+      lower.includes("unknown tool") ||
+      lower.includes("cannot find") ||
+      lower.includes("no such file")
+    ) {
+      return "not_found";
+    }
+    if (
+      lower.includes("econn") ||
+      lower.includes("enotfound") ||
+      lower.includes("network") ||
+      lower.includes("tls") ||
+      lower.includes("certificate")
+    ) {
+      return "network";
+    }
+    if (lower.includes("[validation]") || lower.includes("invalid")) {
+      return "validation";
+    }
+    return "runtime";
+  }
+
+  private summarizeFailureBreakdown(
+    entries: Array<{ tool: string; failureClass: ToolFailureClass }>,
+    maxItems = 6,
+  ): string {
+    if (entries.length === 0) {
+      return "";
+    }
+    const counter = new Map<string, number>();
+    for (const entry of entries) {
+      const key = `${entry.tool}:${entry.failureClass}`;
+      counter.set(key, (counter.get(key) ?? 0) + 1);
+    }
+    return [...counter.entries()]
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+      .slice(0, maxItems)
+      .map(([key, count]) => `${key}x${count}`)
+      .join(", ");
+  }
+
+  private buildFastFailureGuardResult(state: ToolFailureState): string {
+    return translate(this.locale, "agent.runtime.fastGuardResult", {
+      tool: state.tool,
+      failureClass: translate(this.locale, `agent.trace.toolFailureClass.${state.failureClass}`),
+      sample: state.sample || "(no sample)",
+    });
+  }
+
+  private updateToolFailureState(
+    stateBySignature: Map<string, ToolFailureState>,
+    signature: string,
+    toolName: string,
+    failureClass: ToolFailureClass | null,
+    status: AgentStepStatus,
+    result: string,
+    now = Date.now(),
+  ): ToolFailureState | null {
+    if (status === "completed" || !failureClass) {
+      stateBySignature.delete(signature);
+      return null;
+    }
+    const previous = stateBySignature.get(signature);
+    const nextStreak =
+      previous && previous.failureClass === failureClass
+        ? previous.streak + 1
+        : 1;
+    const next: ToolFailureState = {
+      tool: toolName,
+      failureClass,
+      streak: nextStreak,
+      lastAt: now,
+      sample: result.slice(0, 220),
+    };
+    stateBySignature.set(signature, next);
+    return next;
+  }
+
+  private shouldFastGuardToolFailure(state: ToolFailureState | undefined, now = Date.now()): boolean {
+    if (!state) {
+      return false;
+    }
+    if (state.failureClass === "permission") {
+      return false;
+    }
+    if (state.streak < TOOL_FAILURE_FAST_GUARD_STREAK) {
+      return false;
+    }
+    return now - state.lastAt <= TOOL_FAILURE_FAST_GUARD_WINDOW_MS;
+  }
+
+  private shouldTriggerBatchFailureDiagnosis(
+    toolCount: number,
+    errorCount: number,
+    continuationCount: number,
+  ): boolean {
+    if (toolCount <= 0) {
+      return false;
+    }
+    if (continuationCount >= TOOL_FAILURE_DIAGNOSIS_MAX_CONTINUATIONS) {
+      return false;
+    }
+    if (errorCount < TOOL_FAILURE_DIAGNOSIS_MIN_BATCH_ERRORS) {
+      return false;
+    }
+    const ratio = errorCount / toolCount;
+    return ratio >= TOOL_FAILURE_DIAGNOSIS_MIN_RATIO;
+  }
+
+  private buildBatchFailureDiagnosisContinuation(details: string, errorCount: number, toolCount: number): string {
+    return translate(this.locale, "agent.runtime.batchFailureDiagnosisContinuation", {
+      errorCount,
+      toolCount,
+      details: details || "unknown",
+    });
+  }
+
+  private computeToolCallBudget(
+    toolName: string,
+    tool: Tool | undefined,
+    consecutiveFailureBatches: number,
+  ): { budget: number; reason: ToolBudgetGuardReason } {
+    const normalizedName = toolName.trim().toLowerCase();
+    const policy = this.toolCallBudgetPolicy;
+    let baseBudget = tool?.isReadOnly ? policy.readOnlyBase : policy.mutatingBase;
+    if (normalizedName === "shell") {
+      baseBudget = policy.shellBase;
+    }
+    const backoffPenalty = Math.max(0, consecutiveFailureBatches) * policy.failureBackoffStep;
+    const budget = Math.max(policy.minimum, baseBudget - backoffPenalty);
+    return {
+      budget,
+      reason: backoffPenalty > 0 ? "failure_backoff" : "per_tool_limit",
+    };
+  }
+
+  private buildToolBudgetGuardResult(
+    toolName: string,
+    count: number,
+    budget: number,
+    reason: ToolBudgetGuardReason,
+  ): string {
+    return translate(this.locale, "agent.runtime.toolBudgetGuardResult", {
+      tool: toolName,
+      count,
+      budget,
+      reason: translate(this.locale, `agent.runtime.toolBudgetReason.${reason}`),
+    });
   }
 
   private createSessionPermissionRule(toolName: string, draft?: PermissionRuleDraft): PermissionRule {
@@ -1331,6 +1880,26 @@ export class QueryEngine {
     return this.runtimeSnapshot.queuedQueries.map((item) => ({ ...item }));
   }
 
+  public setQueuedQueryPriority(queueId: string, priority: QueuePriority): boolean {
+    const index = this.messageQueue.findIndex((item) => item.id === queueId);
+    if (index < 0) {
+      return false;
+    }
+    const current = this.messageQueue[index];
+    if (!current) {
+      return false;
+    }
+    if (current.priority === priority) {
+      return true;
+    }
+    this.messageQueue[index] = {
+      ...current,
+      priority,
+    };
+    this.updateUI(true);
+    return true;
+  }
+
   public removeQueuedQuery(queueId: string): boolean {
     const index = this.messageQueue.findIndex((item) => item.id === queueId);
     if (index < 0) {
@@ -1380,24 +1949,276 @@ export class QueryEngine {
     return item ? { ...item } : null;
   }
 
+  private shouldIncomingQueryPreemptCandidate(
+    incomingPriority: QueuePriority,
+    candidate: QueuedQueryItem,
+    now = Date.now(),
+  ): boolean {
+    const incomingEffectiveRank = Math.max(0, QUEUE_PRIORITY_RANK[incomingPriority]);
+    const candidateEffectiveRank = computeEffectiveQueuePriorityRank(candidate, now);
+    if (incomingEffectiveRank < candidateEffectiveRank) {
+      return true;
+    }
+    if (incomingEffectiveRank > candidateEffectiveRank) {
+      return false;
+    }
+    const incomingBaseRank = QUEUE_PRIORITY_RANK[incomingPriority];
+    const candidateBaseRank = QUEUE_PRIORITY_RANK[candidate.priority];
+    return incomingBaseRank < candidateBaseRank;
+  }
+
+  private pickQueuePreemptionCandidate(now = Date.now()): QueuedQueryItem | null {
+    if (this.messageQueue.length === 0) {
+      return null;
+    }
+    let worst = this.messageQueue[0] ?? null;
+    if (!worst) {
+      return null;
+    }
+    for (let index = 1; index < this.messageQueue.length; index += 1) {
+      const current = this.messageQueue[index];
+      if (!current) {
+        continue;
+      }
+      const worstCmp = compareQueueItemsByDispatchOrder(worst, current, now);
+      if (worstCmp < 0) {
+        // current is worse (later dispatch order), so it is a better preemption candidate.
+        worst = current;
+      }
+    }
+    return worst;
+  }
+
+  private findDuplicateQueuedQueryIndex(options: {
+    query: string;
+    model: string;
+    permissionMode: ToolPermissionMode;
+  }): number {
+    const incomingFingerprint = [
+      normalizeQueuedQueryForFingerprint(options.query),
+      options.model.trim(),
+      options.permissionMode,
+    ].join("::");
+    for (let index = 0; index < this.messageQueue.length; index += 1) {
+      const item = this.messageQueue[index];
+      if (!item) continue;
+      const itemFingerprint = [
+        normalizeQueuedQueryForFingerprint(item.query),
+        item.model.trim(),
+        item.permissionMode,
+      ].join("::");
+      if (itemFingerprint === incomingFingerprint) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  private enqueueWhenBusy(options: {
+    query: string;
+    model: string;
+    permissionMode: ToolPermissionMode;
+    priority: QueuePriority;
+    commandLifecycle: CommandLifecycleContext;
+  }): {
+    accepted: boolean;
+    queueCount: number;
+    queueLimit: number;
+    queuedItem?: QueuedQueryItem;
+    preemptedItem?: QueuedQueryItem;
+  } {
+    const queueLimit = MAX_QUEUED_QUERIES;
+    const now = Date.now();
+    let preemptedItem: QueuedQueryItem | undefined;
+
+    const duplicateIndex = this.findDuplicateQueuedQueryIndex({
+      query: options.query,
+      model: options.model,
+      permissionMode: options.permissionMode,
+    });
+    if (duplicateIndex >= 0) {
+      const duplicate = this.messageQueue[duplicateIndex];
+      if (duplicate) {
+        const shouldPromotePriority =
+          QUEUE_PRIORITY_RANK[options.priority] < QUEUE_PRIORITY_RANK[duplicate.priority];
+        if (shouldPromotePriority) {
+          duplicate.priority = options.priority;
+        }
+        if (duplicate.commandId !== options.commandLifecycle.id) {
+          this.emitCommandLifecycleEvent(
+            {
+              id: duplicate.commandId,
+              command: duplicate.commandLabel,
+              lane: "background",
+              queued: true,
+            },
+            "aborted",
+            {
+              terminalReason: "aborted",
+              at: now,
+            },
+          );
+          duplicate.commandId = options.commandLifecycle.id;
+          duplicate.commandLabel = options.commandLifecycle.command;
+        }
+        this.pushQueryEvent({
+          type: "queue_update",
+          action: "queued",
+          queueCount: this.messageQueue.length,
+          queueLimit,
+          reason: "deduplicated",
+          priority: duplicate.priority,
+          at: now,
+        });
+        return {
+          accepted: true,
+          queueCount: this.messageQueue.length,
+          queueLimit,
+          queuedItem: { ...duplicate },
+        };
+      }
+    }
+
+    if (this.messageQueue.length >= queueLimit) {
+      const candidate = this.pickQueuePreemptionCandidate(now);
+      if (!candidate || !this.shouldIncomingQueryPreemptCandidate(options.priority, candidate, now)) {
+        this.pushQueryEvent({
+          type: "queue_update",
+          action: "rejected",
+          queueCount: this.messageQueue.length,
+          queueLimit,
+          reason: "capacity",
+          priority: options.priority,
+          at: now,
+        });
+        return {
+          accepted: false,
+          queueCount: this.messageQueue.length,
+          queueLimit,
+        };
+      }
+
+      const candidateIndex = this.messageQueue.findIndex((item) => item.id === candidate.id);
+      if (candidateIndex < 0) {
+        this.pushQueryEvent({
+          type: "queue_update",
+          action: "rejected",
+          queueCount: this.messageQueue.length,
+          queueLimit,
+          reason: "capacity",
+          priority: options.priority,
+          at: now,
+        });
+        return {
+          accepted: false,
+          queueCount: this.messageQueue.length,
+          queueLimit,
+        };
+      }
+
+      const [removed] = this.messageQueue.splice(candidateIndex, 1);
+      if (removed) {
+        preemptedItem = removed;
+        this.emitCommandLifecycleEvent(
+          {
+            id: removed.commandId,
+            command: removed.commandLabel,
+            lane: "background",
+            queued: true,
+          },
+          "aborted",
+          {
+            terminalReason: "aborted",
+            at: now,
+          },
+        );
+        this.pushQueryEvent({
+          type: "queue_update",
+          action: "rejected",
+          queueCount: this.messageQueue.length,
+          queueLimit,
+          reason: "capacity",
+          priority: removed.priority,
+          at: now,
+        });
+      }
+    }
+
+    const queuedItem: QueuedQueryItem = {
+      id: this.makeId(),
+      query: options.query,
+      model: options.model,
+      permissionMode: options.permissionMode,
+      queuedAt: now,
+      commandId: options.commandLifecycle.id,
+      commandLabel: options.commandLifecycle.command,
+      priority: options.priority,
+    };
+    this.messageQueue.push(queuedItem);
+    this.pushQueryEvent({
+      type: "queue_update",
+      action: "queued",
+      queueCount: this.messageQueue.length,
+      queueLimit,
+      priority: options.priority,
+      at: now,
+    });
+
+    return {
+      accepted: true,
+      queueCount: this.messageQueue.length,
+      queueLimit,
+      queuedItem,
+      preemptedItem,
+    };
+  }
+
   private dequeueNextQueuedQuery(): QueuedQueryItem | undefined {
     if (this.messageQueue.length === 0) {
+      this.consecutiveNowDequeues = 0;
       return undefined;
     }
+    const now = Date.now();
     let bestIndex = 0;
-    let bestRank = QUEUE_PRIORITY_RANK[this.messageQueue[0]?.priority ?? "next"];
-    let bestQueuedAt = this.messageQueue[0]?.queuedAt ?? 0;
+    let bestItem = this.messageQueue[0];
+    if (!bestItem) {
+      return undefined;
+    }
     for (let index = 1; index < this.messageQueue.length; index += 1) {
       const item = this.messageQueue[index];
       if (!item) continue;
-      const rank = QUEUE_PRIORITY_RANK[item.priority];
-      if (rank < bestRank || (rank === bestRank && item.queuedAt < bestQueuedAt)) {
+      if (compareQueueItemsByDispatchOrder(item, bestItem, now) < 0) {
         bestIndex = index;
-        bestRank = rank;
-        bestQueuedAt = item.queuedAt;
+        bestItem = item;
+      }
+    }
+    if (
+      bestItem.priority === "now" &&
+      this.consecutiveNowDequeues >= MAX_CONSECUTIVE_NOW_DEQUEUES
+    ) {
+      let fairnessIndex = -1;
+      let fairnessCandidate: QueuedQueryItem | undefined;
+      for (let index = 0; index < this.messageQueue.length; index += 1) {
+        const item = this.messageQueue[index];
+        if (!item || item.priority === "now") {
+          continue;
+        }
+        if (!fairnessCandidate || compareQueueItemsByDispatchOrder(item, fairnessCandidate, now) < 0) {
+          fairnessCandidate = item;
+          fairnessIndex = index;
+        }
+      }
+      if (fairnessCandidate && fairnessIndex >= 0) {
+        bestItem = fairnessCandidate;
+        bestIndex = fairnessIndex;
       }
     }
     const [next] = this.messageQueue.splice(bestIndex, 1);
+    if (next?.priority === "now") {
+      this.consecutiveNowDequeues += 1;
+    } else {
+      this.consecutiveNowDequeues = 0;
+    }
     return next;
   }
 
@@ -1431,9 +2252,9 @@ export class QueryEngine {
       return [];
     }
     if (events.length <= safeLimit) {
-      return events.map((event) => ({ ...event }));
+      return events.slice();
     }
-    return events.slice(events.length - safeLimit).map((event) => ({ ...event }));
+    return events.slice(events.length - safeLimit);
   }
 
   public clearQueryEvents() {
@@ -1441,6 +2262,7 @@ export class QueryEngine {
       return;
     }
     this.queryEvents = [];
+    this.markQueryEventsChanged();
     this.refreshRuntimeSnapshot();
     this.updateUI(true);
   }
@@ -1464,6 +2286,27 @@ export class QueryEngine {
 
   public setTokenBudget(budget: TokenBudgetConfig | null) {
     this.tokenBudget = budget;
+  }
+
+  public getToolCallBudgetPolicy(): ToolCallBudgetPolicy {
+    return { ...this.toolCallBudgetPolicy };
+  }
+
+  public setToolCallBudgetPolicy(
+    patch: Partial<ToolCallBudgetPolicy> | null,
+    options: { notify?: boolean } = {},
+  ): ToolCallBudgetPolicy {
+    const next = patch
+      ? normalizeToolCallBudgetPolicy({ ...this.toolCallBudgetPolicy, ...patch })
+      : normalizeToolCallBudgetPolicy(DEFAULT_TOOL_CALL_BUDGET_POLICY);
+    if (areToolCallBudgetPoliciesEqual(this.toolCallBudgetPolicy, next)) {
+      return { ...this.toolCallBudgetPolicy };
+    }
+    this.toolCallBudgetPolicy = next;
+    if (options.notify !== false) {
+      this.onToolCallBudgetPolicyChange?.({ ...next });
+    }
+    return { ...next };
   }
 
   public setFallbackModel(model: string | undefined) {
@@ -1878,6 +2721,172 @@ export class QueryEngine {
 
     if (
       matchesAny([
+        /^(?:queue|show queue|queue list|list queue|queued commands?)\s*$/i,
+        /^(?:\u67e5\u770b|\u770b\u4e0b|\u770b\u770b|\u663e\u793a)?\s*(?:\u961f\u5217|\u6392\u961f|\u7b49\u5f85\u961f\u5217)\s*$/u,
+      ]) ||
+      hasAny(["show queue", "queue list", "queued commands", "queued queries"]) ||
+      hasZhAny(["\u67e5\u770b\u961f\u5217", "\u6392\u961f\u5217\u8868", "\u7b49\u5f85\u961f\u5217"])
+    ) {
+      return "/queue list";
+    }
+
+    if (
+      matchesAny([
+        /^(?:clear|reset)\s+queue\s*$/i,
+        /^(?:\u6e05\u7a7a|\u91cd\u7f6e)\s*(?:\u961f\u5217|\u6392\u961f)\s*$/u,
+      ])
+    ) {
+      return "/queue clear";
+    }
+
+    if (
+      matchesAny([
+        /^(?:queue\s+ops|queue\s+history|queue\s+events?|show\s+queue\s+history)\s*$/i,
+        /^(?:\u67e5\u770b|\u770b\u4e0b|\u770b\u770b|\u663e\u793a)?\s*(?:\u961f\u5217\u5386\u53f2|\u961f\u5217\u4e8b\u4ef6|\u961f\u5217\u64cd\u4f5c\u8bb0\u5f55)\s*$/u,
+      ]) ||
+      hasAny(["queue history", "queue events", "queue ops"]) ||
+      hasZhAny(["队列历史", "队列事件", "队列操作记录"])
+    ) {
+      return "/queue ops";
+    }
+
+    if (
+      matchesAny([
+        /^(?:queue\s+summary|queue\s+ops\s+summary|summarize\s+queue)\s*$/i,
+        /^(?:\u961f\u5217\u6c47\u603b|\u961f\u5217\u7edf\u8ba1|\u6c47\u603b\u961f\u5217)\s*$/u,
+      ]) ||
+      hasAny(["queue summary", "queue stats", "summarize queue"]) ||
+      hasZhAny(["队列汇总", "队列统计"])
+    ) {
+      return "/queue ops summary";
+    }
+
+    if (
+      matchesAny([
+        /^(?:queue\s+compact|queue\s+dedupe|dedupe\s+queue|compact\s+queue)\s*$/i,
+        /^(?:\u961f\u5217)?(?:\u53bb\u91cd|\u538b\u7f29)\s*(?:\u961f\u5217)?\s*$/u,
+      ]) ||
+      hasAny(["queue compact", "queue dedupe", "dedupe queue"]) ||
+      hasZhAny(["队列去重", "压缩队列"])
+    ) {
+      return "/queue compact";
+    }
+
+    if (
+      matchesAny([
+        /^(?:queue\s+heal|heal\s+queue|queue\s+repair|relieve\s+queue)\s*$/i,
+        /^(?:\u961f\u5217)?(?:\u81ea\u6108|\u4fee\u590d|\u758f\u901a|\u7f13\u89e3\u62e5\u585e)\s*(?:\u961f\u5217)?\s*$/u,
+      ]) ||
+      hasAny(["queue heal", "heal queue", "queue repair", "relieve queue", "unblock queue"]) ||
+      hasZhAny(["队列自愈", "修复队列", "疏通队列", "缓解队列拥塞"])
+    ) {
+      return "/queue heal";
+    }
+
+    if (
+      matchesAny([
+        /^(?:investigate\s+queue|queue\s+diagnose|queue\s+doctor|queue\s+investigation)\s*$/i,
+        /^(?:\u961f\u5217)?(?:\u8bca\u65ad|\u6392\u67e5|\u8c03\u67e5)\s*(?:\u961f\u5217)?\s*$/u,
+      ]) ||
+      hasAny(["investigate queue", "queue diagnose", "queue doctor", "queue investigation"]) ||
+      hasZhAny(["诊断队列", "排查队列", "调查队列", "队列诊断"])
+    ) {
+      return "/doctor queue investigate";
+    }
+
+    if (
+      matchesAny([
+        /^(?:investigate|diagnose|debug)\s+(?:recover|recovery|resume)\s*$/i,
+        /^(?:recover|recovery)\s+(?:investigate|diagnose|debug)\s*$/i,
+        /^(?:\u6392\u67e5|\u8bca\u65ad|\u8c03\u67e5)\s*(?:\u6062\u590d|\u4e2d\u65ad|\u7eed\u8dd1)\s*$/u,
+      ]) ||
+      hasAny([
+        "recover investigate",
+        "recovery investigate",
+        "investigate recover",
+        "diagnose recovery",
+        "debug recovery",
+        "interrupted turn recovery",
+      ]) ||
+      hasZhAny(["恢复排查", "恢复诊断", "中断回合排查", "中断恢复", "续跑排查"])
+    ) {
+      return "/doctor recover investigate";
+    }
+
+    if (
+      matchesAny([
+        /^(?:recover|recovery|resume)\s+(?:plan|strategy|runbook|playbook)\s*$/i,
+        /^(?:plan|strategy)\s+(?:recover|recovery|resume)\s*$/i,
+        /^(?:\u6062\u590d|\u7eed\u8dd1)\s*(?:\u8ba1\u5212|\u65b9\u6848|\u7b56\u7565)\s*$/u,
+      ]) ||
+      hasAny(["recover plan", "recovery plan", "recovery strategy", "resume plan", "recover runbook"]) ||
+      hasZhAny(["恢复计划", "恢复方案", "恢复策略", "续跑计划", "恢复runbook"])
+    ) {
+      return "/recover plan";
+    }
+
+    if (
+      matchesAny([
+        /^(?:auto|smart)\s+(?:recover|resume)(?:\s+turn)?\s*$/i,
+        /^(?:\u81ea\u52a8|\u667a\u80fd)\s*(?:\u6062\u590d|\u7eed\u8dd1)(?:\u4e2d\u65ad|\u56de\u5408)?\s*$/u,
+      ]) ||
+      hasAny(["auto recover", "smart recover", "auto resume", "smart resume"]) ||
+      hasZhAny(["自动恢复", "智能恢复", "自动续跑", "智能续跑"])
+    ) {
+      return "/recover auto";
+    }
+
+    if (
+      matchesAny([
+        /^(?:recover|resume|recovery)\s+(?:strict|gate)\s*$/i,
+        /^(?:execute|run)\s+(?:recover|recovery)\s+(?:strict|strictly)\s*$/i,
+        /^(?:recover|recovery)\s+(?:execute|run)\s+(?:strict|strictly)\s*$/i,
+        /^(?:\u4e25\u683c|\u4e25\u683c\u6a21\u5f0f|\u5f3a\u6821\u9a8c)?\s*(?:\u6267\u884c|\u8fd0\u884c)\s*(?:\u6062\u590d|\u7eed\u8dd1)\s*$/u,
+      ]) ||
+      hasAny([
+        "recover strict",
+        "recover gate",
+        "resume strict",
+        "recover execute strict",
+        "strict recovery execute",
+        "run strict recovery",
+        "execute recovery strict",
+      ]) ||
+      hasZhAny([
+        "\u4e25\u683c\u6062\u590d",
+        "\u4e25\u683c\u6267\u884c\u6062\u590d",
+        "\u4e25\u683c\u6a21\u5f0f\u6062\u590d",
+        "\u5f3a\u6821\u9a8c\u6062\u590d",
+      ])
+    ) {
+      return "/recover execute --strict";
+    }
+
+    if (
+      matchesAny([
+        /^(?:execute|run)\s+(?:recover|recovery)(?:\s+plan)?\s*$/i,
+        /^(?:recover|recovery)\s+(?:execute|run)\s*$/i,
+        /^(?:\u4e00\u952e|\u7acb\u5373|\u76f4\u63a5)?\s*(?:\u6267\u884c|运行)\s*(?:\u6062\u590d|\u7eed\u8dd1)\s*$/u,
+      ]) ||
+      hasAny(["recover execute", "execute recovery", "run recovery", "one-shot recovery"]) ||
+      hasZhAny(["执行恢复", "一键恢复", "立即恢复执行", "直接恢复"])
+    ) {
+      return "/recover execute";
+    }
+
+    if (
+      matchesAny([
+        /^(?:recover|resume(?:\s+turn)?|resume\s+interrupted\s+turn|continue\s+where\s+left\s+off)\s*$/i,
+        /^(?:\u6062\u590d|\u7eed\u8dd1|\u7ee7\u7eed)(?:\u4e0a\u6b21|\u4e2d\u65ad|\u672a\u5b8c\u6210)?(?:\u4efb\u52a1|\u4f1a\u8bdd|\u56de\u5408)?\s*$/u,
+      ]) ||
+      hasAny(["resume interrupted", "continue where left off", "recover turn"]) ||
+      hasZhAny(["\u6062\u590d\u4e2d\u65ad", "\u7eed\u8dd1", "\u7ee7\u7eed\u4e0a\u6b21"])
+    ) {
+      return "/recover resume";
+    }
+
+    if (
+      matchesAny([
         /^(?:trace|show trace|event log|events?|show events?|show trajectory)\s*$/i,
         /^(?:\u67e5\u770b|\u770b\u4e0b|\u770b\u770b|\u663e\u793a)?\s*(?:\u8f68\u8ff9|\u6267\u884c\u8f68\u8ff9|\u4e8b\u4ef6|\u4e8b\u4ef6\u65e5\u5fd7)\s*$/u,
       ]) ||
@@ -2106,50 +3115,29 @@ export class QueryEngine {
     };
 
     if (this.isProcessing) {
-      if (this.messageQueue.length >= queueLimit) {
-        this.pushQueryEvent({
-          type: "queue_update",
-          action: "rejected",
-          queueCount: this.messageQueue.length,
-          queueLimit,
-          reason: "capacity",
-          priority: targetPriority,
-          at: Date.now(),
-        });
+      const enqueueResult = this.enqueueWhenBusy({
+        query: trimmed,
+        model: targetModel,
+        permissionMode: targetPermissionMode,
+        priority: targetPriority,
+        commandLifecycle,
+      });
+      if (!enqueueResult.accepted) {
         this.updateUI(true);
         return {
           accepted: false,
           reason: "queue_full",
-          queueCount: this.messageQueue.length,
-          queueLimit,
+          queueCount: enqueueResult.queueCount,
+          queueLimit: enqueueResult.queueLimit,
         };
       }
-      const queuedItem: QueuedQueryItem = {
-        id: this.makeId(),
-        query: trimmed,
-        model: targetModel,
-        permissionMode: targetPermissionMode,
-        queuedAt: Date.now(),
-        commandId: commandLifecycle.id,
-        commandLabel: commandLifecycle.command,
-        priority: targetPriority,
-      };
-      this.messageQueue.push(queuedItem);
-      this.pushQueryEvent({
-        type: "queue_update",
-        action: "queued",
-        queueCount: this.messageQueue.length,
-        queueLimit,
-        priority: targetPriority,
-        at: Date.now(),
-      });
       this.emitCommandLifecycleEvent(commandLifecycle, "queued");
       this.updateUI();
       return {
         accepted: true,
-        queueCount: this.messageQueue.length,
-        queueLimit,
-        queuedId: queuedItem.id,
+        queueCount: enqueueResult.queueCount,
+        queueLimit: enqueueResult.queueLimit,
+        queuedId: enqueueResult.queuedItem?.id,
         started: false,
         commandId: commandLifecycle.id,
       };
@@ -2228,8 +3216,13 @@ export class QueryEngine {
         getMessages: () => this.getMessages(),
         getUsageSnapshot: () => this.getUsageSnapshot(),
         resetUsageSnapshot: () => this.resetUsageSnapshot(),
+        getToolCallBudgetPolicy: () => this.getToolCallBudgetPolicy(),
+        setToolCallBudgetPolicy: (patch) => this.setToolCallBudgetPolicy(patch),
         getRecentQueryEvents: (limit) => this.getRecentQueryEvents(limit),
         clearQueryEvents: () => this.clearQueryEvents(),
+        getQueuedQueries: () => this.getQueuedQueries(),
+        setQueuedQueryPriority: (queueId, priority) => this.setQueuedQueryPriority(queueId, priority),
+        removeQueuedQuery: (queueId) => this.removeQueuedQuery(queueId),
         submitFollowupQuery: (query, options) => this.submitFollowupQuery(query, options),
         taskManager: this.taskManager,
         t: (key, vars) => translate(this.locale, key, vars),
@@ -2298,45 +3291,23 @@ export class QueryEngine {
     }
 
     if (this.isProcessing) {
-      if (this.messageQueue.length >= MAX_QUEUED_QUERIES) {
-        const queueCount = this.messageQueue.length;
-        this.pushQueryEvent({
-          type: "queue_update",
-          action: "rejected",
-          queueCount,
-          queueLimit: MAX_QUEUED_QUERIES,
-          reason: "capacity",
-          priority: queuePriority,
-          at: Date.now(),
-        });
+      const enqueueResult = this.enqueueWhenBusy({
+        query: normalizedQuery,
+        model,
+        permissionMode: modeSnapshot,
+        priority: queuePriority,
+        commandLifecycle,
+      });
+      if (!enqueueResult.accepted) {
         this.updateUI(true);
         return {
           state: "rejected",
           reason: "queue_full",
-          queueCount,
-          queueLimit: MAX_QUEUED_QUERIES,
+          queueCount: enqueueResult.queueCount,
+          queueLimit: enqueueResult.queueLimit,
           commandId: commandLifecycle.id,
         };
       }
-      // If busy, push to queue and notify UI
-      this.messageQueue.push({
-        id: this.makeId(),
-        query: normalizedQuery,
-        model,
-        permissionMode: modeSnapshot,
-        queuedAt: Date.now(),
-        commandId: commandLifecycle.id,
-        commandLabel: commandLifecycle.command,
-        priority: queuePriority,
-      });
-      this.pushQueryEvent({
-        type: "queue_update",
-        action: "queued",
-        queueCount: this.messageQueue.length,
-        queueLimit: MAX_QUEUED_QUERIES,
-        priority: queuePriority,
-        at: Date.now(),
-      });
       this.emitCommandLifecycleEvent(
         {
           ...commandLifecycle,
@@ -2347,8 +3318,8 @@ export class QueryEngine {
       this.updateUI();
       return {
         state: "queued",
-        queueCount: this.messageQueue.length,
-        queueLimit: MAX_QUEUED_QUERIES,
+        queueCount: enqueueResult.queueCount,
+        queueLimit: enqueueResult.queueLimit,
         commandId: commandLifecycle.id,
       };
     }
@@ -2438,6 +3409,7 @@ export class QueryEngine {
             );
           }
           this.messageQueue = [];
+          this.consecutiveNowDequeues = 0;
           this.abortQueuedProcessing = false;
           if (droppedByAbort > 0) {
             this.pushQueryEvent({
@@ -2453,6 +3425,71 @@ export class QueryEngine {
         this.updateUI();
       }
     }
+  }
+
+  private compactStepLogsForHistory(step: AgentStepData) {
+    if (step.logs.length <= STEP_LOG_HISTORY_MAX_LINES) {
+      return;
+    }
+
+    const logsWithoutMarker =
+      step.logs[0] === STEP_LOG_TRUNCATED_MARKER ? step.logs.slice(1) : [...step.logs];
+    if (logsWithoutMarker.length <= STEP_LOG_HISTORY_HEAD_LINES + STEP_LOG_HISTORY_TAIL_LINES) {
+      return;
+    }
+
+    const headCount = Math.min(STEP_LOG_HISTORY_HEAD_LINES, logsWithoutMarker.length);
+    const tailCount = Math.min(
+      STEP_LOG_HISTORY_TAIL_LINES,
+      Math.max(0, logsWithoutMarker.length - headCount),
+    );
+    const omittedCount = Math.max(0, logsWithoutMarker.length - headCount - tailCount);
+    if (omittedCount <= 0) {
+      return;
+    }
+
+    step.logs = [
+      STEP_LOG_TRUNCATED_MARKER,
+      ...logsWithoutMarker.slice(0, headCount),
+      `[system] ${omittedCount} historical log lines omitted for responsiveness.`,
+      ...logsWithoutMarker.slice(logsWithoutMarker.length - tailCount),
+    ];
+  }
+
+  private setStepStatus(step: AgentStepData, status: AgentStepStatus, options?: { compact?: boolean }) {
+    step.status = status;
+    const shouldCompact =
+      options?.compact !== false &&
+      status !== "running" &&
+      status !== "pending";
+    if (shouldCompact) {
+      this.compactStepLogsForHistory(step);
+    }
+  }
+
+  private finalizeAssistantMessageSteps(
+    assistantMsg: AgentMessage,
+    options?: { finalizeRunningStatus?: AgentStepStatus },
+  ): { hasError: boolean; hasRejected: boolean } {
+    const steps = assistantMsg.steps;
+    if (!steps || steps.length === 0) {
+      return { hasError: false, hasRejected: false };
+    }
+
+    const finalizeRunningStatus = options?.finalizeRunningStatus;
+    for (const step of steps) {
+      if ((step.status === "running" || step.status === "pending") && finalizeRunningStatus) {
+        this.setStepStatus(step, finalizeRunningStatus);
+        continue;
+      }
+      if (step.status !== "running" && step.status !== "pending") {
+        this.compactStepLogsForHistory(step);
+      }
+    }
+
+    const hasError = steps.some((step) => step.status === "error");
+    const hasRejected = steps.some((step) => step.status === "rejected");
+    return { hasError, hasRejected };
   }
 
   /**
@@ -2605,6 +3642,10 @@ export class QueryEngine {
       let totalToolCallsExecuted = 0;
       const toolFailureStreakBySignature = new Map<string, { tool: string; streak: number }>();
       const emittedToolRetryGuardSignatures = new Set<string>();
+      const toolFailureStateBySignature = new Map<string, ToolFailureState>();
+      const fastGuardFailureClassBySignature = new Map<string, ToolFailureClass>();
+      const toolExecutionCountByTool = new Map<string, number>();
+      let batchFailureDiagnosisContinuations = 0;
       let maxIterationTriggered = false;
       let activeRetryProfile = initialRetryProfile;
 
@@ -2645,7 +3686,7 @@ export class QueryEngine {
             : translate(this.locale, "agent.stepReasoningRound").replace("{round}", String(iteration))
         );
         assistantMsg.steps!.push(thinkingStep);
-        thinkingStep.status = "running";
+        this.setStepStatus(thinkingStep, "running", { compact: false });
         this.activeRunningStep = thinkingStep;
         this.updateUI();
 
@@ -2761,7 +3802,7 @@ export class QueryEngine {
               model: currentModel,
             }),
           );
-          thinkingStep.status = "completed";
+          this.setStepStatus(thinkingStep, "completed");
           if (this.activeRunningStep?.id === thinkingStep.id) {
             this.activeRunningStep = null;
           }
@@ -2779,7 +3820,7 @@ export class QueryEngine {
           globalTurnTokens += estimateTokensFromText(message.content);
         }
 
-        thinkingStep.status = "completed";
+        this.setStepStatus(thinkingStep, "completed", { compact: false });
         if (this.activeRunningStep?.id === thinkingStep.id) {
           this.activeRunningStep = null;
         }
@@ -2790,6 +3831,7 @@ export class QueryEngine {
             String(finishReason ?? "unknown"),
           ),
         );
+        this.compactStepLogsForHistory(thinkingStep);
         this.updateUI();
 
         // --- Case A: LLM wants to call tools ---
@@ -2810,13 +3852,14 @@ export class QueryEngine {
           const projectedToolCalls = totalToolCallsExecuted + message.tool_calls.length;
           if (projectedToolCalls > MAX_TOOL_CALLS_PER_QUERY) {
             const guardStep = this.createStep(translate(this.locale, "agent.runtime.toolCallCapStep"));
-            guardStep.status = "error";
+            this.setStepStatus(guardStep, "error", { compact: false });
             this.appendStepLog(
               guardStep,
               translate(this.locale, "agent.runtime.maxToolCallsReached", {
                 max: MAX_TOOL_CALLS_PER_QUERY,
               }),
             );
+            this.compactStepLogsForHistory(guardStep);
             assistantMsg.steps!.push(guardStep);
             assistantMsg.content +=
               (assistantMsg.content ? "\n\n" : "") +
@@ -2840,6 +3883,12 @@ export class QueryEngine {
           }
 
           const stepByToolCallId = new Map<string, AgentStepData>();
+          const toolBudgetGuardEvents: Array<{
+            tool: string;
+            count: number;
+            budget: number;
+            reason: ToolBudgetGuardReason;
+          }> = [];
           const toolResults = await runTools({
             toolCalls: message.tool_calls,
             isConcurrencySafe: (toolCall) => this.isToolConcurrencySafe(toolCall),
@@ -2861,7 +3910,7 @@ export class QueryEngine {
                 },
               );
               assistantMsg.steps!.push(toolStep);
-              toolStep.status = "running";
+              this.setStepStatus(toolStep, "running", { compact: false });
               this.activeRunningStep = toolStep;
               stepByToolCallId.set(toolCall.id, toolStep);
               this.updateUI();
@@ -2873,13 +3922,67 @@ export class QueryEngine {
                   tool: toolCall.function.name,
                 });
               }
+              const signature = this.createToolCallSignatureFromArgsJson(
+                toolCall.function.name,
+                toolCall.function.arguments,
+              );
+              const knownFailureState = toolFailureStateBySignature.get(signature);
+              if (this.shouldFastGuardToolFailure(knownFailureState)) {
+                const guardedResult = this.buildFastFailureGuardResult(knownFailureState!);
+                fastGuardFailureClassBySignature.set(signature, knownFailureState!.failureClass);
+                this.appendStepLog(
+                  step,
+                  translate(this.locale, "agent.runtime.fastGuardLog", {
+                    tool: knownFailureState!.tool,
+                    failureClass: translate(
+                      this.locale,
+                      `agent.trace.toolFailureClass.${knownFailureState!.failureClass}`,
+                    ),
+                    streak: knownFailureState!.streak,
+                  }),
+                );
+                return guardedResult;
+              }
+              const toolName = toolCall.function.name;
+              const toolImpl = this.tools.get(toolName);
+              const currentCount = toolExecutionCountByTool.get(toolName) ?? 0;
+              const budget = this.computeToolCallBudget(
+                toolName,
+                toolImpl,
+                consecutiveToolFailureBatches,
+              );
+              if (currentCount >= budget.budget) {
+                toolBudgetGuardEvents.push({
+                  tool: toolName,
+                  count: currentCount,
+                  budget: budget.budget,
+                  reason: budget.reason,
+                });
+                const guardResult = this.buildToolBudgetGuardResult(
+                  toolName,
+                  currentCount,
+                  budget.budget,
+                  budget.reason,
+                );
+                this.appendStepLog(
+                  step,
+                  translate(this.locale, "agent.runtime.toolBudgetGuardLog", {
+                    tool: toolName,
+                    count: currentCount,
+                    budget: budget.budget,
+                    reason: translate(this.locale, `agent.runtime.toolBudgetReason.${budget.reason}`),
+                  }),
+                );
+                return guardResult;
+              }
+              toolExecutionCountByTool.set(toolName, currentCount + 1);
               return this.executeTool(toolCall, step, modeSnapshot);
             },
             onToolComplete: (toolCall, result) => {
               const step = stepByToolCallId.get(toolCall.id);
               if (!step) return;
               this.flushQueuedStepLogsCore();
-              step.status = this.getToolResultStatus(result);
+              this.setStepStatus(step, this.getToolResultStatus(result), { compact: false });
               if (this.activeRunningStep?.id === step.id) {
                 this.activeRunningStep = null;
               }
@@ -2898,11 +4001,24 @@ export class QueryEngine {
                   result: `${result.substring(0, 500)}${result.length > 500 ? "..." : ""}`,
                 }),
               );
+              this.compactStepLogsForHistory(step);
               this.updateUI();
             },
           });
 
+          for (const guardEvent of toolBudgetGuardEvents) {
+            yield {
+              type: "tool_budget_guard",
+              tool: guardEvent.tool,
+              count: guardEvent.count,
+              budget: guardEvent.budget,
+              reason: guardEvent.reason,
+              at: Date.now(),
+            };
+          }
+
           const repeatedGuardHints: Array<{ tool: string; streak: number }> = [];
+          const batchFailureEntries: Array<{ tool: string; failureClass: ToolFailureClass }> = [];
           for (const { toolCall, result } of toolResults) {
             const status = this.getToolResultStatus(result);
             const outcome =
@@ -2927,6 +4043,33 @@ export class QueryEngine {
               toolCall.function.name,
               toolCall.function.arguments,
             );
+            const fastGuardFailureClass = fastGuardFailureClassBySignature.get(signature);
+            if (fastGuardFailureClass) {
+              fastGuardFailureClassBySignature.delete(signature);
+            }
+            const failureClass = fastGuardFailureClass ?? this.classifyToolFailure(result, status);
+            const failureState = this.updateToolFailureState(
+              toolFailureStateBySignature,
+              signature,
+              toolCall.function.name,
+              failureClass,
+              status,
+              result,
+            );
+            if (failureClass) {
+              batchFailureEntries.push({
+                tool: toolCall.function.name,
+                failureClass,
+              });
+              yield {
+                type: "tool_failure_classified",
+                tool: toolCall.function.name,
+                failureClass,
+                streak: failureState?.streak ?? 1,
+                fastGuarded: Boolean(fastGuardFailureClass) || /fast\s*guard/i.test(result),
+                at: Date.now(),
+              };
+            }
             const retryHint = updateToolFailureStreak(
               toolFailureStreakBySignature,
               emittedToolRetryGuardSignatures,
@@ -2947,6 +4090,16 @@ export class QueryEngine {
                 at: Date.now(),
               };
             }
+            if (failureState && failureState.streak >= TOOL_FAILURE_FAST_GUARD_STREAK) {
+              this.appendStepLog(
+                thinkingStep,
+                translate(this.locale, "agent.runtime.fastGuardStreakLog", {
+                  tool: toolCall.function.name,
+                  failureClass: translate(this.locale, `agent.trace.toolFailureClass.${failureState.failureClass}`),
+                  streak: failureState.streak,
+                }),
+              );
+            }
           }
           const toolErrorCount = toolResults.reduce((count, item) => {
             const status = this.getToolResultStatus(item.result);
@@ -2956,6 +4109,9 @@ export class QueryEngine {
             consecutiveToolFailureBatches += 1;
           } else {
             consecutiveToolFailureBatches = 0;
+          }
+          if (toolErrorCount === 0) {
+            batchFailureDiagnosisContinuations = 0;
           }
           yield {
             type: "tool_batch_complete",
@@ -2967,7 +4123,7 @@ export class QueryEngine {
 
           if (repeatedGuardHints.length > 0) {
             const guardStep = this.createStep(translate(this.locale, "agent.runtime.retryGuardStep"));
-            guardStep.status = "completed";
+            this.setStepStatus(guardStep, "completed", { compact: false });
             for (const hint of repeatedGuardHints) {
               this.appendStepLog(
                 guardStep,
@@ -2977,6 +4133,7 @@ export class QueryEngine {
                 }),
               );
             }
+            this.compactStepLogsForHistory(guardStep);
             assistantMsg.steps!.push(guardStep);
             const detail = repeatedGuardHints
               .map((hint) => `${hint.tool}x${hint.streak}`)
@@ -2990,15 +4147,62 @@ export class QueryEngine {
             this.updateUI();
           }
 
+          if (this.shouldTriggerBatchFailureDiagnosis(
+            toolResults.length,
+            toolErrorCount,
+            batchFailureDiagnosisContinuations,
+          )) {
+            const failureDetails = this.summarizeFailureBreakdown(batchFailureEntries);
+            const diagnosisStep = this.createStep(translate(this.locale, "agent.runtime.retryGuardStep"));
+            this.setStepStatus(diagnosisStep, "completed", { compact: false });
+            this.appendStepLog(
+              diagnosisStep,
+              translate(this.locale, "agent.runtime.batchFailureDiagnosisLog", {
+                errorCount: toolErrorCount,
+                toolCount: toolResults.length,
+              }),
+            );
+            if (failureDetails) {
+              this.appendStepLog(
+                diagnosisStep,
+                translate(this.locale, "agent.runtime.batchFailureDiagnosisBreakdown", {
+                  details: failureDetails,
+                }),
+              );
+            }
+            this.compactStepLogsForHistory(diagnosisStep);
+            assistantMsg.steps!.push(diagnosisStep);
+            const continuationCount = batchFailureDiagnosisContinuations + 1;
+            yield {
+              type: "tool_failure_diagnosis",
+              errorCount: toolErrorCount,
+              toolCount: toolResults.length,
+              breakdown: failureDetails,
+              continuationCount,
+              at: Date.now(),
+            };
+            llmHistory.push({
+              role: "user",
+              content: this.buildBatchFailureDiagnosisContinuation(
+                failureDetails,
+                toolErrorCount,
+                toolResults.length,
+              ),
+            });
+            batchFailureDiagnosisContinuations = continuationCount;
+            this.updateUI();
+          }
+
           if (consecutiveToolFailureBatches >= MAX_CONSECUTIVE_TOOL_FAILURE_BATCHES) {
             const guardStep = this.createStep(translate(this.locale, "agent.runtime.failureGuardStep"));
-            guardStep.status = "error";
+            this.setStepStatus(guardStep, "error", { compact: false });
             this.appendStepLog(
               guardStep,
               translate(this.locale, "agent.runtime.failureGuardLog", {
                 count: consecutiveToolFailureBatches,
               }),
             );
+            this.compactStepLogsForHistory(guardStep);
             assistantMsg.steps!.push(guardStep);
             assistantMsg.content +=
               (assistantMsg.content ? "\n\n" : "") +
@@ -3054,10 +4258,11 @@ export class QueryEngine {
 
         if (stopHookResult.notes.length > 0) {
           const hookStep = this.createStep(translate(this.locale, "agent.runtime.stopHooksStep"));
-          hookStep.status = "completed";
+          this.setStepStatus(hookStep, "completed", { compact: false });
           for (const note of stopHookResult.notes) {
             this.appendStepLog(hookStep, note);
           }
+          this.compactStepLogsForHistory(hookStep);
           assistantMsg.steps!.push(hookStep);
         }
 
@@ -3075,7 +4280,7 @@ export class QueryEngine {
               content: continuationMessage,
             });
             const reviewStep = this.createStep(translate(this.locale, "agent.runtime.stopHooksReviewStep"));
-            reviewStep.status = "completed";
+            this.setStepStatus(reviewStep, "completed", { compact: false });
             this.appendStepLog(
               reviewStep,
               translate(this.locale, "agent.runtime.stopHooksReviewRetryLog", {
@@ -3083,6 +4288,7 @@ export class QueryEngine {
               }),
             );
             this.appendStepLog(reviewStep, continuationMessage);
+            this.compactStepLogsForHistory(reviewStep);
             assistantMsg.steps!.push(reviewStep);
             this.lastContinue = {
               reason: "stop_hook_retry",
@@ -3132,7 +4338,7 @@ export class QueryEngine {
         if (budgetDecision.action === "continue") {
           llmHistory.push({ role: "user", content: budgetDecision.nudgeMessage });
           const budgetStep = this.createStep(translate(this.locale, "agent.runtime.tokenBudgetStep"));
-          budgetStep.status = "completed";
+          this.setStepStatus(budgetStep, "completed", { compact: false });
           this.appendStepLog(
             budgetStep,
             translate(this.locale, "agent.runtime.tokenBudgetAutoContinue", {
@@ -3142,6 +4348,7 @@ export class QueryEngine {
               budget: budgetDecision.budget,
             }),
           );
+          this.compactStepLogsForHistory(budgetStep);
           assistantMsg.steps!.push(budgetStep);
           this.lastContinue = {
             reason: "token_budget_continuation",
@@ -3162,6 +4369,9 @@ export class QueryEngine {
       }
 
       if (maxIterationTriggered) {
+        this.finalizeAssistantMessageSteps(assistantMsg, {
+          finalizeRunningStatus: "error",
+        });
         assistantMsg.content +=
           (assistantMsg.content ? "\n\n" : "") +
           translate(this.locale, "agent.runtime.maxIterationsReached", {
@@ -3176,8 +4386,10 @@ export class QueryEngine {
         return terminal;
       }
 
-      const hasStepError = assistantMsg.steps?.some((step) => step.status === "error") ?? false;
-      const hasStepRejected = assistantMsg.steps?.some((step) => step.status === "rejected") ?? false;
+      const { hasError: hasStepError, hasRejected: hasStepRejected } = this.finalizeAssistantMessageSteps(
+        assistantMsg,
+        { finalizeRunningStatus: "completed" },
+      );
       assistantMsg.status = hasStepError ? "error" : hasStepRejected ? "rejected" : "completed";
       this.activeRunningStep = null;
       this.activeAssistantMessage = null;
@@ -3195,13 +4407,9 @@ export class QueryEngine {
 
       this.ensureToolResultPairing(llmHistory, assistantMsg);
 
-      if (assistantMsg.steps) {
-        for (const step of assistantMsg.steps) {
-          if (step.status === "running" || step.status === "pending") {
-            step.status = "error";
-          }
-        }
-      }
+      this.finalizeAssistantMessageSteps(assistantMsg, {
+        finalizeRunningStatus: "error",
+      });
       this.updateUI();
       const terminal: Terminal = { reason: "error", error };
       yield buildQueryEndEvent(terminal);
@@ -3256,6 +4464,7 @@ export class QueryEngine {
           );
         }
         this.messageQueue = [];
+        this.consecutiveNowDequeues = 0;
         this.refreshRuntimeSnapshot();
       }
       this.abortQueuedProcessing = true;
@@ -3269,6 +4478,7 @@ export class QueryEngine {
     this.abort(false, "engine_dispose");
     this.activeRunningStep = null;
     this.activeAssistantMessage = null;
+    this.clearQueueMaintenanceTimer();
     if (this.stepLogFlushTimer !== null) {
       clearTimeout(this.stepLogFlushTimer);
       this.stepLogFlushTimer = null;
@@ -3291,6 +4501,7 @@ export class QueryEngine {
    */
   public clear() {
     this.abort(true, "engine_clear");
+    this.clearQueueMaintenanceTimer();
     if (this.stepLogFlushTimer !== null) {
       clearTimeout(this.stepLogFlushTimer);
       this.stepLogFlushTimer = null;
@@ -3302,11 +4513,13 @@ export class QueryEngine {
     this.usageByModel.clear();
     this.messages = [];
     this.messageQueue = [];
+    this.consecutiveNowDequeues = 0;
     this.isProcessing = false;
     this.abortQueuedProcessing = false;
     this.lastTerminal = null;
     this.lastContinue = null;
     this.queryEvents = [];
+    this.markQueryEventsChanged();
     this.commandLifecycleById.clear();
     this.commandLifecycleOrder = [];
     this.refreshRuntimeSnapshot();

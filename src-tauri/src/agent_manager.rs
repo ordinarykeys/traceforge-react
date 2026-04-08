@@ -6,6 +6,15 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 
+const AGENT_COMMAND_TIMEOUT_DEFAULT_MS: u64 = 120_000;
+const AGENT_COMMAND_TIMEOUT_MIN_MS: u64 = 1_000;
+const AGENT_COMMAND_TIMEOUT_MAX_MS: u64 = 30 * 60_000;
+
+fn clamp_agent_timeout_ms(value: Option<u64>) -> u64 {
+    let raw = value.unwrap_or(AGENT_COMMAND_TIMEOUT_DEFAULT_MS);
+    raw.clamp(AGENT_COMMAND_TIMEOUT_MIN_MS, AGENT_COMMAND_TIMEOUT_MAX_MS)
+}
+
 #[derive(Deserialize)]
 pub struct AgentCommandRequest {
     pub cmd: String,
@@ -720,8 +729,9 @@ pub async fn invoke_agent_task_execution(
             } else if lines.len() == 5000 {
                 lines.push("... [Standard output truncated for memory safety] ...".to_string());
             }
-            // Small throttle to prevent UI flooding
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            if lines.len() % 256 == 0 {
+                tokio::task::yield_now().await;
+            }
         }
         lines
     });
@@ -746,13 +756,15 @@ pub async fn invoke_agent_task_execution(
             } else if lines.len() == 2000 {
                 lines.push("... [Error output truncated for memory safety] ...".to_string());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            if lines.len() % 256 == 0 {
+                tokio::task::yield_now().await;
+            }
         }
         lines
     });
 
     // Wait for the exit status with timeout
-    let timeout_ms = request.timeout_ms.unwrap_or(30000); // 30s default
+    let timeout_ms = clamp_agent_timeout_ms(request.timeout_ms);
     let mut interrupted = false;
     let mut exit_code = None;
     let mut success = false;

@@ -53,12 +53,29 @@ export async function withRetry<T>(
         onRetry(attempt, error, nextDelay);
       }
 
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(resolve, nextDelay);
-        signal?.addEventListener("abort", () => {
-          clearTimeout(timer);
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const cleanup = () => {
+          if (timer !== null) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          signal?.removeEventListener("abort", onAbort);
+        };
+        const onAbort = () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
           reject(new Error("Operation aborted by user"));
-        }, { once: true });
+        };
+        timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve();
+        }, nextDelay);
+        signal?.addEventListener("abort", onAbort, { once: true });
       });
     }
   }

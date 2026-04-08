@@ -1,11 +1,10 @@
-import { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
+import { startTransition, useState, useEffect, useRef, useCallback, useMemo, memo, lazy, Suspense } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import {
   AlertTriangle,
   ChevronDown,
-  ChevronLeft,
   ChevronRight,
   Copy,
   FilePlus2,
@@ -50,9 +49,10 @@ import { ComposerPanel } from "@/components/agent/ComposerPanel";
 import { ThreadSidebar } from "@/components/agent/ThreadSidebar";
 import { VirtualMessageList } from "@/components/agent/VirtualMessageList";
 import {
+  DEFAULT_TOOL_CALL_BUDGET_POLICY,
   QueryEngine,
-  type AgentStepData,
   type AgentMessage,
+  type ToolCallBudgetPolicy,
   type QueuePriority,
   type QueryRuntimeSnapshot,
   type QueuedQueryItem,
@@ -60,6 +60,51 @@ import {
   type PermissionPromptDecision,
   type PermissionPromptRequest,
 } from "@/lib/agent/QueryEngine";
+import {
+  THREAD_AUTOSAVE_IDLE_MS,
+  buildPersistedThreadStateFromPersisted,
+  compactMessagesForPersistence,
+  getMessageContentSnapshot,
+  getMessagePersistenceSignature,
+  getMessageStepsSnapshot,
+  getPreviousArgsSnapshot,
+  seedPersistedMessageCacheFromPersisted,
+  type PersistedMessageCache,
+  type PersistedThreadState,
+} from "@/lib/agent/threadPersistenceRuntime";
+import {
+  deriveRecoverActionDecision,
+  deriveRecoverDoctorRecommendationPresentations,
+  deriveRecoverRunbookBlueprint,
+  getRecoverRunbookStepDescriptor,
+} from "@/lib/agent/recoveryPolicy";
+import {
+  compareDiagnosisRecommendationPriority,
+  deriveDiagnosisTrendWeight,
+  extractDiagnosisCommandTool,
+  type DiagnosisRecommendationBlastRadiusLevel as PermissionBlastRadiusLevel,
+  type DiagnosisRecommendationId,
+  type DiagnosisRecommendationReversibilityLevel as PermissionReversibilityLevel,
+} from "@/lib/agent/diagnosisRecommendationPolicy";
+import {
+  buildFallbackDiagnosisRecommendationBlueprint,
+  buildHotspotDiagnosisRecommendationBlueprint,
+  buildQueueDiagnosisRecommendationBlueprint,
+  buildRecoverDiagnosisRecommendationBlueprint,
+  buildReplayFailedDiagnosisRecommendationBlueprint,
+} from "@/lib/agent/diagnosisRecommendationRuntime";
+import {
+  buildRecoverContinuePromptFingerprintSet,
+  buildRecoverRuntimeSnapshot,
+  buildRecoverStateSignature,
+  deriveQueuePressure,
+  detectRecoverStateFromMessages,
+  normalizeRecoverContinuePromptFingerprint,
+  RECOVER_CONTINUE_PROMPT_LOCALES,
+  sumRecoverFailureCounters,
+  type TraceQueuePressure,
+} from "@/lib/agent/recoveryRuntime";
+import { deriveThreadNameFromQuery } from "@/lib/agent/threadTitleRuntime";
 import type { PermissionRule, PermissionSuggestion } from "@/lib/agent/permissions/toolPermissions";
 import type { Continue, Terminal as QueryTerminal } from "@/lib/agent/query/transitions";
 import type {
@@ -71,7 +116,11 @@ import { ALL_TOOLS } from "@/lib/agent/tools";
 import { threadService } from "@/lib/agent/ThreadService";
 import type { ThreadMetadata } from "@/lib/agent/ThreadService";
 import type { ThreadEvent } from "@/lib/agent/ThreadService";
-import type { ThreadDiagnostics, ThreadDiagnosisActivity } from "@/lib/agent/ThreadService";
+import type {
+  ThreadDiagnostics,
+  ThreadDiagnosisActivity,
+  ThreadRecoveryDiagnostics,
+} from "@/lib/agent/ThreadService";
 import { translate, type AppLocale } from "@/lib/i18n";
 import { useLocaleStore } from "@/hooks/useLocaleStore";
 import { loadAgentPreferences, saveAgentPreferences } from "@/lib/agentPreferencesStorage";
@@ -80,6 +129,10 @@ import {
   loadTerminalShellType,
   type TerminalShellType,
 } from "@/lib/terminalShellStorage";
+import {
+  buildPreviousToolArgsLookup,
+  type ToolArgsHistorySnapshot,
+} from "@/lib/agent/toolArgsHistoryRuntime";
 
 interface AgentWorkstationViewProps {
   apiConfig: { baseUrl: string; apiKey: string } | null;
@@ -131,6 +184,16 @@ interface RewindPreviewState {
   affectedPaths: string[];
   warnings: string[];
   firstSeq: number | null;
+}
+
+interface ThreadAutosavePayload {
+  threadId: string;
+  name: string;
+  workingDir: string | undefined;
+  messages: AgentMessage[];
+  existingDiagnostics: ThreadDiagnostics | undefined;
+  diagnosisActivity: TraceQuickCommandState | null;
+  diagnosisHistory: TraceQuickCommandState[];
 }
 
 type TraceQuickCommandKind =
@@ -194,9 +257,13 @@ const DIAGNOSIS_HISTORY_FAILED_STATUS_SET: ReadonlySet<TraceQuickCommandStatus> 
   "queue_full",
 ]);
 
-interface PersistedThreadState {
-  order: string[];
-  signatures: Record<string, string>;
+interface MessageRenderSnapshotCacheEntry {
+  messageRef: AgentMessage;
+  previousArgsRef: Record<string, string>;
+  contentSnapshot: string;
+  statusSnapshot: string;
+  stepsSnapshot: string;
+  previousArgsSnapshot: string;
 }
 
 type DiffScope = "unstaged" | "staged" | "allBranches" | "lastRound";
@@ -207,6 +274,49 @@ type SubmitAgentQueryResult =
       accepted: false;
       reason: "engine_not_ready" | "empty" | "queue_full";
     };
+
+const RECOVER_CONTINUE_PROMPT_FINGERPRINTS = buildRecoverContinuePromptFingerprintSet(
+  RECOVER_CONTINUE_PROMPT_LOCALES.map((locale) =>
+    translate(locale as AppLocale, "agent.command.recover.continuePrompt"),
+  ),
+);
+
+function isRecoverContinuePrompt(query: string): boolean {
+  return RECOVER_CONTINUE_PROMPT_FINGERPRINTS.has(normalizeRecoverContinuePromptFingerprint(query));
+}
+
+function buildThreadRecoveryDiagnosticsSnapshot(
+  messages: AgentMessage[],
+  queuedQueries: readonly QueuedQueryItem[],
+  queueCount: number,
+  queueLimit: number,
+  events: readonly QueryStreamEvent[],
+): ThreadRecoveryDiagnostics {
+  const recoverRuntimeSnapshot = buildRecoverRuntimeSnapshot({
+    messages,
+    queuedQueries,
+    queueCount,
+    queueLimit,
+    queuedRecoveryMatcher: isRecoverContinuePrompt,
+    events,
+  });
+  const state = recoverRuntimeSnapshot.state;
+  const plan = recoverRuntimeSnapshot.plan;
+  const signals = recoverRuntimeSnapshot.signals;
+  return {
+    state: state.kind,
+    plan: plan.kind,
+    interrupted_message_id: state.lastMessageId ?? null,
+    queued_recovery_id: plan.queuedRecovery?.id ?? null,
+    queue_count: plan.queueCount,
+    queue_limit: plan.queueLimit,
+    pressure: plan.pressure,
+    failure: signals.failure,
+    failure_total: signals.failureTotal,
+    queue_rejected_count: signals.queueRejectedCount,
+    queue_deduplicated_count: signals.queueDeduplicatedCount,
+  };
+}
 
 interface AgentLogEventPayload {
   source?: string;
@@ -223,21 +333,37 @@ const FALLBACK_MODELS: ModelInfo[] = [
 
 const DEFAULT_TOOL_NAMES = ALL_TOOLS.map((tool) => tool.name);
 const DEFAULT_TOOL_COUNT = DEFAULT_TOOL_NAMES.length;
-const SNAPSHOT_SAMPLE_SIZE = 32;
 const MAX_TERMINAL_LIVE_LOG_LINES = 800;
 const THREADS_REFRESH_DEBOUNCE_MS = 450;
 const TERMINAL_LOG_FLUSH_INTERVAL_MS = 80;
+const GIT_SNAPSHOT_CACHE_TTL_MS = 1_500;
 const STATUS_TICK_INTERVAL_MS = 1000;
 const STATUS_STALL_THRESHOLD_SECONDS = 8;
 const TOOL_ARGS_HISTORY_SCAN_LIMIT = 420;
+const THREAD_DIAGNOSTIC_EVENT_SCAN_LIMIT = 220;
 const EMPTY_PROMPT_SECTIONS: PromptCompiledSectionMetadata[] = [];
 const EMPTY_STRING_LIST: string[] = [];
+const EMPTY_TOOL_ARGS_RECORD: Record<string, string> = Object.freeze({});
 const EMPTY_QUEUED_QUERY_LIST: QueuedQueryItem[] = [];
+const EMPTY_DIFF_CHANGED_FILES: Array<{ code: string; path: string }> = [];
 const EMPTY_QUEUE_BY_PRIORITY = Object.freeze({
   now: 0,
   next: 0,
   later: 0,
 });
+
+function areToolCallBudgetPoliciesEqual(
+  left: ToolCallBudgetPolicy,
+  right: ToolCallBudgetPolicy,
+): boolean {
+  return (
+    left.readOnlyBase === right.readOnlyBase &&
+    left.mutatingBase === right.mutatingBase &&
+    left.shellBase === right.shellBase &&
+    left.failureBackoffStep === right.failureBackoffStep &&
+    left.minimum === right.minimum
+  );
+}
 const EMPTY_QUERY_RUNTIME_SNAPSHOT: QueryRuntimeSnapshot = {
   queueCount: 0,
   queueLimit: 8,
@@ -247,31 +373,21 @@ const EMPTY_QUERY_RUNTIME_SNAPSHOT: QueryRuntimeSnapshot = {
   latestEvent: null,
   lastEventAt: null,
 };
-const THREAD_AUTOSAVE_IDLE_MS = 1_200;
-const PERSISTED_MESSAGE_CONTENT_LIMIT = 40_000;
-const PERSISTED_REPORT_CONTENT_LIMIT = 16_000;
-const PERSISTED_STEP_LOG_LINES_LIMIT = 180;
-const PERSISTED_STEP_LOG_LINE_CHARS_LIMIT = 900;
-const PERSISTED_TOOL_ARGS_CHARS_LIMIT = 8_000;
-const PERSISTED_TOOL_PREVIEW_CHARS_LIMIT = 3_000;
-const PERSISTED_THREAD_PAYLOAD_BUDGET_CHARS = 280_000;
-const PERSISTED_BUDGET_RECENT_MESSAGE_COUNT = 8;
-const PERSISTED_BUDGET_OLD_MESSAGE_CONTENT_LIMIT = 4_500;
-const PERSISTED_BUDGET_OLD_MESSAGE_REPORT_LIMIT = 1_400;
-const PERSISTED_BUDGET_OLD_STEP_LOG_LINES_LIMIT = 60;
-const PERSISTED_BUDGET_OLD_STEP_LOG_LINE_CHARS_LIMIT = 360;
-const PERSISTED_BUDGET_OLD_TOOL_ARGS_CHARS_LIMIT = 1_800;
-const PERSISTED_BUDGET_OLD_TOOL_PREVIEW_CHARS_LIMIT = 900;
-const PERSISTED_BUDGET_HARD_MIN_CONTENT_LIMIT = 220;
-const PERSISTED_BUDGET_HARD_MIN_REPORT_LIMIT = 120;
-const PERSISTED_BUDGET_HARD_MIN_LOG_LINES = 8;
-const PERSISTED_BUDGET_HARD_MIN_LOG_LINE_CHARS_LIMIT = 140;
-const PERSISTED_BUDGET_HARD_MIN_TOOL_ARGS_CHARS_LIMIT = 420;
-const PERSISTED_BUDGET_HARD_MIN_TOOL_PREVIEW_CHARS_LIMIT = 240;
-const PERSISTED_BUDGET_MINIMAL_CONTENT = "[persisted-pruned]";
-const PERSISTED_BUDGET_MINIMAL_REPORT = "[persisted-pruned-report]";
 const MAX_DIAGNOSIS_HISTORY_ITEMS = 40;
 const DIAGNOSIS_HISTORY_PREVIEW_LIMIT = 8;
+const MAX_MESSAGE_RENDER_SNAPSHOT_CACHE_ENTRIES = 480;
+const SHOW_TRACE_PANEL = false;
+const SHOW_CONSOLE_PANEL = false;
+const SHOW_DIAGNOSIS_COCKPIT = false;
+const PERSIST_THREAD_DIAGNOSTICS = SHOW_TRACE_PANEL || SHOW_DIAGNOSIS_COCKPIT;
+const DiffGitSummarySection = lazy(() => import("@/components/agent/DiffGitSummarySection"));
+
+function getToolArgsHistoryScanWindow(messageCount: number): number {
+  if (messageCount > 1200) return 160;
+  if (messageCount > 800) return 220;
+  if (messageCount > 500) return 300;
+  return TOOL_ARGS_HISTORY_SCAN_LIMIT;
+}
 
 function getDiagnosisHistoryRiskScore(state: Pick<TraceQuickCommandState, "kind" | "status" | "command">): number {
   let score = 0;
@@ -326,9 +442,22 @@ function getDiagnosisRunbookActionIdFromKind(kind: TraceQuickCommandKind): strin
   return "fallback_investigate";
 }
 
-function extractTraceToolFromCommand(command: string): string | null {
-  const matched = command.match(/\btool=([^\s]+)/);
-  return matched?.[1] ?? null;
+function isDoctorQueueInvestigateCommand(command: string): boolean {
+  return command.trim().startsWith("/doctor queue investigate");
+}
+
+function isDoctorFallbackInvestigateCommand(command: string): boolean {
+  return command.trim().startsWith("/doctor fallback investigate");
+}
+
+function getRiskInvestigateCommandType(command: string): "queue" | "fallback" | null {
+  if (isDoctorQueueInvestigateCommand(command)) {
+    return "queue";
+  }
+  if (isDoctorFallbackInvestigateCommand(command)) {
+    return "fallback";
+  }
+  return null;
 }
 
 function cloneMessages(messages: AgentMessage[]): AgentMessage[] {
@@ -338,28 +467,48 @@ function cloneMessages(messages: AgentMessage[]): AgentMessage[] {
   return JSON.parse(JSON.stringify(messages)) as AgentMessage[];
 }
 
-function summarizeText(value: string | undefined): string {
-  if (!value) return "0";
-  const head = value.slice(0, SNAPSHOT_SAMPLE_SIZE);
-  const tail = value.slice(-SNAPSHOT_SAMPLE_SIZE);
-  return `${value.length}:${head}:${tail}`;
+function isEditableKeyboardTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tagName = target.tagName.toLowerCase();
+  return tagName === "textarea" || tagName === "input" || tagName === "select";
 }
 
-function truncateForPersistence(value: string | undefined, maxChars: number): string {
-  const text = value ?? "";
-  if (!text) return "";
-  if (text.length <= maxChars) return text;
-  const marker = "\n...[persisted-trimmed]...\n";
-  const available = Math.max(16, maxChars - marker.length);
-  const headLen = Math.max(8, Math.floor(available * 0.72));
-  const tailLen = Math.max(8, available - headLen);
-  return `${text.slice(0, headLen)}${marker}${text.slice(-tailLen)}`;
-}
-
-function buildThreadDiagnosticsFromEvents(events: QueryStreamEvent[]): ThreadDiagnostics | undefined {
+function buildThreadDiagnosticsFromEvents(events: readonly QueryStreamEvent[]): ThreadDiagnostics | undefined {
   if (events.length === 0) {
     return undefined;
   }
+
+  const queueReasonCounts = {
+    capacity: 0,
+    stale: 0,
+    manual: 0,
+    deduplicated: 0,
+  };
+  const queueQueuedPriority = {
+    now: 0,
+    next: 0,
+    later: 0,
+  };
+  const queueDequeuedPriority = {
+    now: 0,
+    next: 0,
+    later: 0,
+  };
+  const queueRejectedPriority = {
+    now: 0,
+    next: 0,
+    later: 0,
+  };
+
+  let queueQueuedCount = 0;
+  let queueDequeuedCount = 0;
+  let queueRejectedCount = 0;
+  let queueDeduplicatedCount = 0;
+  let queueLatestDepth = 0;
+  let queueMaxDepth = 0;
+  let queueLimitSeen = 0;
+  let queueEventCount = 0;
 
   let fallbackUsed = 0;
   let fallbackSuppressed = 0;
@@ -372,6 +521,38 @@ function buildThreadDiagnosticsFromEvents(events: QueryStreamEvent[]): ThreadDia
   let permissionScopeNotices = 0;
 
   for (const event of events) {
+    if (event.type === "queue_update") {
+      queueEventCount += 1;
+      queueLatestDepth = Math.max(0, event.queueCount);
+      queueMaxDepth = Math.max(queueMaxDepth, Math.max(0, event.queueCount));
+      queueLimitSeen = Math.max(queueLimitSeen, Math.max(0, event.queueLimit));
+
+      if (event.action === "queued") {
+        queueQueuedCount += 1;
+        if (event.priority) {
+          queueQueuedPriority[event.priority] += 1;
+        }
+      } else if (event.action === "dequeued") {
+        queueDequeuedCount += 1;
+        if (event.priority) {
+          queueDequeuedPriority[event.priority] += 1;
+        }
+      } else if (event.action === "rejected") {
+        queueRejectedCount += 1;
+        if (event.priority) {
+          queueRejectedPriority[event.priority] += 1;
+        }
+      }
+
+      if (event.reason) {
+        queueReasonCounts[event.reason] += 1;
+        if (event.reason === "deduplicated") {
+          queueDeduplicatedCount += 1;
+        }
+      }
+      continue;
+    }
+
     if (event.type === "continue" && event.transition.reason === "fallback_retry") {
       fallbackUsed += 1;
       continue;
@@ -415,6 +596,7 @@ function buildThreadDiagnosticsFromEvents(events: QueryStreamEvent[]): ThreadDia
   }
 
   const hasRetrySignals = fallbackUsed > 0 || fallbackSuppressed > 0 || retryEventCount > 0;
+  const hasQueueSignals = queueEventCount > 0;
   const hasPermissionSignals =
     permissionRiskCounts.critical > 0 ||
     permissionRiskCounts.high_risk > 0 ||
@@ -429,7 +611,7 @@ function buildThreadDiagnosticsFromEvents(events: QueryStreamEvent[]): ThreadDia
     permissionBlastRadiusCounts.workspace > 0 ||
     permissionBlastRadiusCounts.shared > 0;
 
-  if (!hasRetrySignals && !hasPermissionSignals) {
+  if (!hasRetrySignals && !hasPermissionSignals && !hasQueueSignals) {
     return undefined;
   }
 
@@ -468,247 +650,87 @@ function buildThreadDiagnosticsFromEvents(events: QueryStreamEvent[]): ThreadDia
           },
         }
       : undefined,
+    queue: hasQueueSignals
+      ? {
+          queue_limit: queueLimitSeen,
+          latest_depth: queueLatestDepth,
+          max_depth: queueMaxDepth,
+          pressure: deriveQueuePressure(Math.max(queueLatestDepth, queueMaxDepth), queueLimitSeen),
+          queued_count: queueQueuedCount,
+          dequeued_count: queueDequeuedCount,
+          rejected_count: queueRejectedCount,
+          deduplicated_count: queueDeduplicatedCount,
+          reason: queueReasonCounts,
+          queued_priority: queueQueuedPriority,
+          dequeued_priority: queueDequeuedPriority,
+          rejected_priority: queueRejectedPriority,
+        }
+      : undefined,
     updated_at: Date.now(),
   };
-}
-
-function compactStepForPersistence(step: AgentStepData): AgentStepData {
-  const logs = (step.logs ?? [])
-    .slice(-PERSISTED_STEP_LOG_LINES_LIMIT)
-    .map((line) => truncateForPersistence(line, PERSISTED_STEP_LOG_LINE_CHARS_LIMIT));
-  const toolRender = step.toolRender
-    ? {
-        ...step.toolRender,
-        callArguments: truncateForPersistence(step.toolRender.callArguments, PERSISTED_TOOL_ARGS_CHARS_LIMIT),
-        outcomePreview: truncateForPersistence(step.toolRender.outcomePreview, PERSISTED_TOOL_PREVIEW_CHARS_LIMIT),
-      }
-    : undefined;
-  return {
-    ...step,
-    logs,
-    toolRender,
-  };
-}
-
-function compactMessageForPersistence(message: AgentMessage): AgentMessage {
-  return {
-    ...message,
-    content: truncateForPersistence(message.content, PERSISTED_MESSAGE_CONTENT_LIMIT),
-    report: truncateForPersistence(message.report, PERSISTED_REPORT_CONTENT_LIMIT),
-    steps: message.steps?.map(compactStepForPersistence),
-  };
-}
-
-function compactStepForBudget(
-  step: AgentStepData,
-  options: {
-    logLinesLimit: number;
-    lineCharsLimit: number;
-    argsCharsLimit: number;
-    previewCharsLimit: number;
-  },
-): AgentStepData {
-  const logs = (step.logs ?? [])
-    .slice(-Math.max(1, options.logLinesLimit))
-    .map((line) => truncateForPersistence(line, Math.max(16, options.lineCharsLimit)));
-  const toolRender = step.toolRender
-    ? {
-        ...step.toolRender,
-        callArguments: truncateForPersistence(
-          step.toolRender.callArguments,
-          Math.max(24, options.argsCharsLimit),
-        ),
-        outcomePreview: truncateForPersistence(
-          step.toolRender.outcomePreview,
-          Math.max(24, options.previewCharsLimit),
-        ),
-      }
-    : undefined;
-  return {
-    ...step,
-    logs,
-    toolRender,
-  };
-}
-
-function compactMessageForBudget(
-  message: AgentMessage,
-  options: {
-    contentLimit: number;
-    reportLimit: number;
-    logLinesLimit: number;
-    lineCharsLimit: number;
-    argsCharsLimit: number;
-    previewCharsLimit: number;
-  },
-): AgentMessage {
-  return {
-    ...message,
-    content: truncateForPersistence(message.content, Math.max(24, options.contentLimit)),
-    report: truncateForPersistence(message.report, Math.max(24, options.reportLimit)),
-    steps: message.steps?.map((step) =>
-      compactStepForBudget(step, {
-        logLinesLimit: options.logLinesLimit,
-        lineCharsLimit: options.lineCharsLimit,
-        argsCharsLimit: options.argsCharsLimit,
-        previewCharsLimit: options.previewCharsLimit,
-      }),
-    ),
-  };
-}
-
-function estimatePersistedMessagePayloadSize(message: AgentMessage): number {
-  let total = 0;
-  total += message.id.length;
-  total += message.role.length;
-  total += message.status?.length ?? 0;
-  total += message.content?.length ?? 0;
-  total += message.report?.length ?? 0;
-  const steps = message.steps ?? [];
-  for (const step of steps) {
-    total += step.id.length + step.title.length + step.status.length;
-    for (const line of step.logs ?? []) {
-      total += line.length;
-    }
-    if (step.toolRender) {
-      total += step.toolRender.toolName.length;
-      total += step.toolRender.argsSummary.length;
-      total += step.toolRender.callArguments?.length ?? 0;
-      total += step.toolRender.outcome.length;
-      total += step.toolRender.outcomePreview?.length ?? 0;
-    }
-  }
-  return total;
-}
-
-function estimatePersistedMessagesPayloadSize(messages: AgentMessage[]): number {
-  return messages.reduce((sum, message) => sum + estimatePersistedMessagePayloadSize(message), 0);
-}
-
-function compactMessagesForPersistence(messages: AgentMessage[]): AgentMessage[] {
-  const persisted = messages.map(compactMessageForPersistence);
-  let totalSize = estimatePersistedMessagesPayloadSize(persisted);
-  if (totalSize <= PERSISTED_THREAD_PAYLOAD_BUDGET_CHARS) {
-    return persisted;
-  }
-
-  const budgetProtectedStart = Math.max(0, persisted.length - PERSISTED_BUDGET_RECENT_MESSAGE_COUNT);
-  for (let index = 0; index < budgetProtectedStart && totalSize > PERSISTED_THREAD_PAYLOAD_BUDGET_CHARS; index += 1) {
-    const current = persisted[index];
-    const tightened = compactMessageForBudget(current, {
-      contentLimit: PERSISTED_BUDGET_OLD_MESSAGE_CONTENT_LIMIT,
-      reportLimit: PERSISTED_BUDGET_OLD_MESSAGE_REPORT_LIMIT,
-      logLinesLimit: PERSISTED_BUDGET_OLD_STEP_LOG_LINES_LIMIT,
-      lineCharsLimit: PERSISTED_BUDGET_OLD_STEP_LOG_LINE_CHARS_LIMIT,
-      argsCharsLimit: PERSISTED_BUDGET_OLD_TOOL_ARGS_CHARS_LIMIT,
-      previewCharsLimit: PERSISTED_BUDGET_OLD_TOOL_PREVIEW_CHARS_LIMIT,
-    });
-    const delta =
-      estimatePersistedMessagePayloadSize(current) - estimatePersistedMessagePayloadSize(tightened);
-    if (delta > 0) {
-      persisted[index] = tightened;
-      totalSize -= delta;
-    }
-  }
-
-  if (totalSize <= PERSISTED_THREAD_PAYLOAD_BUDGET_CHARS) {
-    return persisted;
-  }
-
-  for (let index = 0; index < budgetProtectedStart && totalSize > PERSISTED_THREAD_PAYLOAD_BUDGET_CHARS; index += 1) {
-    const current = persisted[index];
-    const hardened = compactMessageForBudget(current, {
-      contentLimit: PERSISTED_BUDGET_HARD_MIN_CONTENT_LIMIT,
-      reportLimit: PERSISTED_BUDGET_HARD_MIN_REPORT_LIMIT,
-      logLinesLimit: PERSISTED_BUDGET_HARD_MIN_LOG_LINES,
-      lineCharsLimit: PERSISTED_BUDGET_HARD_MIN_LOG_LINE_CHARS_LIMIT,
-      argsCharsLimit: PERSISTED_BUDGET_HARD_MIN_TOOL_ARGS_CHARS_LIMIT,
-      previewCharsLimit: PERSISTED_BUDGET_HARD_MIN_TOOL_PREVIEW_CHARS_LIMIT,
-    });
-    const minimal: AgentMessage = {
-      ...hardened,
-      content: hardened.content ? PERSISTED_BUDGET_MINIMAL_CONTENT : "",
-      report: hardened.report ? PERSISTED_BUDGET_MINIMAL_REPORT : "",
-      steps: hardened.steps?.map((step) => ({
-        ...step,
-        logs: step.logs.length > 0 ? [PERSISTED_BUDGET_MINIMAL_CONTENT] : [],
-        toolRender: step.toolRender
-          ? {
-              ...step.toolRender,
-              callArguments: step.toolRender.callArguments ? PERSISTED_BUDGET_MINIMAL_CONTENT : "",
-              outcomePreview: step.toolRender.outcomePreview ? PERSISTED_BUDGET_MINIMAL_CONTENT : "",
-            }
-          : undefined,
-      })),
-    };
-    const delta = estimatePersistedMessagePayloadSize(current) - estimatePersistedMessagePayloadSize(minimal);
-    if (delta > 0) {
-      persisted[index] = minimal;
-      totalSize -= delta;
-    }
-  }
-
-  return persisted;
-}
-
-function getMessageContentSnapshot(message: AgentMessage): string {
-  return summarizeText(message.content);
-}
-
-function getPreviousArgsSnapshot(previousCallArgsByTool: Record<string, string>): string {
-  const entries = Object.entries(previousCallArgsByTool);
-  if (entries.length === 0) return "";
-  return entries
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([tool, args]) => `${tool}:${summarizeText(args)}`)
-    .join("|");
-}
-
-function getMessageStepsSnapshot(message: AgentMessage): string {
-  if (!message.steps || message.steps.length === 0) {
-    return "";
-  }
-
-  return message.steps
-    .map((step) => {
-      const toolSnapshot = step.toolRender
-        ? `${step.toolRender.toolName}:${step.toolRender.outcome}:${summarizeText(step.toolRender.outcomePreview)}`
-        : "";
-      const lastLog = step.logs.length > 0 ? step.logs[step.logs.length - 1] : "";
-      return `${step.id}:${step.status}:${step.logs.length}:${summarizeText(lastLog)}:${toolSnapshot}`;
-    })
-    .join("|");
-}
-
-function getMessagePersistenceSignature(message: AgentMessage): string {
-  const stepSnapshot = getMessageStepsSnapshot(message);
-  return [
-    message.id,
-    message.role,
-    message.status ?? "",
-    summarizeText(message.content),
-    summarizeText(message.report),
-    stepSnapshot,
-  ].join("#");
-}
-
-function buildPersistedThreadState(messages: AgentMessage[]): PersistedThreadState {
-  return buildPersistedThreadStateFromPersisted(compactMessagesForPersistence(messages));
-}
-
-function buildPersistedThreadStateFromPersisted(messages: AgentMessage[]): PersistedThreadState {
-  const order: string[] = [];
-  const signatures: Record<string, string> = {};
-  for (const message of messages) {
-    order.push(message.id);
-    signatures[message.id] = getMessagePersistenceSignature(message);
-  }
-  return { order, signatures };
 }
 
 function getPermissionSuggestionSummary(suggestions: PermissionSuggestion[]): string {
   if (suggestions.length === 0) return "";
   return suggestions.map((item) => item.summary).join(" | ");
+}
+
+function areQueuedQueryItemsEqual(
+  left: readonly QueuedQueryItem[],
+  right: readonly QueuedQueryItem[],
+): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (left.length !== right.length) {
+    return false;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    const leftItem = left[index];
+    const rightItem = right[index];
+    if (!leftItem || !rightItem) {
+      return false;
+    }
+    if (
+      leftItem.id !== rightItem.id ||
+      leftItem.query !== rightItem.query ||
+      leftItem.model !== rightItem.model ||
+      leftItem.permissionMode !== rightItem.permissionMode ||
+      leftItem.queuedAt !== rightItem.queuedAt ||
+      leftItem.commandId !== rightItem.commandId ||
+      leftItem.commandLabel !== rightItem.commandLabel ||
+      leftItem.priority !== rightItem.priority
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function areQueuePriorityCountersEqual(
+  left: QueryRuntimeSnapshot["queueByPriority"],
+  right: QueryRuntimeSnapshot["queueByPriority"],
+): boolean {
+  return (
+    left.now === right.now &&
+    left.next === right.next &&
+    left.later === right.later
+  );
+}
+
+function areRuntimeSnapshotsEqual(
+  previous: QueryRuntimeSnapshot,
+  next: QueryRuntimeSnapshot,
+): boolean {
+  return (
+    previous.queueCount === next.queueCount &&
+    previous.queueLimit === next.queueLimit &&
+    previous.lastEventAt === next.lastEventAt &&
+    previous.latestEvent === next.latestEvent &&
+    previous.recentEvents === next.recentEvents &&
+    areQueuePriorityCountersEqual(previous.queueByPriority, next.queueByPriority) &&
+    areQueuedQueryItemsEqual(previous.queuedQueries, next.queuedQueries)
+  );
 }
 
 function parseGitStatusEntry(line: string): { code: string; path: string } | null {
@@ -725,69 +747,35 @@ function parseGitStatusEntry(line: string): { code: string; path: string } | nul
   return { code: "--", path: trimmed };
 }
 
-function deriveThreadNameFromQuery(query: string, fallback: string): string {
-  const normalized = query.replace(/\s+/g, " ").trim();
-  if (!normalized) return fallback;
-
-  const clauses = normalized
-    .split(/[\r\n]+|[.!?;:,]+|[\u3002\uFF01\uFF1F\uFF1B\uFF1A\uFF0C]+/g)
-    .map((item) => item.trim())
-    .filter(Boolean);
-
-  const leadingNoise =
-    /^(?:please|pls|can you|could you|help me|i(?:\s+want|\s+need|\s+would like|\s+hope)?\s+to|\u8BF7|\u9EBB\u70E6|\u5E2E\u6211|\u6211(?:\u60F3|\u8981|\u9700\u8981|\u5E0C\u671B|\u5148)?|\u53EF\u4EE5|\u80FD\u4E0D\u80FD|\u7EE7\u7EED)\s*/i;
-
-  const keywordPattern =
-    /(\u4fee\u590d|\u4f18\u5316|\u8c03\u6574|\u5b9e\u73b0|\u652f\u6301|\u767b\u5f55|\u7ebf\u7a0b|\u5de5\u4f5c\u533a|\u66f4\u65b0|\u591a\u8bed\u8a00|\u4ed3\u5e93|git|ui|theme|bug|fix|optimi[sz]e|login|thread|workspace|sidebar|diff|panel|performance)/ig;
-
-  const pickBestClause = () => {
-    if (clauses.length === 0) return normalized;
-    let best = clauses[0];
-    let bestScore = -1;
-    for (const clause of clauses) {
-      const hits = clause.match(keywordPattern)?.length ?? 0;
-      const score = hits * 10 + Math.min(clause.length, 40) / 10;
-      if (score > bestScore) {
-        best = clause;
-        bestScore = score;
-      }
-    }
-    return best;
-  };
-
-  let candidate = pickBestClause()
-    .replace(/^[\-\s:,.!?\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A]+/g, "")
-    .replace(/^[`"']+|[`"']+$/g, "")
-    .trim();
-
-  let previous = "";
-  while (candidate && candidate !== previous) {
-    previous = candidate;
-    candidate = candidate.replace(leadingNoise, "").trim();
-  }
-
-  if (!candidate) {
-    candidate = normalized;
-  }
-
-  const HARD_MAX_LENGTH = 14;
-  if (candidate.length <= HARD_MAX_LENGTH) {
-    return candidate;
-  }
-
-  const breakpoints = [
-    candidate.lastIndexOf(" ", HARD_MAX_LENGTH),
-    candidate.lastIndexOf("\uFF0C", HARD_MAX_LENGTH),
-    candidate.lastIndexOf(",", HARD_MAX_LENGTH),
-    candidate.lastIndexOf("\u3002", HARD_MAX_LENGTH),
-    candidate.lastIndexOf("\uFF1A", HARD_MAX_LENGTH),
-    candidate.lastIndexOf(":", HARD_MAX_LENGTH),
-  ].filter((index) => index >= 10);
-
-  const cut = breakpoints.length > 0 ? Math.max(...breakpoints) : HARD_MAX_LENGTH;
-  return `${candidate.slice(0, cut).trim()}...`;
-}
 function buildThreadRiskInvestigationPrompt(thread: ThreadMetadata): string {
+  const queue = thread.diagnostics?.queue;
+  const queuePressure = queue?.pressure ?? "idle";
+  const queueLimit = typeof queue?.queue_limit === "number" ? queue.queue_limit : 0;
+  const queueLatestDepth = typeof queue?.latest_depth === "number" ? queue.latest_depth : 0;
+  const queueMaxDepth = typeof queue?.max_depth === "number" ? queue.max_depth : queueLatestDepth;
+  const queueQueued = typeof queue?.queued_count === "number" ? queue.queued_count : 0;
+  const queueDequeued = typeof queue?.dequeued_count === "number" ? queue.dequeued_count : 0;
+  const queueRejected = typeof queue?.rejected_count === "number" ? queue.rejected_count : 0;
+  const queueDeduplicated = typeof queue?.deduplicated_count === "number" ? queue.deduplicated_count : 0;
+  const queueCapacityReason = typeof queue?.reason?.capacity === "number" ? queue.reason.capacity : 0;
+  const queueStaleReason = typeof queue?.reason?.stale === "number" ? queue.reason.stale : 0;
+  const queueManualReason = typeof queue?.reason?.manual === "number" ? queue.reason.manual : 0;
+  const queueDominantPriority = (() => {
+    const now = typeof queue?.queued_priority?.now === "number" ? queue.queued_priority.now : 0;
+    const next = typeof queue?.queued_priority?.next === "number" ? queue.queued_priority.next : 0;
+    const later = typeof queue?.queued_priority?.later === "number" ? queue.queued_priority.later : 0;
+    if (now === 0 && next === 0 && later === 0) {
+      return "none";
+    }
+    if (now >= next && now >= later) {
+      return "now";
+    }
+    if (next >= now && next >= later) {
+      return "next";
+    }
+    return "later";
+  })();
+
   const retry = thread.diagnostics?.retry;
   const suppressionRatioPct = typeof retry?.suppression_ratio_pct === "number" ? retry.suppression_ratio_pct : 0;
   const fallbackSuppressed = typeof retry?.fallback_suppressed === "number" ? retry.fallback_suppressed : 0;
@@ -795,6 +783,36 @@ function buildThreadRiskInvestigationPrompt(thread: ThreadMetadata): string {
   const retryEvents = typeof retry?.retry_event_count === "number" ? retry.retry_event_count : 0;
   const reason = (retry?.last_suppressed_reason ?? "unknown").replace(/\s+/g, "_");
   const strategy = (retry?.last_retry_strategy ?? "unknown").replace(/\s+/g, "_");
+  const hasFallbackSignal =
+    fallbackSuppressed > 0 ||
+    suppressionRatioPct >= 20 ||
+    retryEvents >= 2;
+  const hasQueueSignal =
+    queuePressure === "busy" ||
+    queuePressure === "congested" ||
+    queuePressure === "saturated" ||
+    queueRejected > 0 ||
+    queueDeduplicated >= 2;
+
+  if (hasQueueSignal && !hasFallbackSignal) {
+    return [
+      "/doctor queue investigate",
+      `thread=${thread.id}`,
+      `pressure=${queuePressure}`,
+      `queue_limit=${queueLimit}`,
+      `latest_depth=${queueLatestDepth}`,
+      `max_depth=${queueMaxDepth}`,
+      `queued_count=${queueQueued}`,
+      `dequeued_count=${queueDequeued}`,
+      `rejected_count=${queueRejected}`,
+      `deduplicated_count=${queueDeduplicated}`,
+      `capacity_rejections=${queueCapacityReason}`,
+      `stale_rejections=${queueStaleReason}`,
+      `manual_rejections=${queueManualReason}`,
+      `dominant_priority=${queueDominantPriority}`,
+      "analyze root cause and propose minimal safe queue relief plan",
+    ].join(" ");
+  }
 
   return [
     "/doctor fallback investigate",
@@ -1185,15 +1203,12 @@ type TraceFilter = "all" | "queue" | "tools" | "permission" | "query" | "prompt"
 type TraceCategory = Exclude<TraceFilter, "all">;
 type TraceHotspotWindow = "runs3" | "runs6" | "all";
 type TracePermissionRiskFilter = "all" | PermissionRiskClass;
-type PermissionReversibilityLevel = "reversible" | "mixed" | "hard_to_reverse";
-type PermissionBlastRadiusLevel = "local" | "workspace" | "shared";
 type TracePermissionReversibilityFilter = "all" | PermissionReversibilityLevel;
 type TracePermissionBlastRadiusFilter = "all" | PermissionBlastRadiusLevel;
 type TracePermissionRiskCounts = Record<PermissionRiskClass, number>;
 type TracePermissionReversibilityCounts = Record<PermissionReversibilityLevel, number>;
 type TracePermissionBlastRadiusCounts = Record<PermissionBlastRadiusLevel, number>;
 type TraceQueuePriority = NonNullable<Extract<QueryStreamEvent, { type: "queue_update" }>["priority"]>;
-type TraceQueuePressure = "idle" | "busy" | "congested" | "saturated";
 const TRACE_HOTSPOT_WINDOW_OPTIONS: Array<{ key: TraceHotspotWindow; runCount: number | null }> = [
   { key: "runs3", runCount: 3 },
   { key: "runs6", runCount: 6 },
@@ -1477,30 +1492,6 @@ interface TraceQueuePriorityStats {
   latestQueueDepth: number;
   maxQueueDepth: number;
   pressure: TraceQueuePressure;
-}
-
-function deriveQueuePressure(depth: number, queueLimit: number): TraceQueuePressure {
-  const normalizedDepth = Math.max(0, depth);
-  if (normalizedDepth <= 0) {
-    return "idle";
-  }
-  if (queueLimit > 0) {
-    const ratio = normalizedDepth / queueLimit;
-    if (ratio >= 1) {
-      return "saturated";
-    }
-    if (ratio >= 0.75) {
-      return "congested";
-    }
-    return "busy";
-  }
-  if (normalizedDepth >= 8) {
-    return "saturated";
-  }
-  if (normalizedDepth >= 4) {
-    return "congested";
-  }
-  return "busy";
 }
 
 function buildTraceQueuePriorityStats(
@@ -1804,30 +1795,6 @@ function getDominantTracePermissionBlastRadius(
   return top?.[0] ?? null;
 }
 
-function getReversibilityMatrixScore(value: PermissionReversibilityLevel): number {
-  switch (value) {
-    case "hard_to_reverse":
-      return 3;
-    case "mixed":
-      return 2;
-    case "reversible":
-    default:
-      return 1;
-  }
-}
-
-function getBlastRadiusMatrixScore(value: PermissionBlastRadiusLevel): number {
-  switch (value) {
-    case "shared":
-      return 3;
-    case "workspace":
-      return 2;
-    case "local":
-    default:
-      return 1;
-  }
-}
-
 function summarizePromptGovernance(sectionMetadata: PromptCompiledSectionMetadata[]) {
   const ownerCounts = {
     core: 0,
@@ -2073,6 +2040,9 @@ export default function AgentWorkstationView({
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>(FALLBACK_MODELS);
   const [currentModel, setCurrentModel] = useState<string>("deepseek-ai/DeepSeek-V3");
   const [permissionMode, setPermissionMode] = useState<ToolPermissionMode>("default");
+  const [toolCallBudgetPolicy, setToolCallBudgetPolicy] = useState<ToolCallBudgetPolicy>(
+    DEFAULT_TOOL_CALL_BUDGET_POLICY,
+  );
   const [permissionRules, setPermissionRules] = useState<PermissionRule[]>([]);
   const [showUserPopover, setShowUserPopover] = useState(false);
   const [permissionQueue, setPermissionQueue] = useState<PermissionPromptQueueItem[]>([]);
@@ -2107,6 +2077,8 @@ export default function AgentWorkstationView({
   const isUserAtBottomRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const lastPersistedStateRef = useRef<PersistedThreadState | null>(null);
+  const persistedMessageCacheRef = useRef<PersistedMessageCache>(new Map());
+  const messageRenderSnapshotCacheRef = useRef<Map<string, MessageRenderSnapshotCacheEntry>>(new Map());
   const messagesRef = useRef<AgentMessage[]>(messages);
   const panelRef = useRef<ImperativePanelHandle>(null);
   const diffPanelRef = useRef<ImperativePanelHandle>(null);
@@ -2115,7 +2087,7 @@ export default function AgentWorkstationView({
   const permissionResolversRef = useRef(new Map<string, (decision: PermissionPromptDecision) => void>());
   const hasHydratedAgentPreferencesRef = useRef(false);
   const activePermissionItem = permissionQueue[0] ?? null;
-  const [isDiffPanelOpen, setIsDiffPanelOpen] = useState(true);
+  const [isDiffPanelOpen, setIsDiffPanelOpen] = useState(false);
   const [isDiffPanelExpanded, setIsDiffPanelExpanded] = useState(false);
   const [diffPanelSizePct, setDiffPanelSizePct] = useState(30);
   const [diffSplitViewEnabled, setDiffSplitViewEnabled] = useState(false);
@@ -2174,7 +2146,23 @@ export default function AgentWorkstationView({
   const threadsRefreshTimerRef = useRef<number | null>(null);
   const terminalLogQueueRef = useRef<Map<string, string[]>>(new Map());
   const terminalLogFlushTimerRef = useRef<number | null>(null);
+  const autosaveInFlightRef = useRef<Promise<void> | null>(null);
+  const autosavePendingPayloadRef = useRef<ThreadAutosavePayload | null>(null);
+  const toolArgsHistorySnapshotRef = useRef<ToolArgsHistorySnapshot | null>(null);
+  const pendingEngineMessagesStateRef = useRef<AgentMessage[] | null>(null);
+  const pendingRuntimeSnapshotStateRef = useRef<QueryRuntimeSnapshot | null>(null);
+  const threadListInflightRef = useRef<Promise<ThreadMetadata[]> | null>(null);
+  const threadListInflightAutoSelectRef = useRef(false);
+  const gitSnapshotInflightRef = useRef<Promise<RuntimeGitSnapshotView> | null>(null);
+  const gitSnapshotInflightDirRef = useRef<string | null>(null);
+  const gitSnapshotCacheRef = useRef<Map<string, { snapshot: RuntimeGitSnapshotView; at: number }>>(new Map());
+  const engineMessageRafRef = useRef<number | null>(null);
+  const runtimeSnapshotRafRef = useRef<number | null>(null);
   const handleLoadThreadRef = useRef<(id: string) => Promise<void>>(async () => undefined);
+  const pendingAutoRecoverThreadRef = useRef<{
+    threadId: string;
+    signature: string;
+  } | null>(null);
   const effectiveWorkingDir = currentThreadWorkingDir ?? activeWorkspacePath;
   const currentThreadMeta = useMemo(
     () => (currentThreadId ? threads.find((thread) => thread.id === currentThreadId) ?? null : null),
@@ -2218,6 +2206,84 @@ export default function AgentWorkstationView({
     });
     setPermissionDelayReady(false);
   }, []);
+
+  const flushPendingEngineMessages = useCallback(() => {
+    engineMessageRafRef.current = null;
+    const nextMessages = pendingEngineMessagesStateRef.current;
+    pendingEngineMessagesStateRef.current = null;
+    if (!nextMessages) {
+      return;
+    }
+    startTransition(() => {
+      setMessages(nextMessages);
+    });
+  }, []);
+
+  const scheduleEngineMessagesStateUpdate = useCallback(
+    (nextMessages: AgentMessage[]) => {
+      pendingEngineMessagesStateRef.current = nextMessages;
+      messagesRef.current = nextMessages;
+      lastUiActivityAtRef.current = Date.now();
+      if (engineMessageRafRef.current !== null) {
+        return;
+      }
+      engineMessageRafRef.current = window.requestAnimationFrame(() => {
+        flushPendingEngineMessages();
+      });
+    },
+    [flushPendingEngineMessages],
+  );
+
+  const flushPendingRuntimeSnapshot = useCallback(() => {
+    runtimeSnapshotRafRef.current = null;
+    const nextSnapshot = pendingRuntimeSnapshotStateRef.current;
+    pendingRuntimeSnapshotStateRef.current = null;
+    if (!nextSnapshot) {
+      return;
+    }
+    startTransition(() => {
+      setEngineRuntimeSnapshot((previous) =>
+        areRuntimeSnapshotsEqual(previous, nextSnapshot) ? previous : nextSnapshot,
+      );
+    });
+  }, []);
+
+  const normalizeRuntimeSnapshotForUi = useCallback((snapshot: QueryRuntimeSnapshot): QueryRuntimeSnapshot => {
+    if (SHOW_TRACE_PANEL || SHOW_DIAGNOSIS_COCKPIT) {
+      return snapshot;
+    }
+    if (
+      snapshot.recentEvents.length === 0 &&
+      snapshot.latestEvent === null &&
+      snapshot.lastEventAt === null
+    ) {
+      return snapshot;
+    }
+    return {
+      ...snapshot,
+      recentEvents: EMPTY_QUERY_RUNTIME_SNAPSHOT.recentEvents,
+      latestEvent: null,
+      lastEventAt: null,
+    };
+  }, []);
+
+  const scheduleRuntimeSnapshotStateUpdate = useCallback(
+    (snapshot: QueryRuntimeSnapshot) => {
+      const normalizedSnapshot = normalizeRuntimeSnapshotForUi(snapshot);
+      const queuedSnapshot = pendingRuntimeSnapshotStateRef.current;
+      if (queuedSnapshot && areRuntimeSnapshotsEqual(queuedSnapshot, normalizedSnapshot)) {
+        return;
+      }
+      pendingRuntimeSnapshotStateRef.current = normalizedSnapshot;
+      if (runtimeSnapshotRafRef.current !== null) {
+        return;
+      }
+      runtimeSnapshotRafRef.current = window.requestAnimationFrame(() => {
+        flushPendingRuntimeSnapshot();
+      });
+    },
+    [flushPendingRuntimeSnapshot, normalizeRuntimeSnapshotForUi],
+  );
 
   const flushQueuedTerminalLogs = useCallback(() => {
     terminalLogFlushTimerRef.current = null;
@@ -2266,6 +2332,42 @@ export default function AgentWorkstationView({
     [flushQueuedTerminalLogs],
   );
 
+  const runThreadListRefresh = useCallback(async (autoSelect = false) => {
+    if (autoSelect) {
+      threadListInflightAutoSelectRef.current = true;
+    }
+
+    const inflight = threadListInflightRef.current;
+    if (inflight) {
+      try {
+        await inflight;
+      } catch {
+        // no-op: handled by request owner
+      }
+      return;
+    }
+
+    const request = threadService.listThreads();
+    threadListInflightRef.current = request;
+
+    try {
+      const list = await request;
+      setThreads(list);
+      const shouldAutoSelect = threadListInflightAutoSelectRef.current;
+      threadListInflightAutoSelectRef.current = false;
+      if (shouldAutoSelect && !currentThreadIdRef.current && !isDraftThreadRef.current && list.length > 0) {
+        void handleLoadThreadRef.current(list[0].id);
+      }
+    } catch (e) {
+      threadListInflightAutoSelectRef.current = false;
+      console.warn("Failed to list threads:", e);
+    } finally {
+      if (threadListInflightRef.current === request) {
+        threadListInflightRef.current = null;
+      }
+    }
+  }, []);
+
   const scheduleThreadsRefresh = useCallback(
     (delayMs = THREADS_REFRESH_DEBOUNCE_MS) => {
       if (threadsRefreshTimerRef.current !== null) {
@@ -2273,20 +2375,35 @@ export default function AgentWorkstationView({
       }
       threadsRefreshTimerRef.current = window.setTimeout(() => {
         threadsRefreshTimerRef.current = null;
-        void threadService.listThreads()
-          .then((list) => {
-            setThreads(list);
-          })
-          .catch((error) => {
-            console.warn("Failed to list threads:", error);
-          });
+        void runThreadListRefresh(false);
       }, delayMs);
     },
-    [],
+    [runThreadListRefresh],
   );
 
   useEffect(() => {
+    return () => {
+      if (engineMessageRafRef.current !== null) {
+        window.cancelAnimationFrame(engineMessageRafRef.current);
+        engineMessageRafRef.current = null;
+      }
+      if (runtimeSnapshotRafRef.current !== null) {
+        window.cancelAnimationFrame(runtimeSnapshotRafRef.current);
+        runtimeSnapshotRafRef.current = null;
+      }
+      pendingEngineMessagesStateRef.current = null;
+      pendingRuntimeSnapshotStateRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     currentThreadIdRef.current = currentThreadId;
+  }, [currentThreadId]);
+
+  useEffect(() => {
+    persistedMessageCacheRef.current.clear();
+    messageRenderSnapshotCacheRef.current.clear();
+    toolArgsHistorySnapshotRef.current = null;
   }, [currentThreadId]);
 
   useEffect(() => {
@@ -2330,6 +2447,13 @@ export default function AgentWorkstationView({
         logTimerRef.current = null;
       }
       logQueueRef.current.clear();
+      autosavePendingPayloadRef.current = null;
+      autosaveInFlightRef.current = null;
+      threadListInflightRef.current = null;
+      threadListInflightAutoSelectRef.current = false;
+      gitSnapshotInflightRef.current = null;
+      gitSnapshotInflightDirRef.current = null;
+      gitSnapshotCacheRef.current.clear();
     };
   }, []);
 
@@ -2343,23 +2467,60 @@ export default function AgentWorkstationView({
       setGitSnapshot(null);
       setGitSnapshotError(null);
       setGitSnapshotUpdatedAt(null);
+      gitSnapshotInflightRef.current = null;
+      gitSnapshotInflightDirRef.current = null;
+      return;
+    }
+
+    const requestDir = effectiveWorkingDir;
+    const now = Date.now();
+    const cached = gitSnapshotCacheRef.current.get(requestDir);
+    if (cached && now - cached.at <= GIT_SNAPSHOT_CACHE_TTL_MS) {
+      setGitSnapshot(cached.snapshot);
+      setGitSnapshotError(null);
+      setGitSnapshotUpdatedAt(cached.at);
+      return;
+    }
+
+    const inflight = gitSnapshotInflightRef.current;
+    if (inflight && gitSnapshotInflightDirRef.current === requestDir) {
+      setGitSnapshotLoading(true);
+      try {
+        const snapshot = await inflight;
+        setGitSnapshot(snapshot);
+        setGitSnapshotError(null);
+        setGitSnapshotUpdatedAt(Date.now());
+      } catch (error) {
+        setGitSnapshotError(String(error));
+      } finally {
+        setGitSnapshotLoading(false);
+      }
       return;
     }
 
     setGitSnapshotLoading(true);
     setGitSnapshotError(null);
+    const request = invoke<RuntimeGitSnapshotView>("invoke_agent_git_snapshot", {
+      request: {
+        working_dir: requestDir,
+        max_commits: 10,
+      },
+    });
+    gitSnapshotInflightRef.current = request;
+    gitSnapshotInflightDirRef.current = requestDir;
     try {
-      const snapshot = await invoke<RuntimeGitSnapshotView>("invoke_agent_git_snapshot", {
-        request: {
-          working_dir: effectiveWorkingDir,
-          max_commits: 10,
-        },
-      });
+      const snapshot = await request;
       setGitSnapshot(snapshot);
-      setGitSnapshotUpdatedAt(Date.now());
+      const updatedAt = Date.now();
+      gitSnapshotCacheRef.current.set(requestDir, { snapshot, at: updatedAt });
+      setGitSnapshotUpdatedAt(updatedAt);
     } catch (error) {
       setGitSnapshotError(String(error));
     } finally {
+      if (gitSnapshotInflightRef.current === request) {
+        gitSnapshotInflightRef.current = null;
+        gitSnapshotInflightDirRef.current = null;
+      }
       setGitSnapshotLoading(false);
     }
   }, [effectiveWorkingDir]);
@@ -2492,16 +2653,17 @@ export default function AgentWorkstationView({
   }, [isDiffPanelExpanded, isDiffPanelOpen, isSidebarPanelOpen]);
 
   const toggleSidebarPanel = useCallback(() => {
-    const nextOpen = !isSidebarPanelOpen;
-    setIsSidebarPanelOpen(nextOpen);
-    if (!nextOpen) {
-      panelRef.current?.resize("0%");
+    if (isDiffPanelExpanded) {
       return;
     }
-    requestAnimationFrame(() => {
-      panelRef.current?.resize("18%");
+    setIsSidebarPanelOpen((prev) => {
+      const next = !prev;
+      requestAnimationFrame(() => {
+        panelRef.current?.resize(next ? "26%" : "0%");
+      });
+      return next;
     });
-  }, [isSidebarPanelOpen]);
+  }, [isDiffPanelExpanded]);
 
   const handleSidebarResize = useCallback(() => { }, []);
 
@@ -2578,18 +2740,8 @@ export default function AgentWorkstationView({
 
   // Load threads on mount
   const refreshThreads = useCallback(async (autoSelect = false) => {
-    try {
-      const list = await threadService.listThreads();
-      setThreads(list);
-
-      // If no thread is selected, select the most recent one.
-      if (autoSelect && !currentThreadIdRef.current && !isDraftThreadRef.current && list.length > 0) {
-        void handleLoadThreadRef.current(list[0].id);
-      }
-    } catch (e) {
-      console.warn("Failed to list threads:", e);
-    }
-  }, []);
+    await runThreadListRefresh(autoSelect);
+  }, [runThreadListRefresh]);
 
   useEffect(() => {
     void refreshThreads(true);
@@ -2605,6 +2757,7 @@ export default function AgentWorkstationView({
         if (cancelled) return;
         setCurrentModel(snapshot.currentModel);
         setPermissionMode(snapshot.permissionMode);
+        setToolCallBudgetPolicy(snapshot.toolCallBudgetPolicy);
       } catch (error) {
         console.warn("Failed to load agent preferences:", error);
       }
@@ -2625,10 +2778,11 @@ export default function AgentWorkstationView({
     void saveAgentPreferences(apiBaseUrl || undefined, {
       currentModel,
       permissionMode,
+      toolCallBudgetPolicy,
     }).catch((error) => {
       console.warn("Failed to save agent preferences:", error);
     });
-  }, [apiBaseUrl, currentModel, permissionMode]);
+  }, [apiBaseUrl, currentModel, permissionMode, toolCallBudgetPolicy]);
 
   // Initialize engine
   useEffect(() => {
@@ -2637,19 +2791,23 @@ export default function AgentWorkstationView({
     const engine = new QueryEngine(
       (updatedMessages) => {
         const nextMessages = [...updatedMessages];
-        setMessages(nextMessages);
-        messagesRef.current = nextMessages;
-        lastUiActivityAtRef.current = Date.now();
+        scheduleEngineMessagesStateUpdate(nextMessages);
       },
       apiBaseUrl,
       apiKey,
       {
         onPermissionRequest: enqueuePermissionRequest,
+        toolCallBudgetPolicy,
+        onToolCallBudgetPolicyChange: (nextPolicy) => {
+          setToolCallBudgetPolicy((previous) =>
+            areToolCallBudgetPoliciesEqual(previous, nextPolicy) ? previous : nextPolicy,
+          );
+        },
       }
     );
     engineRef.current = engine;
     const unsubscribeRuntimeSnapshot = engine.subscribeRuntimeSnapshot((snapshot) => {
-      setEngineRuntimeSnapshot(snapshot);
+      scheduleRuntimeSnapshotStateUpdate(snapshot);
     });
 
     // Replay any messages loaded before engine was ready.
@@ -2692,7 +2850,11 @@ export default function AgentWorkstationView({
       }
       setEngineRuntimeSnapshot(EMPTY_QUERY_RUNTIME_SNAPSHOT);
     };
-  }, [apiBaseUrl, apiKey, enqueuePermissionRequest]);
+  }, [
+    apiBaseUrl,
+    apiKey,
+    enqueuePermissionRequest,
+  ]);
 
   useEffect(() => {
     if (apiBaseUrl && apiKey) {
@@ -2709,6 +2871,10 @@ export default function AgentWorkstationView({
   useEffect(() => {
     engineRef.current?.setPermissionMode(permissionMode);
   }, [permissionMode]);
+
+  useEffect(() => {
+    engineRef.current?.setToolCallBudgetPolicy(toolCallBudgetPolicy, { notify: false });
+  }, [toolCallBudgetPolicy]);
 
   useEffect(() => {
     engineRef.current?.setPermissionRules(permissionRules);
@@ -2790,6 +2956,7 @@ export default function AgentWorkstationView({
     const nextMessages = cloneMessages(initMsg);
     setMessages(nextMessages);
     messagesRef.current = nextMessages;
+    pendingAutoRecoverThreadRef.current = null;
     // Keep null so autosave performs an initial full snapshot for brand-new threads.
     lastPersistedStateRef.current = null;
     if (engineRef.current) {
@@ -2820,7 +2987,12 @@ export default function AgentWorkstationView({
       const nextMessages = cloneMessages(data.messages);
       setMessages(nextMessages);
       messagesRef.current = nextMessages;
-      lastPersistedStateRef.current = buildPersistedThreadState(nextMessages);
+      seedPersistedMessageCacheFromPersisted(nextMessages, persistedMessageCacheRef.current);
+      pendingAutoRecoverThreadRef.current = {
+        threadId: data.metadata.id,
+        signature: buildRecoverStateSignature(detectRecoverStateFromMessages(nextMessages)),
+      };
+      lastPersistedStateRef.current = buildPersistedThreadStateFromPersisted(nextMessages);
 
       if (engineRef.current) {
         engineRef.current.setMessages(nextMessages);
@@ -2845,6 +3017,7 @@ export default function AgentWorkstationView({
       await threadService.deleteThread(id);
       if (currentThreadId === id) {
         setCurrentThreadId(null);
+        pendingAutoRecoverThreadRef.current = null;
         setTraceQuickCommandState(null);
         setLastDiagnosisActivity(null);
         setDiagnosisHistory([]);
@@ -2930,67 +3103,83 @@ export default function AgentWorkstationView({
       }
     })();
   }, [currentThreadId, focusComposerToEnd, handleLoadThread, locale]);
-  // Auto-save thread on message updates
-  useEffect(() => {
-    if (!currentThreadId) return;
-    if (isThinking) return;
+  const buildThreadEvents = useCallback((
+    prevState: PersistedThreadState,
+    nextPersistedMessages: AgentMessage[],
+  ): ThreadEvent[] => {
+    const events: ThreadEvent[] = [];
+    const prevSignatures = prevState.signatures;
+    const nextIds = new Set<string>();
+    const now = Date.now();
 
-    const buildThreadEvents = (
-      prevState: PersistedThreadState,
-      nextPersistedMessages: AgentMessage[],
-    ): ThreadEvent[] => {
-      const events: ThreadEvent[] = [];
-      const prevSignatures = prevState.signatures;
-      const nextIds = new Set<string>();
-      const now = Date.now();
+    for (const persisted of nextPersistedMessages) {
+      nextIds.add(persisted.id);
+      const prevSignature = prevSignatures[persisted.id];
+      const nextSignature = getMessagePersistenceSignature(persisted);
+      if (!prevSignature) {
+        events.push({
+          event_type: "append_message",
+          message_id: persisted.id,
+          payload: persisted,
+          at: now,
+        });
+        continue;
+      }
+      if (prevSignature !== nextSignature) {
+        events.push({
+          event_type: "upsert_message",
+          message_id: persisted.id,
+          payload: persisted,
+          at: now,
+        });
+      }
+    }
 
-      for (const persisted of nextPersistedMessages) {
-        nextIds.add(persisted.id);
-        const prevSignature = prevSignatures[persisted.id];
-        const nextSignature = getMessagePersistenceSignature(persisted);
-        if (!prevSignature) {
-          events.push({
-            event_type: "append_message",
-            message_id: persisted.id,
-            payload: persisted,
-            at: now,
-          });
-          continue;
-        }
-        if (prevSignature !== nextSignature) {
-          events.push({
-            event_type: "upsert_message",
-            message_id: persisted.id,
-            payload: persisted,
-            at: now,
-          });
-        }
+    for (const messageId of prevState.order) {
+      if (!nextIds.has(messageId)) {
+        events.push({
+          event_type: "delete_message",
+          message_id: messageId,
+          payload: {},
+          at: now,
+        });
+      }
+    }
+
+    return events;
+  }, []);
+
+  const runThreadAutosavePayload = useCallback(async (payload: ThreadAutosavePayload) => {
+    const prevState = lastPersistedStateRef.current;
+    const persistedMessages = compactMessagesForPersistence(
+      payload.messages,
+      persistedMessageCacheRef.current,
+    );
+    const nextState = buildPersistedThreadStateFromPersisted(persistedMessages);
+    const diagnostics: ThreadDiagnostics | undefined = (() => {
+      if (!PERSIST_THREAD_DIAGNOSTICS) {
+        return payload.existingDiagnostics;
       }
 
-      for (const messageId of prevState.order) {
-        if (!nextIds.has(messageId)) {
-          events.push({
-            event_type: "delete_message",
-            message_id: messageId,
-            payload: {},
-            at: now,
-          });
-        }
-      }
-      return events;
-    };
-
-    const name = currentThreadName;
-
-    const saveTimer = setTimeout(() => {
-      const prevState = lastPersistedStateRef.current;
-      const currentMessages = messages;
-      const persistedMessages = compactMessagesForPersistence(currentMessages);
-      const nextState = buildPersistedThreadStateFromPersisted(persistedMessages);
-      const wd = currentThreadWorkingDir;
-      const computedDiagnostics = buildThreadDiagnosticsFromEvents(engineRef.current?.getRecentQueryEvents(80) ?? []);
-      const persistedDiagnosisActivity = toThreadDiagnosisActivity(lastDiagnosisActivity);
-      const persistedDiagnosisHistory: ThreadDiagnosisActivity[] = diagnosisHistory
+      const runtimeSnapshot = engineRef.current?.getRuntimeSnapshot();
+      const snapshotEvents = runtimeSnapshot?.recentEvents ?? EMPTY_QUERY_RUNTIME_SNAPSHOT.recentEvents;
+      const recentEvents =
+        snapshotEvents.length > THREAD_DIAGNOSTIC_EVENT_SCAN_LIMIT
+          ? snapshotEvents.slice(snapshotEvents.length - THREAD_DIAGNOSTIC_EVENT_SCAN_LIMIT)
+          : snapshotEvents;
+      const computedDiagnostics = buildThreadDiagnosticsFromEvents(recentEvents);
+      const runtimeQueuedQueries = runtimeSnapshot?.queuedQueries ?? EMPTY_QUEUED_QUERY_LIST;
+      const runtimeQueueCount = Math.max(0, runtimeSnapshot?.queueCount ?? runtimeQueuedQueries.length);
+      const runtimeQueueLimit = Math.max(0, runtimeSnapshot?.queueLimit ?? computedDiagnostics?.queue?.queue_limit ?? 0);
+      const computedRecoveryDiagnostics = buildThreadRecoveryDiagnosticsSnapshot(
+        payload.messages,
+        runtimeQueuedQueries,
+        runtimeQueueCount,
+        runtimeQueueLimit,
+        recentEvents,
+      );
+      const persistedDiagnosisActivity = toThreadDiagnosisActivity(payload.diagnosisActivity);
+      const persistedDiagnosisHistory: ThreadDiagnosisActivity[] = payload.diagnosisHistory
         .slice(0, MAX_DIAGNOSIS_HISTORY_ITEMS)
         .map((item) => ({
           kind: item.kind,
@@ -2999,75 +3188,144 @@ export default function AgentWorkstationView({
           at: item.at,
           command_id: item.commandId ?? null,
         }));
-      const existingDiagnostics = currentThreadMeta?.diagnostics;
-      const diagnostics: ThreadDiagnostics | undefined = (() => {
-        if (!computedDiagnostics && !existingDiagnostics && !persistedDiagnosisActivity && persistedDiagnosisHistory.length === 0) {
-          return undefined;
-        }
-        return {
-          retry: computedDiagnostics?.retry ??
-            existingDiagnostics?.retry ?? {
-              fallback_used: 0,
-              fallback_suppressed: 0,
-              retry_event_count: 0,
-              suppression_ratio_pct: 0,
-              last_suppressed_reason: null,
-              last_retry_strategy: null,
-            },
-          permission: computedDiagnostics?.permission ?? existingDiagnostics?.permission,
-          diagnosis_activity: persistedDiagnosisActivity ?? existingDiagnostics?.diagnosis_activity,
-          diagnosis_history:
-            persistedDiagnosisHistory.length > 0
-              ? persistedDiagnosisHistory
-              : existingDiagnostics?.diagnosis_history ?? [],
-          updated_at: computedDiagnostics?.updated_at ?? Date.now(),
-        };
-      })();
-
-      if (!prevState) {
-        void threadService.saveThread(currentThreadId, name, persistedMessages, wd, diagnostics)
-          .then(() => {
-            lastPersistedStateRef.current = nextState;
-            scheduleThreadsRefresh();
-          })
-          .catch((error) => {
-            console.warn("Failed to save thread:", error);
-          });
-        return;
+      const recoveryFailureTotal =
+        typeof computedRecoveryDiagnostics.failure_total === "number"
+          ? Math.max(0, computedRecoveryDiagnostics.failure_total)
+          : sumRecoverFailureCounters(computedRecoveryDiagnostics.failure);
+      const hasRecoverySignals =
+        computedRecoveryDiagnostics.state !== "none" ||
+        Boolean(computedRecoveryDiagnostics.queued_recovery_id) ||
+        computedRecoveryDiagnostics.queue_count > 0 ||
+        recoveryFailureTotal > 0;
+      const recovery = hasRecoverySignals
+        ? computedRecoveryDiagnostics
+        : payload.existingDiagnostics?.recovery;
+      if (
+        !computedDiagnostics &&
+        !payload.existingDiagnostics &&
+        !persistedDiagnosisActivity &&
+        persistedDiagnosisHistory.length === 0 &&
+        !recovery
+      ) {
+        return undefined;
       }
+      return {
+        retry: computedDiagnostics?.retry ??
+          payload.existingDiagnostics?.retry ?? {
+            fallback_used: 0,
+            fallback_suppressed: 0,
+            retry_event_count: 0,
+            suppression_ratio_pct: 0,
+            last_suppressed_reason: null,
+            last_retry_strategy: null,
+          },
+        permission: computedDiagnostics?.permission ?? payload.existingDiagnostics?.permission,
+        queue: computedDiagnostics?.queue ?? payload.existingDiagnostics?.queue,
+        recovery,
+        diagnosis_activity: persistedDiagnosisActivity ?? payload.existingDiagnostics?.diagnosis_activity,
+        diagnosis_history:
+          persistedDiagnosisHistory.length > 0
+            ? persistedDiagnosisHistory
+            : payload.existingDiagnostics?.diagnosis_history ?? [],
+        updated_at: computedDiagnostics?.updated_at ?? Date.now(),
+      };
+    })();
 
-      const events = buildThreadEvents(prevState, persistedMessages);
-      if (events.length === 0) return;
+    const saveFullSnapshot = async () => {
+      await threadService.saveThread(
+        payload.threadId,
+        payload.name,
+        persistedMessages,
+        payload.workingDir,
+        diagnostics,
+      );
+      lastPersistedStateRef.current = nextState;
+      scheduleThreadsRefresh();
+    };
 
-      void threadService.appendThreadEvents(currentThreadId, name, events, wd, diagnostics)
-        .then(() => {
-          lastPersistedStateRef.current = nextState;
-          scheduleThreadsRefresh();
-        })
-        .catch((error) => {
-          console.warn("Failed to append thread events, fallback to full snapshot:", error);
-          void threadService.saveThread(currentThreadId, name, persistedMessages, wd, diagnostics)
-            .then(() => {
-              lastPersistedStateRef.current = nextState;
-              scheduleThreadsRefresh();
-            })
-            .catch((saveErr) => {
-              console.warn("Failed to save thread snapshot:", saveErr);
-            });
-        });
+    if (!prevState) {
+      await saveFullSnapshot();
+      return;
+    }
+
+    const events = buildThreadEvents(prevState, persistedMessages);
+    if (events.length === 0) {
+      return;
+    }
+
+    try {
+      await threadService.appendThreadEvents(
+        payload.threadId,
+        payload.name,
+        events,
+        payload.workingDir,
+        diagnostics,
+      );
+      lastPersistedStateRef.current = nextState;
+      scheduleThreadsRefresh();
+    } catch (error) {
+      console.warn("Failed to append thread events, fallback to full snapshot:", error);
+      await saveFullSnapshot();
+    }
+  }, [buildThreadEvents, scheduleThreadsRefresh]);
+
+  const queueThreadAutosave = useCallback((payload: ThreadAutosavePayload) => {
+    autosavePendingPayloadRef.current = payload;
+    if (autosaveInFlightRef.current) {
+      return;
+    }
+
+    const drain = async () => {
+      while (autosavePendingPayloadRef.current) {
+        const nextPayload = autosavePendingPayloadRef.current;
+        autosavePendingPayloadRef.current = null;
+        await runThreadAutosavePayload(nextPayload);
+      }
+    };
+
+    const task = drain()
+      .catch((error) => {
+        console.warn("Failed to drain autosave queue:", error);
+      })
+      .finally(() => {
+        if (autosaveInFlightRef.current === task) {
+          autosaveInFlightRef.current = null;
+        }
+      });
+
+    autosaveInFlightRef.current = task;
+  }, [runThreadAutosavePayload]);
+
+  // Auto-save thread on message updates
+  useEffect(() => {
+    if (!currentThreadId) return;
+    if (isThinking) return;
+
+    const payload: ThreadAutosavePayload = {
+      threadId: currentThreadId,
+      name: currentThreadName,
+      workingDir: currentThreadWorkingDir,
+      messages,
+      existingDiagnostics: currentThreadMeta?.diagnostics,
+      diagnosisActivity: lastDiagnosisActivity,
+      diagnosisHistory,
+    };
+
+    const saveTimer = window.setTimeout(() => {
+      queueThreadAutosave(payload);
     }, THREAD_AUTOSAVE_IDLE_MS);
 
-    return () => clearTimeout(saveTimer);
+    return () => window.clearTimeout(saveTimer);
   }, [
     messages,
     currentThreadId,
     currentThreadName,
     currentThreadWorkingDir,
-    scheduleThreadsRefresh,
     isThinking,
-    lastDiagnosisActivity,
-    diagnosisHistory,
-    currentThreadMeta?.diagnostics,
+    queueThreadAutosave,
+    PERSIST_THREAD_DIAGNOSTICS ? lastDiagnosisActivity : null,
+    PERSIST_THREAD_DIAGNOSTICS ? diagnosisHistory : null,
+    PERSIST_THREAD_DIAGNOSTICS ? currentThreadMeta?.diagnostics : undefined,
   ]);
 
   useEffect(() => {
@@ -3092,9 +3350,9 @@ export default function AgentWorkstationView({
   const queuedCount = engineRuntimeSnapshot.queueCount;
   const queueLimit = engineRuntimeSnapshot.queueLimit;
   const queueByPriority = engineRuntimeSnapshot.queueByPriority ?? EMPTY_QUEUE_BY_PRIORITY;
-  const queuedQueries: QueuedQueryItem[] =
+  const queuedQueries: readonly QueuedQueryItem[] =
     engineRuntimeSnapshot.queuedQueries.length > 0
-      ? engineRuntimeSnapshot.queuedQueries.map((item) => ({ ...item }))
+      ? engineRuntimeSnapshot.queuedQueries
       : EMPTY_QUEUED_QUERY_LIST;
   const toolNames = engineRef.current?.getToolNames() ?? DEFAULT_TOOL_NAMES;
   const slashCommands = engineRef.current?.getSlashCommands() ?? [];
@@ -3108,6 +3366,9 @@ export default function AgentWorkstationView({
   const isEngineReady = Boolean(engineRef.current);
   const hasConnection = Boolean(apiConfig);
   const hasActiveWork = isThinking || runningTaskCount > 0;
+  const diagnosisRuntimeEnabled = SHOW_DIAGNOSIS_COCKPIT && isDiffPanelOpen;
+  const traceDiagnosticsEnabled = SHOW_TRACE_PANEL && isTracePanelOpen;
+  const traceAnalyticsEnabled = traceDiagnosticsEnabled || diagnosisRuntimeEnabled;
   const statusLabel = !hasConnection
     ? translate(locale, "agent.statusDisconnected")
     : hasActiveWork
@@ -3118,12 +3379,15 @@ export default function AgentWorkstationView({
   const latestStreamEvent = engineRuntimeSnapshot.latestEvent ?? null;
   const lastStreamEventAt = engineRuntimeSnapshot.lastEventAt;
   const latestStreamEventLabel = useMemo(
-    () => formatLatestTraceEventLabel(locale, latestStreamEvent),
-    [locale, latestStreamEvent],
+    () => (traceDiagnosticsEnabled ? formatLatestTraceEventLabel(locale, latestStreamEvent) : null),
+    [locale, latestStreamEvent, traceDiagnosticsEnabled],
   );
   const latestRetryDiagnosticEvent = useMemo<
     Extract<QueryStreamEvent, { type: "retry_profile_update" | "fallback_suppressed" }> | null
   >(() => {
+    if (!traceDiagnosticsEnabled) {
+      return null;
+    }
     const events = engineRuntimeSnapshot.recentEvents;
     for (let index = events.length - 1; index >= 0; index -= 1) {
       const event = events[index];
@@ -3132,7 +3396,7 @@ export default function AgentWorkstationView({
       }
     }
     return null;
-  }, [engineRuntimeSnapshot.recentEvents]);
+  }, [engineRuntimeSnapshot.recentEvents, traceDiagnosticsEnabled]);
   const latestRetryDiagnosticLabel = useMemo(
     () =>
       latestRetryDiagnosticEvent
@@ -3265,6 +3529,7 @@ export default function AgentWorkstationView({
         const nextMessages: AgentMessage[] = [];
         setMessages(nextMessages);
         messagesRef.current = nextMessages;
+        pendingAutoRecoverThreadRef.current = null;
         lastPersistedStateRef.current = null;
 
         engineRef.current.setMessages(nextMessages);
@@ -3321,6 +3586,65 @@ export default function AgentWorkstationView({
       engineRuntimeSnapshot.queueLimit,
     ],
   );
+
+  useEffect(() => {
+    const pending = pendingAutoRecoverThreadRef.current;
+    if (!pending || !currentThreadId || pending.threadId !== currentThreadId) {
+      return;
+    }
+    if (isDraftThread || isThinking) {
+      return;
+    }
+
+    const recoverState = detectRecoverStateFromMessages(messages);
+    const signature = buildRecoverStateSignature(recoverState);
+    if (recoverState.kind === "none") {
+      pendingAutoRecoverThreadRef.current = null;
+      return;
+    }
+    if (pending.signature !== signature) {
+      pendingAutoRecoverThreadRef.current = {
+        threadId: currentThreadId,
+        signature,
+      };
+      return;
+    }
+
+    const submitResult = submitAgentQuery("/recover resume", {
+      clearComposer: false,
+      restoreComposerOnQueueReject: false,
+      focusComposerOnQueueReject: false,
+    });
+    if (!submitResult.accepted && submitResult.reason === "engine_not_ready") {
+      return;
+    }
+
+    pendingAutoRecoverThreadRef.current = null;
+    if (submitResult.accepted) {
+      toast.info(translate(locale, "agent.recover.autoResumeDetected"));
+      return;
+    }
+    if (submitResult.reason === "queue_full") {
+      toast.warning(
+        translate(locale, "agent.queue.full", {
+          count: engineRuntimeSnapshot.queueCount,
+          limit: engineRuntimeSnapshot.queueLimit,
+        }),
+      );
+      return;
+    }
+    toast.warning(translate(locale, "agent.recover.autoResumeUnavailable"));
+  }, [
+    currentThreadId,
+    isDraftThread,
+    isThinking,
+    messages,
+    submitAgentQuery,
+    locale,
+    engineRuntimeSnapshot.queueCount,
+    engineRuntimeSnapshot.queueLimit,
+  ]);
+
   const handleRunThreadDiagnosisFromSidebar = useCallback((thread: ThreadMetadata) => {
     void (async () => {
       try {
@@ -3621,16 +3945,48 @@ export default function AgentWorkstationView({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!isThinking) return;
-      if (!(event.ctrlKey || event.metaKey)) return;
-      if (event.shiftKey) return;
-      if (event.key.toLowerCase() !== "c") return;
-      event.preventDefault();
-      handleStop();
+      const key = event.key.toLowerCase();
+      const metaOrCtrl = event.metaKey || event.ctrlKey;
+      const editingTarget = isEditableKeyboardTarget(event.target);
+      const composerFocused = event.target === inputRef.current;
+
+      if (key === "escape" && isThinking) {
+        event.preventDefault();
+        handleStop();
+        return;
+      }
+
+      if (!metaOrCtrl) return;
+
+      if (!event.shiftKey && key === "c" && isThinking) {
+        event.preventDefault();
+        handleStop();
+        return;
+      }
+
+      if (!event.shiftKey && !event.altKey && (key === "k" || key === "l")) {
+        if (editingTarget && composerFocused) {
+          return;
+        }
+        event.preventDefault();
+        focusComposerToEnd();
+        return;
+      }
+
+      if (!event.shiftKey && !event.altKey && key === "b" && !editingTarget) {
+        event.preventDefault();
+        toggleSidebarPanel();
+        return;
+      }
+
+      if (event.shiftKey && !event.altKey && key === "d" && !editingTarget) {
+        event.preventDefault();
+        toggleDiffPanel();
+      }
     };
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [handleStop, isThinking]);
+  }, [focusComposerToEnd, handleStop, isThinking, toggleDiffPanel, toggleSidebarPanel]);
 
   const handleClear = () => {
     denyAllPermissionPrompts();
@@ -3663,39 +4019,100 @@ export default function AgentWorkstationView({
     return 260;
   }, [messages.length]);
   const previousToolArgsByMessageId = useMemo(() => {
-    const lookup = new Map<string, Record<string, string>>();
-    const rolling = new Map<string, string>();
-    const startIndex = Math.max(0, messages.length - TOOL_ARGS_HISTORY_SCAN_LIMIT);
-
-    for (let index = startIndex; index < messages.length; index += 1) {
-      const message = messages[index];
-      lookup.set(message.id, Object.fromEntries(rolling.entries()));
-      if (!message.steps || message.steps.length === 0) continue;
-      for (const step of message.steps) {
-        const toolName = step.toolRender?.toolName;
-        const callArgs = step.toolRender?.callArguments;
-        if (toolName && callArgs) {
-          rolling.set(toolName, callArgs);
-        }
-      }
-    }
+    const scanWindow = getToolArgsHistoryScanWindow(messages.length);
+    const { lookup, snapshot } = buildPreviousToolArgsLookup(
+      messages,
+      scanWindow,
+      toolArgsHistorySnapshotRef.current,
+      EMPTY_TOOL_ARGS_RECORD,
+    );
+    toolArgsHistorySnapshotRef.current = snapshot;
     return lookup;
   }, [messages]);
 
+  const upsertMessageRenderSnapshotCache = useCallback(
+    (messageId: string, entry: MessageRenderSnapshotCacheEntry) => {
+      const cache = messageRenderSnapshotCacheRef.current;
+      if (cache.has(messageId)) {
+        cache.delete(messageId);
+      }
+      cache.set(messageId, entry);
+      if (cache.size <= MAX_MESSAGE_RENDER_SNAPSHOT_CACHE_ENTRIES) {
+        return;
+      }
+      const overflowCount = cache.size - MAX_MESSAGE_RENDER_SNAPSHOT_CACHE_ENTRIES;
+      let removed = 0;
+      for (const staleId of cache.keys()) {
+        cache.delete(staleId);
+        removed += 1;
+        if (removed >= overflowCount) {
+          break;
+        }
+      }
+    },
+    [],
+  );
+
   const renderVirtualMessageItem = useCallback((message: AgentMessage) => {
-    const previousCallArgsByTool = previousToolArgsByMessageId.get(message.id) ?? {};
+    const previousCallArgsByTool = previousToolArgsByMessageId.get(message.id) ?? EMPTY_TOOL_ARGS_RECORD;
+    const cache = messageRenderSnapshotCacheRef.current.get(message.id);
+    const statusSnapshot = message.status ?? "";
+    if (cache && cache.messageRef === message) {
+      const contentSnapshot = getMessageContentSnapshot(message);
+      const stepsSnapshot = getMessageStepsSnapshot(message);
+      const previousArgsSnapshot =
+        cache.previousArgsRef === previousCallArgsByTool
+          ? cache.previousArgsSnapshot
+          : getPreviousArgsSnapshot(previousCallArgsByTool);
+      if (
+        cache.previousArgsRef !== previousCallArgsByTool ||
+        cache.statusSnapshot !== statusSnapshot ||
+        cache.contentSnapshot !== contentSnapshot ||
+        cache.stepsSnapshot !== stepsSnapshot
+      ) {
+        upsertMessageRenderSnapshotCache(message.id, {
+          ...cache,
+          previousArgsRef: previousCallArgsByTool,
+          previousArgsSnapshot,
+          statusSnapshot,
+          contentSnapshot,
+          stepsSnapshot,
+        });
+      }
+      return (
+        <AgentMessageItem
+          message={message}
+          contentSnapshot={contentSnapshot}
+          statusSnapshot={statusSnapshot}
+          stepsSnapshot={stepsSnapshot}
+          previousCallArgsByTool={previousCallArgsByTool}
+          previousArgsSnapshot={previousArgsSnapshot}
+        />
+      );
+    }
+
+    const contentSnapshot = getMessageContentSnapshot(message);
+    const stepsSnapshot = getMessageStepsSnapshot(message);
     const previousArgsSnapshot = getPreviousArgsSnapshot(previousCallArgsByTool);
+    upsertMessageRenderSnapshotCache(message.id, {
+      messageRef: message,
+      previousArgsRef: previousCallArgsByTool,
+      contentSnapshot,
+      statusSnapshot,
+      stepsSnapshot,
+      previousArgsSnapshot,
+    });
     return (
       <AgentMessageItem
         message={message}
-        contentSnapshot={getMessageContentSnapshot(message)}
-        statusSnapshot={message.status ?? ""}
-        stepsSnapshot={getMessageStepsSnapshot(message)}
+        contentSnapshot={contentSnapshot}
+        statusSnapshot={statusSnapshot}
+        stepsSnapshot={stepsSnapshot}
         previousCallArgsByTool={previousCallArgsByTool}
         previousArgsSnapshot={previousArgsSnapshot}
       />
     );
-  }, [previousToolArgsByMessageId]);
+  }, [previousToolArgsByMessageId, upsertMessageRenderSnapshotCache]);
 
   const diffPanelText = useMemo(
     () => ({
@@ -3752,8 +4169,34 @@ export default function AgentWorkstationView({
       diagnosisFallbackStarted: translate(locale, "agent.diff.diagnosisFallbackStarted"),
       diagnosisFallbackQueued: translate(locale, "agent.diff.diagnosisFallbackQueued"),
       diagnosisFallbackMissingThread: translate(locale, "agent.diff.diagnosisFallbackMissingThread"),
+      diagnosisRiskPrepare: translate(locale, "agent.diff.diagnosisRiskPrepare"),
+      diagnosisRiskRun: translate(locale, "agent.diff.diagnosisRiskRun"),
+      diagnosisRiskPrepared: translate(locale, "agent.diff.diagnosisRiskPrepared"),
+      diagnosisRiskStarted: translate(locale, "agent.diff.diagnosisRiskStarted"),
+      diagnosisRiskQueued: translate(locale, "agent.diff.diagnosisRiskQueued"),
+      diagnosisRiskMissingThread: translate(locale, "agent.diff.diagnosisRiskMissingThread"),
       diagnosisQueueTrack: translate(locale, "agent.diff.diagnosisQueueTrack"),
       diagnosisQueueTrackEmpty: translate(locale, "agent.diff.diagnosisQueueTrackEmpty"),
+      diagnosisQueueRecorded: translate(locale, "agent.diff.diagnosisQueueRecorded", {
+        pressure: "{pressure}",
+        latest: "{latest}",
+        max: "{max}",
+        limit: "{limit}",
+        queued: "{queued}",
+        dequeued: "{dequeued}",
+        rejected: "{rejected}",
+        deduplicated: "{deduplicated}",
+      }),
+      diagnosisQueueRecordedReasons: translate(locale, "agent.diff.diagnosisQueueRecordedReasons", {
+        capacity: "{capacity}",
+        stale: "{stale}",
+        manual: "{manual}",
+      }),
+      diagnosisQueueRecordedPriority: translate(locale, "agent.diff.diagnosisQueueRecordedPriority", {
+        now: "{now}",
+        next: "{next}",
+        later: "{later}",
+      }),
       diagnosisRunbookActionsTitle: translate(locale, "agent.diff.diagnosisRunbookActionsTitle"),
       diagnosisActionPrepare: translate(locale, "agent.diff.diagnosisActionPrepare"),
       diagnosisActionRun: translate(locale, "agent.diff.diagnosisActionRun"),
@@ -3763,6 +4206,46 @@ export default function AgentWorkstationView({
       diagnosisRecommendationFallbackReason: translate(locale, "agent.diff.diagnosisRecommendationFallbackReason"),
       diagnosisRecommendationHotspotReason: translate(locale, "agent.diff.diagnosisRecommendationHotspotReason"),
       diagnosisRecommendationFailedReason: translate(locale, "agent.diff.diagnosisRecommendationFailedReason"),
+      diagnosisRecommendationRecoverReason: translate(locale, "agent.diff.diagnosisRecommendationRecoverReason"),
+      diagnosisRecommendationRecoverPlanReason: translate(
+        locale,
+        "agent.diff.diagnosisRecommendationRecoverPlanReason",
+      ),
+      diagnosisRecommendationRecoverExecuteStrictReason: translate(
+        locale,
+        "agent.diff.diagnosisRecommendationRecoverExecuteStrictReason",
+      ),
+      diagnosisRecommendationRecoverInvestigateReason: translate(
+        locale,
+        "agent.diff.diagnosisRecommendationRecoverInvestigateReason",
+      ),
+      diagnosisRecommendationQueueHealReason: translate(locale, "agent.diff.diagnosisRecommendationQueueHealReason"),
+      diagnosisRecoveryTitle: translate(locale, "agent.diff.diagnosisRecoveryTitle"),
+      diagnosisRecoverySummary: translate(locale, "agent.diff.diagnosisRecoverySummary", {
+        state: "{state}",
+        plan: "{plan}",
+        queue: "{queue}",
+        limit: "{limit}",
+        pressure: "{pressure}",
+      }),
+      diagnosisRecoveryQueuedId: translate(locale, "agent.diff.diagnosisRecoveryQueuedId", {
+        id: "{id}",
+      }),
+      diagnosisRecoveryFailure: translate(locale, "agent.diff.diagnosisRecoveryFailure", {
+        aborted: "{aborted}",
+        error: "{error}",
+        maxIterations: "{maxIterations}",
+        stopHook: "{stopHook}",
+        lifecycleFailed: "{lifecycleFailed}",
+        lifecycleAborted: "{lifecycleAborted}",
+      }),
+      diagnosisRecoverAutoRun: translate(locale, "agent.diff.diagnosisRecoverAutoRun"),
+      diagnosisRecoverPlanRun: translate(locale, "agent.diff.diagnosisRecoverPlanRun"),
+      diagnosisRecoverResumeRun: translate(locale, "agent.diff.diagnosisRecoverResumeRun"),
+      diagnosisRecoverExecuteRun: translate(locale, "agent.diff.diagnosisRecoverExecuteRun"),
+      diagnosisRecoverExecuteStrictRun: translate(locale, "agent.diff.diagnosisRecoverExecuteStrictRun"),
+      diagnosisRecoverInvestigateRun: translate(locale, "agent.diff.diagnosisRecoverInvestigateRun"),
+      diagnosisQueueHealRun: translate(locale, "agent.diff.diagnosisQueueHealRun"),
       diagnosisSeverityHigh: translate(locale, "agent.diff.diagnosisSeverityHigh"),
       diagnosisSeverityMedium: translate(locale, "agent.diff.diagnosisSeverityMedium"),
       diagnosisSeverityLow: translate(locale, "agent.diff.diagnosisSeverityLow"),
@@ -3821,7 +4304,7 @@ export default function AgentWorkstationView({
   );
 
   const diffChangedFiles = useMemo(() => {
-    if (!gitSnapshot?.status_short) return [];
+    if (!gitSnapshot?.status_short) return EMPTY_DIFF_CHANGED_FILES;
     return gitSnapshot.status_short
       .map((line) => parseGitStatusEntry(line))
       .filter((entry): entry is { code: string; path: string } => Boolean(entry));
@@ -3860,13 +4343,14 @@ export default function AgentWorkstationView({
     }
   }, [diffScope, diffPanelText]);
   const visibleDiffChangedFiles = useMemo(() => {
+    if (!isDiffPanelOpen) return EMPTY_DIFF_CHANGED_FILES;
     if (diffScope === "allBranches") return diffChangedFiles;
     if (diffScope === "lastRound") return lastRoundChangedFiles;
     if (diffScope === "staged") {
       return diffChangedFiles.filter((entry) => entry.code !== "??" && entry.code.charAt(0) !== " ");
     }
     return diffChangedFiles.filter((entry) => entry.code === "??" || entry.code.charAt(1) !== " ");
-  }, [diffScope, diffChangedFiles, lastRoundChangedFiles]);
+  }, [isDiffPanelOpen, diffScope, diffChangedFiles, lastRoundChangedFiles]);
   const useTwoColumnDiffLayout = diffSplitViewEnabled && (isDiffPanelExpanded || diffPanelSizePct >= 38);
   const canCopyGitApplyCommand = Boolean(effectiveWorkingDir) && visibleDiffChangedFiles.length > 0;
   const handleCreateGitRepository = useCallback(async () => {
@@ -4058,20 +4542,26 @@ export default function AgentWorkstationView({
     [tracePanelText],
   );
   const traceEventsChronological = useMemo<QueryStreamEvent[]>(() => {
-    if (!isTracePanelOpen) {
+    if (!traceAnalyticsEnabled) {
       return [];
     }
     return engineRuntimeSnapshot.recentEvents.map((event) => ({ ...event }));
-  }, [isTracePanelOpen, engineRuntimeSnapshot.recentEvents]);
+  }, [traceAnalyticsEnabled, engineRuntimeSnapshot.recentEvents]);
   const activeTraceQuickLifecycle = useMemo(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return null;
+    }
     const commandId = traceQuickCommandState?.commandId;
     if (!commandId) {
       return null;
     }
     void lastStreamEventAt;
     return engineRef.current?.getCommandLifecycle(commandId) ?? null;
-  }, [traceQuickCommandState?.commandId, lastStreamEventAt]);
+  }, [diagnosisRuntimeEnabled, traceQuickCommandState?.commandId, lastStreamEventAt]);
   const latestPromptCompiled = useMemo(() => {
+    if (!traceDiagnosticsEnabled) {
+      return null;
+    }
     const events = engineRuntimeSnapshot.recentEvents;
     for (let index = events.length - 1; index >= 0; index -= 1) {
       const event = events[index];
@@ -4080,7 +4570,7 @@ export default function AgentWorkstationView({
       }
     }
     return null;
-  }, [engineRuntimeSnapshot.recentEvents]);
+  }, [engineRuntimeSnapshot.recentEvents, traceDiagnosticsEnabled]);
   const latestPromptStaticIds = latestPromptCompiled?.staticSectionIds ?? EMPTY_STRING_LIST;
   const latestPromptDynamicIds = latestPromptCompiled?.dynamicSectionIds ?? EMPTY_STRING_LIST;
   const latestPromptModelLaunchTags = latestPromptCompiled?.modelLaunchTags ?? EMPTY_STRING_LIST;
@@ -4440,17 +4930,21 @@ export default function AgentWorkstationView({
   const topTraceHotspot = traceToolHotspots[0] ?? null;
   const traceQueueDiagnosisVisible = useMemo(
     () =>
-      traceHotspotQueuePriorityStats.pressure === "congested" ||
-      traceHotspotQueuePriorityStats.pressure === "saturated",
-    [traceHotspotQueuePriorityStats.pressure],
+      diagnosisRuntimeEnabled &&
+      (traceHotspotQueuePriorityStats.pressure === "congested" ||
+        traceHotspotQueuePriorityStats.pressure === "saturated"),
+    [diagnosisRuntimeEnabled, traceHotspotQueuePriorityStats.pressure],
   );
   const traceHotspotDiagnosisVisible = useMemo(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return false;
+    }
     if (!topTraceHotspot) {
       return false;
     }
     const anomalyCount = topTraceHotspot.errors + topTraceHotspot.rejected + topTraceHotspot.denied;
     return topTraceHotspot.total >= 2 && anomalyCount >= 2;
-  }, [topTraceHotspot]);
+  }, [diagnosisRuntimeEnabled, topTraceHotspot]);
   const traceQueueDiagnosisDepthLabel = useMemo(
     () =>
       queueLimit > 0
@@ -4467,6 +4961,165 @@ export default function AgentWorkstationView({
   );
   const currentThreadPermissionDiagnostics = currentThreadMeta?.diagnostics?.permission;
   const currentThreadRetryDiagnostics = currentThreadMeta?.diagnostics?.retry;
+  const currentThreadQueueDiagnostics = currentThreadMeta?.diagnostics?.queue;
+  const currentThreadRecoveryDiagnostics = currentThreadMeta?.diagnostics?.recovery;
+  const recoverRuntimeSnapshot = useMemo(
+    () => {
+      if (!diagnosisRuntimeEnabled) {
+        return null;
+      }
+      return buildRecoverRuntimeSnapshot({
+        messages,
+        queuedQueries,
+        queueCount: queuedCount,
+        queueLimit,
+        queuedRecoveryMatcher: isRecoverContinuePrompt,
+        events: engineRuntimeSnapshot.recentEvents,
+      });
+    },
+    [
+      diagnosisRuntimeEnabled,
+      messages,
+      queuedQueries,
+      queuedCount,
+      queueLimit,
+      engineRuntimeSnapshot.recentEvents,
+    ],
+  );
+  const recoverStateSnapshot = recoverRuntimeSnapshot?.state ?? { kind: "none" as const };
+  const recoverPlanSnapshot =
+    recoverRuntimeSnapshot?.plan ??
+    {
+      kind: "none" as const,
+      queuedRecovery: null,
+      queueCount: 0,
+      queueLimit: 0,
+      pressure: "idle" as const,
+    };
+  const recoverRuntimeSignals =
+    recoverRuntimeSnapshot?.signals ??
+    {
+      failure: {
+        query_end_aborted: 0,
+        query_end_error: 0,
+        query_end_max_iterations: 0,
+        query_end_stop_hook_prevented: 0,
+        lifecycle_failed: 0,
+        lifecycle_aborted: 0,
+      },
+      failureTotal: 0,
+      queueRejectedCount: 0,
+      queueDeduplicatedCount: 0,
+    };
+  const recoverSnapshotState =
+    currentThreadRecoveryDiagnostics?.state ?? recoverStateSnapshot.kind;
+  const recoverSnapshotPlan =
+    currentThreadRecoveryDiagnostics?.plan ?? recoverPlanSnapshot.kind;
+  const recoverSnapshotQueueCount =
+    typeof currentThreadRecoveryDiagnostics?.queue_count === "number"
+      ? Math.max(0, currentThreadRecoveryDiagnostics.queue_count)
+      : recoverPlanSnapshot.queueCount;
+  const recoverSnapshotQueueLimit =
+    typeof currentThreadRecoveryDiagnostics?.queue_limit === "number"
+      ? Math.max(0, currentThreadRecoveryDiagnostics.queue_limit)
+      : recoverPlanSnapshot.queueLimit;
+  const recoverSnapshotPressure =
+    currentThreadRecoveryDiagnostics?.pressure ?? recoverPlanSnapshot.pressure;
+  const recoverSnapshotQueuedId =
+    currentThreadRecoveryDiagnostics?.queued_recovery_id ??
+    recoverPlanSnapshot.queuedRecovery?.id ??
+    null;
+  const recoverSnapshotFailure = currentThreadRecoveryDiagnostics?.failure ?? recoverRuntimeSignals.failure;
+  const recoverSnapshotFailureTotal =
+    typeof currentThreadRecoveryDiagnostics?.failure_total === "number"
+      ? Math.max(0, currentThreadRecoveryDiagnostics.failure_total)
+      : recoverRuntimeSignals.failureTotal;
+  const recoverSnapshotVisible =
+    diagnosisRuntimeEnabled &&
+    (
+      recoverSnapshotState !== "none" ||
+      recoverSnapshotPlan !== "none" ||
+      recoverSnapshotQueueCount > 0 ||
+      Boolean(recoverSnapshotQueuedId) ||
+      recoverSnapshotFailureTotal > 0
+    );
+  const recoverSnapshotStateLabel = translate(
+    locale,
+    `agent.command.status.recovery.${recoverSnapshotState}`,
+  );
+  const recoverSnapshotPlanLabel = translate(
+    locale,
+    `agent.command.recover.plan.${recoverSnapshotPlan}`,
+  );
+  const recoverSnapshotPressureLabel = translate(
+    locale,
+    `agent.trace.queuePressure.${recoverSnapshotPressure}`,
+  );
+  const recoverSnapshotSummaryText = diffPanelText.diagnosisRecoverySummary
+    .replace("{state}", recoverSnapshotStateLabel)
+    .replace("{plan}", recoverSnapshotPlanLabel)
+    .replace("{queue}", String(recoverSnapshotQueueCount))
+    .replace("{limit}", String(recoverSnapshotQueueLimit))
+    .replace("{pressure}", recoverSnapshotPressureLabel);
+  const recoverSnapshotFailureText = diffPanelText.diagnosisRecoveryFailure
+    .replace("{aborted}", String(recoverSnapshotFailure.query_end_aborted))
+    .replace("{error}", String(recoverSnapshotFailure.query_end_error))
+    .replace("{maxIterations}", String(recoverSnapshotFailure.query_end_max_iterations))
+    .replace("{stopHook}", String(recoverSnapshotFailure.query_end_stop_hook_prevented))
+    .replace("{lifecycleFailed}", String(recoverSnapshotFailure.lifecycle_failed))
+    .replace("{lifecycleAborted}", String(recoverSnapshotFailure.lifecycle_aborted));
+  const recoverFailureTotal = recoverSnapshotFailureTotal;
+  const recoverQueueDeduplicatedCount = useMemo(() => {
+    if (typeof currentThreadRecoveryDiagnostics?.queue_deduplicated_count === "number") {
+      return Math.max(0, currentThreadRecoveryDiagnostics.queue_deduplicated_count);
+    }
+    if (typeof currentThreadQueueDiagnostics?.deduplicated_count === "number") {
+      return Math.max(0, currentThreadQueueDiagnostics.deduplicated_count);
+    }
+    return recoverRuntimeSignals.queueDeduplicatedCount;
+  }, [
+    currentThreadRecoveryDiagnostics?.queue_deduplicated_count,
+    currentThreadQueueDiagnostics?.deduplicated_count,
+    recoverRuntimeSignals.queueDeduplicatedCount,
+  ]);
+  const recoverQueueRejectedCount = useMemo(() => {
+    if (typeof currentThreadRecoveryDiagnostics?.queue_rejected_count === "number") {
+      return Math.max(0, currentThreadRecoveryDiagnostics.queue_rejected_count);
+    }
+    if (typeof currentThreadQueueDiagnostics?.rejected_count === "number") {
+      return Math.max(0, currentThreadQueueDiagnostics.rejected_count);
+    }
+    return recoverRuntimeSignals.queueRejectedCount;
+  }, [
+    currentThreadRecoveryDiagnostics?.queue_rejected_count,
+    currentThreadQueueDiagnostics?.rejected_count,
+    recoverRuntimeSignals.queueRejectedCount,
+  ]);
+  const recoverActionDecision = useMemo(
+    () =>
+      deriveRecoverActionDecision({
+        stateKind: recoverSnapshotState,
+        queueCount: recoverSnapshotQueueCount,
+        queueLimit: recoverSnapshotQueueLimit,
+        queueDeduplicatedCount: recoverQueueDeduplicatedCount,
+        queueRejectedCount: recoverQueueRejectedCount,
+        failureTotal: recoverFailureTotal,
+      }),
+    [
+      recoverSnapshotState,
+      recoverSnapshotQueueCount,
+      recoverSnapshotQueueLimit,
+      recoverQueueDeduplicatedCount,
+      recoverQueueRejectedCount,
+      recoverFailureTotal,
+    ],
+  );
+  const recoverShouldRelieveQueueWithHeal = recoverActionDecision.shouldRelieveQueueWithHeal;
+  const recoverHasFailureSignals = recoverActionDecision.hasFailureSignals;
+  const recoverRunbook = useMemo(
+    () => deriveRecoverRunbookBlueprint(recoverSnapshotState, recoverActionDecision),
+    [recoverSnapshotState, recoverActionDecision],
+  );
   const fallbackSuppressionRatioPct =
     typeof currentThreadRetryDiagnostics?.suppression_ratio_pct === "number"
       ? currentThreadRetryDiagnostics.suppression_ratio_pct
@@ -4491,17 +5144,44 @@ export default function AgentWorkstationView({
     locale,
     currentThreadRetryDiagnostics?.last_retry_strategy ?? undefined,
   );
-  const fallbackInvestigateCommand = useMemo(
+  const riskInvestigateCommand = useMemo(
     () => (currentThreadMeta ? buildThreadRiskInvestigationPrompt(currentThreadMeta) : ""),
     [currentThreadMeta],
   );
-  const fallbackInvestigateQueued = useMemo(
+  const riskInvestigateCommandType = useMemo(
+    () => getRiskInvestigateCommandType(riskInvestigateCommand),
+    [riskInvestigateCommand],
+  );
+  const queueInvestigateCommand = useMemo(() => {
+    if (riskInvestigateCommandType !== "queue") {
+      return "";
+    }
+    return riskInvestigateCommand.trim();
+  }, [riskInvestigateCommand, riskInvestigateCommandType]);
+  const fallbackInvestigateCommand = useMemo(() => {
+    if (riskInvestigateCommandType !== "fallback") {
+      return "";
+    }
+    return riskInvestigateCommand.trim();
+  }, [riskInvestigateCommand, riskInvestigateCommandType]);
+  const riskInvestigateQueued = useMemo(
     () =>
-      Boolean(fallbackInvestigateCommand) &&
-      queuedQueries.some((item) => item.query.trim() === fallbackInvestigateCommand.trim()),
-    [queuedQueries, fallbackInvestigateCommand],
+      Boolean(riskInvestigateCommand) &&
+      queuedQueries.some((item) => item.query.trim() === riskInvestigateCommand.trim()),
+    [queuedQueries, riskInvestigateCommand],
+  );
+  const fallbackInvestigateQueued = useMemo(
+    () => riskInvestigateCommandType === "fallback" && riskInvestigateQueued,
+    [riskInvestigateCommandType, riskInvestigateQueued],
+  );
+  const queueInvestigateQueued = useMemo(
+    () => riskInvestigateCommandType === "queue" && riskInvestigateQueued,
+    [riskInvestigateCommandType, riskInvestigateQueued],
   );
   const fallbackDiagnosisVisible = useMemo(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return false;
+    }
     if (!currentThreadRetryDiagnostics) {
       return false;
     }
@@ -4511,6 +5191,7 @@ export default function AgentWorkstationView({
       fallbackRetryEventsCount >= 2
     );
   }, [
+    diagnosisRuntimeEnabled,
     currentThreadRetryDiagnostics,
     fallbackSuppressedCount,
     fallbackSuppressionRatioPct,
@@ -4537,32 +5218,85 @@ export default function AgentWorkstationView({
     () => (queueLimit > 0 ? `Q${queuedCount}/${queueLimit}` : `Q${queuedCount}`),
     [queueLimit, queuedCount],
   );
+  const cockpitRecordedQueuePressureLabel = useMemo(() => {
+    const pressure = currentThreadQueueDiagnostics?.pressure ?? "idle";
+    switch (pressure) {
+      case "saturated":
+        return tracePanelText.queuePressureSaturated;
+      case "congested":
+        return tracePanelText.queuePressureCongested;
+      case "busy":
+        return tracePanelText.queuePressureBusy;
+      case "idle":
+      default:
+        return tracePanelText.queuePressureIdle;
+    }
+  }, [
+    currentThreadQueueDiagnostics?.pressure,
+    tracePanelText.queuePressureSaturated,
+    tracePanelText.queuePressureCongested,
+    tracePanelText.queuePressureBusy,
+    tracePanelText.queuePressureIdle,
+  ]);
+  const cockpitRecordedQueueInfo = useMemo(() => {
+    if (!currentThreadQueueDiagnostics) {
+      return null;
+    }
+    const queueLimitRecorded = Math.max(0, currentThreadQueueDiagnostics.queue_limit);
+    const latestDepthRecorded = Math.max(0, currentThreadQueueDiagnostics.latest_depth);
+    const maxDepthRecorded = Math.max(latestDepthRecorded, currentThreadQueueDiagnostics.max_depth);
+    return {
+      summary: diffPanelText.diagnosisQueueRecorded
+        .replace("{pressure}", cockpitRecordedQueuePressureLabel)
+        .replace("{latest}", String(latestDepthRecorded))
+        .replace("{max}", String(maxDepthRecorded))
+        .replace("{limit}", String(queueLimitRecorded))
+        .replace("{queued}", String(Math.max(0, currentThreadQueueDiagnostics.queued_count)))
+        .replace("{dequeued}", String(Math.max(0, currentThreadQueueDiagnostics.dequeued_count)))
+        .replace("{rejected}", String(Math.max(0, currentThreadQueueDiagnostics.rejected_count)))
+        .replace("{deduplicated}", String(Math.max(0, currentThreadQueueDiagnostics.deduplicated_count))),
+      reasons: diffPanelText.diagnosisQueueRecordedReasons
+        .replace("{capacity}", String(Math.max(0, currentThreadQueueDiagnostics.reason.capacity)))
+        .replace("{stale}", String(Math.max(0, currentThreadQueueDiagnostics.reason.stale)))
+        .replace("{manual}", String(Math.max(0, currentThreadQueueDiagnostics.reason.manual))),
+      priority: diffPanelText.diagnosisQueueRecordedPriority
+        .replace("{now}", String(Math.max(0, currentThreadQueueDiagnostics.queued_priority.now)))
+        .replace("{next}", String(Math.max(0, currentThreadQueueDiagnostics.queued_priority.next)))
+        .replace("{later}", String(Math.max(0, currentThreadQueueDiagnostics.queued_priority.later))),
+    };
+  }, [currentThreadQueueDiagnostics, cockpitRecordedQueuePressureLabel, diffPanelText]);
   const cockpitQueueDiagnosisVisible = useMemo(
     () =>
-      traceQueueDiagnosisVisible ||
-      cockpitQueuePressure === "busy" ||
-      cockpitQueuePressure === "congested" ||
-      cockpitQueuePressure === "saturated",
-    [traceQueueDiagnosisVisible, cockpitQueuePressure],
+      diagnosisRuntimeEnabled &&
+      (traceQueueDiagnosisVisible ||
+        cockpitQueuePressure === "busy" ||
+        cockpitQueuePressure === "congested" ||
+        cockpitQueuePressure === "saturated"),
+    [diagnosisRuntimeEnabled, traceQueueDiagnosisVisible, cockpitQueuePressure],
   );
   const diagnosisCockpitVisible =
-    cockpitQueueDiagnosisVisible ||
-    traceHotspotDiagnosisVisible ||
-    fallbackDiagnosisVisible ||
-    queuedQueries.some((item) => {
-      const query = item.query.trim();
-      return (
-        query.startsWith("/trace summary") ||
-        query.startsWith("/trace hotspots") ||
-        query.startsWith("/trace investigate") ||
-        query.startsWith("/doctor fallback investigate")
-      );
-    }) ||
-    Boolean(lastDiagnosisActivity);
+    diagnosisRuntimeEnabled &&
+    (cockpitQueueDiagnosisVisible ||
+      traceHotspotDiagnosisVisible ||
+      fallbackDiagnosisVisible ||
+      queuedQueries.some((item) => {
+        const query = item.query.trim();
+        return (
+          query.startsWith("/trace summary") ||
+          query.startsWith("/trace hotspots") ||
+          query.startsWith("/trace investigate") ||
+          query.startsWith("/doctor queue investigate") ||
+          query.startsWith("/doctor fallback investigate")
+        );
+      }) ||
+      Boolean(lastDiagnosisActivity));
   const inferDiagnosisKindFromCommand = useCallback((command: string): TraceQuickCommandKind | null => {
     const trimmed = command.trim();
     if (!trimmed) {
       return null;
+    }
+    if (isDoctorQueueInvestigateCommand(trimmed)) {
+      return "queue_diagnostics";
     }
     if (trimmed.startsWith("/doctor fallback investigate")) {
       return "fallback_investigate";
@@ -4581,6 +5315,7 @@ export default function AgentWorkstationView({
     }
     return null;
   }, []);
+
   const getTraceQuickCommandStatusLabel = useCallback(
     (status: TraceQuickCommandStatus) => {
       if (status === "queued") return tracePanelText.commandStatusQueued;
@@ -4594,8 +5329,11 @@ export default function AgentWorkstationView({
     [tracePanelText, locale, queuedCount, queueLimit],
   );
   const diagnosisQueuedItems = useMemo(
-    () =>
-      queuedQueries
+    () => {
+      if (!diagnosisRuntimeEnabled) {
+        return [];
+      }
+      return queuedQueries
         .map((item) => {
           const kind = inferDiagnosisKindFromCommand(item.query);
           if (!kind) {
@@ -4606,11 +5344,12 @@ export default function AgentWorkstationView({
             kind,
           };
         })
-        .filter((item): item is QueuedQueryItem & { kind: TraceQuickCommandKind } => Boolean(item)),
-    [queuedQueries, inferDiagnosisKindFromCommand],
+        .filter((item): item is QueuedQueryItem & { kind: TraceQuickCommandKind } => Boolean(item));
+    },
+    [diagnosisRuntimeEnabled, queuedQueries, inferDiagnosisKindFromCommand],
   );
   useEffect(() => {
-    if (diagnosisQueuedItems.length === 0) {
+    if (!diagnosisRuntimeEnabled || diagnosisQueuedItems.length === 0) {
       return;
     }
     const timer = window.setInterval(() => {
@@ -4619,8 +5358,33 @@ export default function AgentWorkstationView({
     return () => {
       window.clearInterval(timer);
     };
-  }, [diagnosisQueuedItems.length]);
+  }, [diagnosisRuntimeEnabled, diagnosisQueuedItems.length]);
+  useEffect(() => {
+    if (diagnosisRuntimeEnabled) {
+      return;
+    }
+    setTraceQuickCommandState((prev) => (prev === null ? prev : null));
+    setLastDiagnosisActivity((prev) => (prev === null ? prev : null));
+    setDiagnosisHistory((prev) => (prev.length === 0 ? prev : []));
+    setDiagnosisRunbookActionStateById((prev) =>
+      Object.keys(prev).length === 0 ? prev : {},
+    );
+    setExpandedDiagnosisLifecycleKeys((prev) =>
+      Object.keys(prev).length === 0 ? prev : {},
+    );
+    setDiagnosisQueueTick((prev) => (prev === 0 ? prev : 0));
+  }, [diagnosisRuntimeEnabled]);
   const diagnosisQueuedTrackRows = useMemo(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return [] as Array<
+        QueuedQueryItem & {
+          kind: TraceQuickCommandKind;
+          kindLabel: string;
+          priorityLabel: string;
+          waitSeconds: number;
+        }
+      >;
+    }
     void diagnosisQueueTick;
     const now = Date.now();
     return diagnosisQueuedItems.map((item) => ({
@@ -4633,12 +5397,12 @@ export default function AgentWorkstationView({
             : item.kind === "queue_diagnostics"
               ? tracePanelText.hotspotRunQueueDiagnostics
               : item.kind === "fallback_investigate"
-                ? diffPanelText.diagnosisFallbackRun
+                ? diffPanelText.diagnosisRiskRun
                 : tracePanelText.hotspotInvestigate,
       priorityLabel: translate(locale, `agent.queue.priority.${item.priority}`),
       waitSeconds: Math.max(0, Math.floor((now - item.queuedAt) / 1000)),
     }));
-  }, [diagnosisQueuedItems, diagnosisQueueTick, tracePanelText, diffPanelText, locale]);
+  }, [diagnosisRuntimeEnabled, diagnosisQueuedItems, diagnosisQueueTick, tracePanelText, diffPanelText, locale]);
   const diagnosisHistoryStatusFilterOptions = useMemo(
     () =>
       [
@@ -4660,10 +5424,10 @@ export default function AgentWorkstationView({
         { value: "hotspots" as const, label: tracePanelText.hotspotRunHotspots },
         { value: "queue_diagnostics" as const, label: tracePanelText.hotspotRunQueueDiagnostics },
         { value: "investigate" as const, label: tracePanelText.hotspotInvestigate },
-        { value: "fallback_investigate" as const, label: diffPanelText.diagnosisFallbackRun },
+        { value: "fallback_investigate" as const, label: diffPanelText.diagnosisRiskRun },
       ] satisfies Array<{ value: DiagnosisHistoryKindFilter; label: string }>,
     [
-      diffPanelText.diagnosisFallbackRun,
+      diffPanelText.diagnosisRiskRun,
       diffPanelText.diagnosisFilterKindAll,
       tracePanelText.hotspotInvestigate,
       tracePanelText.hotspotRunHotspots,
@@ -4680,8 +5444,11 @@ export default function AgentWorkstationView({
     [diffPanelText.diagnosisSortRecent, diffPanelText.diagnosisSortRisk],
   );
   const diagnosisHistoryFiltered = useMemo(
-    () =>
-      diagnosisHistory.filter((item) => {
+    () => {
+      if (!diagnosisRuntimeEnabled) {
+        return [] as TraceQuickCommandState[];
+      }
+      return diagnosisHistory.filter((item) => {
         const matchesStatus =
           diagnosisHistoryStatusFilter === "all"
             ? true
@@ -4690,10 +5457,14 @@ export default function AgentWorkstationView({
               : DIAGNOSIS_HISTORY_ACTIVE_STATUS_SET.has(item.status);
         const matchesKind = diagnosisHistoryKindFilter === "all" ? true : item.kind === diagnosisHistoryKindFilter;
         return matchesStatus && matchesKind;
-      }),
-    [diagnosisHistory, diagnosisHistoryStatusFilter, diagnosisHistoryKindFilter],
+      });
+    },
+    [diagnosisRuntimeEnabled, diagnosisHistory, diagnosisHistoryStatusFilter, diagnosisHistoryKindFilter],
   );
   const diagnosisHistorySorted = useMemo(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return [] as TraceQuickCommandState[];
+    }
     if (diagnosisHistorySortMode === "recent") {
       return diagnosisHistoryFiltered;
     }
@@ -4702,17 +5473,24 @@ export default function AgentWorkstationView({
       if (scoreDiff !== 0) return scoreDiff;
       return b.at - a.at;
     });
-  }, [diagnosisHistoryFiltered, diagnosisHistorySortMode]);
+  }, [diagnosisRuntimeEnabled, diagnosisHistoryFiltered, diagnosisHistorySortMode]);
   const latestFailedDiagnosisHistoryEntry = useMemo(
-    () =>
-      diagnosisHistory.find(
+    () => {
+      if (!diagnosisRuntimeEnabled) {
+        return null;
+      }
+      return diagnosisHistory.find(
         (item) => DIAGNOSIS_HISTORY_FAILED_STATUS_SET.has(item.status) && item.command.trim().length > 0,
-      ) ?? null,
-    [diagnosisHistory],
+      ) ?? null;
+    },
+    [diagnosisRuntimeEnabled, diagnosisHistory],
   );
   const diagnosisHistoryRows = useMemo(
-    () =>
-      diagnosisHistorySorted.slice(0, DIAGNOSIS_HISTORY_PREVIEW_LIMIT).map((item) => ({
+    () => {
+      if (!diagnosisRuntimeEnabled) {
+        return [] as Array<TraceQuickCommandState & { kindLabel: string; statusLabel: string; atText: string }>;
+      }
+      return diagnosisHistorySorted.slice(0, DIAGNOSIS_HISTORY_PREVIEW_LIMIT).map((item) => ({
         ...item,
         kindLabel:
           item.kind === "summary"
@@ -4722,12 +5500,14 @@ export default function AgentWorkstationView({
               : item.kind === "queue_diagnostics"
                 ? tracePanelText.hotspotRunQueueDiagnostics
                 : item.kind === "fallback_investigate"
-                  ? diffPanelText.diagnosisFallbackRun
+                  ? diffPanelText.diagnosisRiskRun
                   : tracePanelText.hotspotInvestigate,
         statusLabel: getTraceQuickCommandStatusLabel(item.status),
         atText: new Date(item.at).toLocaleTimeString(locale, { hour12: false }),
-      })),
+      }));
+    },
     [
+      diagnosisRuntimeEnabled,
       diagnosisHistorySorted,
       tracePanelText,
       diffPanelText,
@@ -4736,6 +5516,32 @@ export default function AgentWorkstationView({
     ],
   );
   const diagnosisLifecycleRows = useMemo(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return [] as Array<{
+        key: string;
+        kind: TraceQuickCommandKind;
+        command: string;
+        statuses: TraceQuickCommandStatus[];
+        events: Array<{ status: TraceQuickCommandStatus; at: number; commandId?: string | null }>;
+        firstAt: number;
+        lastAt: number;
+        finalStatus: TraceQuickCommandStatus;
+        riskScore: number;
+        count: number;
+        kindLabel: string;
+        finalStatusLabel: string;
+        trailText: string;
+        eventRows: Array<{
+          status: TraceQuickCommandStatus;
+          at: number;
+          commandId?: string | null;
+          statusLabel: string;
+          atText: string;
+        }>;
+        isFailed: boolean;
+        atText: string;
+      }>;
+    }
     const ascending = [...diagnosisHistorySorted].sort((a, b) => a.at - b.at);
     const groups: Array<{
       key: string;
@@ -4804,9 +5610,9 @@ export default function AgentWorkstationView({
           : group.kind === "hotspots"
             ? tracePanelText.hotspotRunHotspots
             : group.kind === "queue_diagnostics"
-              ? tracePanelText.hotspotRunQueueDiagnostics
-              : group.kind === "fallback_investigate"
-                ? diffPanelText.diagnosisFallbackRun
+            ? tracePanelText.hotspotRunQueueDiagnostics
+            : group.kind === "fallback_investigate"
+                ? diffPanelText.diagnosisRiskRun
                 : tracePanelText.hotspotInvestigate;
       const finalStatusLabel = getTraceQuickCommandStatusLabel(group.finalStatus);
       const trailText = group.statuses.map((status) => getTraceQuickCommandStatusLabel(status)).join(" -> ");
@@ -4835,10 +5641,11 @@ export default function AgentWorkstationView({
     }
     return rows.slice(0, DIAGNOSIS_HISTORY_PREVIEW_LIMIT);
   }, [
+    diagnosisRuntimeEnabled,
     diagnosisHistorySorted,
     diagnosisHistorySortMode,
     tracePanelText,
-    diffPanelText.diagnosisFallbackRun,
+    diffPanelText.diagnosisRiskRun,
     getTraceQuickCommandStatusLabel,
     locale,
   ]);
@@ -5065,6 +5872,9 @@ export default function AgentWorkstationView({
     [buildTraceScopeTokens, diagnosisRootSummary],
   );
   const diagnosisRunbookPayload = useMemo(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return "";
+    }
     if (!currentThreadMeta) {
       return "";
     }
@@ -5079,6 +5889,42 @@ export default function AgentWorkstationView({
     lines.push("## Risk Snapshot");
     lines.push(`queue_pressure: ${cockpitQueuePressure}`);
     lines.push(`queue_depth: ${cockpitQueueDepthLabel}`);
+    if (currentThreadQueueDiagnostics) {
+      const queuedPriority = currentThreadQueueDiagnostics.queued_priority;
+      const dominantPriority = (() => {
+        if (
+          queuedPriority.now >= queuedPriority.next &&
+          queuedPriority.now >= queuedPriority.later &&
+          queuedPriority.now > 0
+        ) {
+          return "now";
+        }
+        if (
+          queuedPriority.next >= queuedPriority.now &&
+          queuedPriority.next >= queuedPriority.later &&
+          queuedPriority.next > 0
+        ) {
+          return "next";
+        }
+        if (queuedPriority.later > 0) {
+          return "later";
+        }
+        return "none";
+      })();
+      lines.push(`queue_limit_recorded: ${currentThreadQueueDiagnostics.queue_limit}`);
+      lines.push(`queue_latest_depth_recorded: ${currentThreadQueueDiagnostics.latest_depth}`);
+      lines.push(`queue_max_depth_recorded: ${currentThreadQueueDiagnostics.max_depth}`);
+      lines.push(`queue_queued_count: ${currentThreadQueueDiagnostics.queued_count}`);
+      lines.push(`queue_dequeued_count: ${currentThreadQueueDiagnostics.dequeued_count}`);
+      lines.push(`queue_rejected_count: ${currentThreadQueueDiagnostics.rejected_count}`);
+      lines.push(`queue_deduplicated_count: ${currentThreadQueueDiagnostics.deduplicated_count}`);
+      lines.push(
+        `queue_reject_reasons: capacity=${currentThreadQueueDiagnostics.reason.capacity}, stale=${currentThreadQueueDiagnostics.reason.stale}, manual=${currentThreadQueueDiagnostics.reason.manual}`,
+      );
+      lines.push(
+        `queue_priority_queued: now=${queuedPriority.now}, next=${queuedPriority.next}, later=${queuedPriority.later}, dominant=${dominantPriority}`,
+      );
+    }
     lines.push(`fallback_suppression_ratio_pct: ${fallbackSuppressionRatioPct}`);
     lines.push(`fallback_suppressed: ${fallbackSuppressedCount}`);
     lines.push(`fallback_used: ${fallbackUsedCount}`);
@@ -5103,8 +5949,8 @@ export default function AgentWorkstationView({
     if (investigateCommand) {
       lines.push(`4. ${investigateCommand}`);
     }
-    if (fallbackInvestigateCommand) {
-      lines.push(`5. ${fallbackInvestigateCommand}`);
+    if (riskInvestigateCommand) {
+      lines.push(`5. ${riskInvestigateCommand}`);
     }
     if (diagnosisQueuedItems.length > 0) {
       lines.push("");
@@ -5123,6 +5969,7 @@ export default function AgentWorkstationView({
     }
     return lines.join("\n");
   }, [
+    diagnosisRuntimeEnabled,
     currentThreadMeta,
     buildTraceInvestigateCommand,
     cockpitQueuePressure,
@@ -5131,13 +5978,14 @@ export default function AgentWorkstationView({
     fallbackSuppressedCount,
     fallbackUsedCount,
     fallbackRetryEventsCount,
+    currentThreadQueueDiagnostics,
     currentThreadRetryDiagnostics?.last_suppressed_reason,
     currentThreadRetryDiagnostics?.last_retry_strategy,
     topTraceHotspot,
     lastDiagnosisActivity,
     buildTraceSummaryCommand,
     buildTraceQueueDiagnosticsCommand,
-    fallbackInvestigateCommand,
+    riskInvestigateCommand,
     diagnosisQueuedItems,
     diagnosisHistorySorted,
   ]);
@@ -5170,6 +6018,13 @@ export default function AgentWorkstationView({
       target.setSelectionRange(caret, caret);
     });
   }, []);
+
+  const handleChangeQueuedQueryPriority = useCallback((queueId: string, priority: QueuePriority) => {
+    const changed = engineRef.current?.setQueuedQueryPriority(queueId, priority) ?? false;
+    if (!changed) return;
+    const label = translate(locale, `agent.queue.priority.${priority}`);
+    toast.success(`${translate(locale, "agent.metricQueuePriority")}: ${label}`);
+  }, [locale]);
   const handlePrepareDiagnosisFixProposal = useCallback(
     (item: (typeof diagnosisLifecycleRows)[number]) => {
       const proposal = buildDiagnosisFixProposalCommand(item);
@@ -5208,21 +6063,30 @@ export default function AgentWorkstationView({
     [buildTraceQueueDiagnosticsCommand],
   );
   const traceInvestigateQueued = useMemo(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return false;
+    }
     const built = buildTraceInvestigateCommand(true);
     if (!built) return false;
     return queuedQueries.some((item) => item.query.trim() === built.command.trim());
-  }, [buildTraceInvestigateCommand, queuedQueries]);
+  }, [diagnosisRuntimeEnabled, buildTraceInvestigateCommand, queuedQueries]);
   const traceSummaryQueued = useMemo(
-    () => queuedQueries.some((item) => item.query.trim() === traceSummaryCommand.trim()),
-    [queuedQueries, traceSummaryCommand],
+    () =>
+      diagnosisRuntimeEnabled &&
+      queuedQueries.some((item) => item.query.trim() === traceSummaryCommand.trim()),
+    [diagnosisRuntimeEnabled, queuedQueries, traceSummaryCommand],
   );
   const traceHotspotsQueued = useMemo(
-    () => queuedQueries.some((item) => item.query.trim() === traceHotspotsCommand.trim()),
-    [queuedQueries, traceHotspotsCommand],
+    () =>
+      diagnosisRuntimeEnabled &&
+      queuedQueries.some((item) => item.query.trim() === traceHotspotsCommand.trim()),
+    [diagnosisRuntimeEnabled, queuedQueries, traceHotspotsCommand],
   );
   const traceQueueDiagnosticsQueued = useMemo(
-    () => queuedQueries.some((item) => item.query.trim() === traceQueueDiagnosticsCommand.trim()),
-    [queuedQueries, traceQueueDiagnosticsCommand],
+    () =>
+      diagnosisRuntimeEnabled &&
+      queuedQueries.some((item) => item.query.trim() === traceQueueDiagnosticsCommand.trim()),
+    [diagnosisRuntimeEnabled, queuedQueries, traceQueueDiagnosticsCommand],
   );
   const traceQueueDiagnosticsPresetActive = useMemo(
     () =>
@@ -5246,6 +6110,9 @@ export default function AgentWorkstationView({
     ],
   );
   useEffect(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return;
+    }
     if (!traceQuickCommandState?.commandId || !activeTraceQuickLifecycle) {
       return;
     }
@@ -5276,8 +6143,11 @@ export default function AgentWorkstationView({
         at: activeTraceQuickLifecycle.at,
       };
     });
-  }, [traceQuickCommandState?.commandId, activeTraceQuickLifecycle]);
+  }, [diagnosisRuntimeEnabled, traceQuickCommandState?.commandId, activeTraceQuickLifecycle]);
   useEffect(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return;
+    }
     if (!traceQuickCommandState) {
       return;
     }
@@ -5309,8 +6179,11 @@ export default function AgentWorkstationView({
       const next = [snapshot, ...prev];
       return next.slice(0, MAX_DIAGNOSIS_HISTORY_ITEMS);
     });
-  }, [traceQuickCommandState]);
+  }, [diagnosisRuntimeEnabled, traceQuickCommandState]);
   useEffect(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return;
+    }
     if (!traceQuickCommandState || traceQuickCommandState.commandId) {
       return;
     }
@@ -5347,8 +6220,11 @@ export default function AgentWorkstationView({
         };
       });
     }
-  }, [traceQuickCommandState, queuedQueries, isThinking]);
+  }, [diagnosisRuntimeEnabled, traceQuickCommandState, queuedQueries, isThinking]);
   useEffect(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return;
+    }
     if (!traceQuickCommandState) {
       return;
     }
@@ -5373,7 +6249,7 @@ export default function AgentWorkstationView({
       });
     }, expiresInMs);
     return () => window.clearTimeout(timer);
-  }, [traceQuickCommandState]);
+  }, [diagnosisRuntimeEnabled, traceQuickCommandState]);
   const getTraceQuickCommandKindLabel = useCallback(
     (kind: TraceQuickCommandKind) =>
       kind === "summary"
@@ -5383,12 +6259,12 @@ export default function AgentWorkstationView({
           : kind === "queue_diagnostics"
             ? tracePanelText.hotspotRunQueueDiagnostics
             : kind === "fallback_investigate"
-              ? diffPanelText.diagnosisFallbackRun
+              ? diffPanelText.diagnosisRiskRun
               : tracePanelText.hotspotInvestigate,
     [tracePanelText, diffPanelText],
   );
   const traceQuickCommandStatusLabel = useMemo(() => {
-    if (!traceQuickCommandState) {
+    if (!diagnosisRuntimeEnabled || !traceQuickCommandState) {
       return null;
     }
     const kindLabel = getTraceQuickCommandKindLabel(traceQuickCommandState.kind);
@@ -5407,21 +6283,21 @@ export default function AgentWorkstationView({
                   ? tracePanelText.commandStatusAborted
               : translate(locale, "agent.queue.full", { count: queuedCount, limit: queueLimit });
     return `${kindLabel} | ${statusLabel}`;
-  }, [traceQuickCommandState, getTraceQuickCommandKindLabel, tracePanelText, locale, queuedCount, queueLimit]);
+  }, [diagnosisRuntimeEnabled, traceQuickCommandState, getTraceQuickCommandKindLabel, tracePanelText, locale, queuedCount, queueLimit]);
   const lastDiagnosisActivityStatusLabel = useMemo(() => {
-    if (!lastDiagnosisActivity) {
+    if (!diagnosisRuntimeEnabled || !lastDiagnosisActivity) {
       return null;
     }
     const kindLabel = getTraceQuickCommandKindLabel(lastDiagnosisActivity.kind);
     const statusLabel = getTraceQuickCommandStatusLabel(lastDiagnosisActivity.status);
     return `${kindLabel} | ${statusLabel}`;
-  }, [lastDiagnosisActivity, getTraceQuickCommandKindLabel, getTraceQuickCommandStatusLabel]);
+  }, [diagnosisRuntimeEnabled, lastDiagnosisActivity, getTraceQuickCommandKindLabel, getTraceQuickCommandStatusLabel]);
   const lastDiagnosisActivityAtText = useMemo(
     () =>
-      lastDiagnosisActivity
+      diagnosisRuntimeEnabled && lastDiagnosisActivity
         ? new Date(lastDiagnosisActivity.at).toLocaleTimeString(locale, { hour12: false })
         : null,
-    [lastDiagnosisActivity, locale],
+    [diagnosisRuntimeEnabled, lastDiagnosisActivity, locale],
   );
   const handlePrepareTraceSummaryCommand = useCallback(() => {
     focusComposerWithCommand(traceSummaryCommand);
@@ -5551,31 +6427,31 @@ export default function AgentWorkstationView({
     }
   }, [handleApplyTraceQueueDiagnosticsPreset, submitAgentQuery, traceQueueDiagnosticsCommand, tracePanelText]);
   const handlePrepareFallbackInvestigateCommand = useCallback(() => {
-    if (!currentThreadMeta || !fallbackInvestigateCommand) {
-      toast.warning(diffPanelText.diagnosisFallbackMissingThread);
+    if (!currentThreadMeta || !riskInvestigateCommand) {
+      toast.warning(diffPanelText.diagnosisRiskMissingThread);
       return;
     }
-    focusComposerWithCommand(fallbackInvestigateCommand);
+    focusComposerWithCommand(riskInvestigateCommand);
     setTraceQuickCommandState({
       kind: "fallback_investigate",
       status: "prepared",
-      command: fallbackInvestigateCommand,
+      command: riskInvestigateCommand,
       at: Date.now(),
     });
-    toast.success(diffPanelText.diagnosisFallbackPrepared);
+    toast.success(diffPanelText.diagnosisRiskPrepared);
   }, [
     currentThreadMeta,
-    fallbackInvestigateCommand,
+    riskInvestigateCommand,
     focusComposerWithCommand,
-    diffPanelText.diagnosisFallbackMissingThread,
-    diffPanelText.diagnosisFallbackPrepared,
+    diffPanelText.diagnosisRiskMissingThread,
+    diffPanelText.diagnosisRiskPrepared,
   ]);
   const handleRunFallbackInvestigateCommand = useCallback(() => {
-    if (!currentThreadMeta || !fallbackInvestigateCommand) {
-      toast.warning(diffPanelText.diagnosisFallbackMissingThread);
+    if (!currentThreadMeta || !riskInvestigateCommand) {
+      toast.warning(diffPanelText.diagnosisRiskMissingThread);
       return;
     }
-    const submitResult = submitAgentQuery(fallbackInvestigateCommand, {
+    const submitResult = submitAgentQuery(riskInvestigateCommand, {
       clearComposer: false,
       restoreComposerOnQueueReject: true,
       focusComposerOnQueueReject: true,
@@ -5584,30 +6460,30 @@ export default function AgentWorkstationView({
       setTraceQuickCommandState({
         kind: "fallback_investigate",
         status: submitResult.queued ? "queued" : "started",
-        command: fallbackInvestigateCommand,
+        command: riskInvestigateCommand,
         at: Date.now(),
         commandId: submitResult.commandId,
       });
       if (submitResult.queued) {
-        toast.info(diffPanelText.diagnosisFallbackQueued);
+        toast.info(diffPanelText.diagnosisRiskQueued);
       } else {
-        toast.success(diffPanelText.diagnosisFallbackStarted);
+        toast.success(diffPanelText.diagnosisRiskStarted);
       }
     } else if (submitResult.reason === "queue_full") {
       setTraceQuickCommandState({
         kind: "fallback_investigate",
         status: "queue_full",
-        command: fallbackInvestigateCommand,
+        command: riskInvestigateCommand,
         at: Date.now(),
       });
     }
   }, [
     currentThreadMeta,
-    fallbackInvestigateCommand,
+    riskInvestigateCommand,
     submitAgentQuery,
-    diffPanelText.diagnosisFallbackMissingThread,
-    diffPanelText.diagnosisFallbackQueued,
-    diffPanelText.diagnosisFallbackStarted,
+    diffPanelText.diagnosisRiskMissingThread,
+    diffPanelText.diagnosisRiskQueued,
+    diffPanelText.diagnosisRiskStarted,
   ]);
   const submitDiagnosisReplay = useCallback(
     (entry: Pick<TraceQuickCommandState, "kind" | "command">) => {
@@ -5668,6 +6544,24 @@ export default function AgentWorkstationView({
     submitDiagnosisReplay,
     diffPanelText.diagnosisReplayFailedMissing,
   ]);
+  const handlePrepareRecoverCommand = useCallback(
+    (command: string, kind: TraceQuickCommandKind) => {
+      focusComposerWithCommand(command);
+      setTraceQuickCommandState({
+        kind,
+        status: "prepared",
+        command,
+        at: Date.now(),
+      });
+    },
+    [focusComposerWithCommand],
+  );
+  const handleRunRecoverCommand = useCallback(
+    (command: string, kind: TraceQuickCommandKind) => {
+      submitDiagnosisReplay({ kind, command });
+    },
+    [submitDiagnosisReplay],
+  );
   const handlePrepareTraceInvestigateCommand = useCallback(() => {
     const built = buildTraceInvestigateCommand(false);
     if (!built) {
@@ -5758,6 +6652,17 @@ export default function AgentWorkstationView({
     [diagnosisQueuedCommandSet, setDiagnosisRunbookActionStatus],
   );
   const diagnosisRunbookActions = useMemo(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return [] as Array<{
+        id: string;
+        kind: TraceQuickCommandKind;
+        label: string;
+        command: string;
+        canRun: boolean;
+        onPrepare: () => void;
+        onRun: () => void;
+      }>;
+    }
     const investigateCommand = buildTraceInvestigateCommand(false)?.command ?? "";
     return [
       {
@@ -5834,18 +6739,18 @@ export default function AgentWorkstationView({
       {
         id: "fallback_investigate",
         kind: "fallback_investigate" as const,
-        label: diffPanelText.diagnosisFallbackRun,
-        command: fallbackInvestigateCommand,
-        canRun: fallbackInvestigateCommand.trim().length > 0,
+        label: diffPanelText.diagnosisRiskRun,
+        command: riskInvestigateCommand,
+        canRun: riskInvestigateCommand.trim().length > 0,
         onPrepare: buildDiagnosisRunbookActionHandler(
           "fallback_investigate",
-          fallbackInvestigateCommand,
+          riskInvestigateCommand,
           "prepared",
           handlePrepareFallbackInvestigateCommand,
         ),
         onRun: buildDiagnosisRunbookActionHandler(
           "fallback_investigate",
-          fallbackInvestigateCommand,
+          riskInvestigateCommand,
           "started",
           handleRunFallbackInvestigateCommand,
         ),
@@ -5860,8 +6765,8 @@ export default function AgentWorkstationView({
     traceSummaryCommand,
     traceHotspotsCommand,
     traceQueueDiagnosticsCommand,
-    diffPanelText.diagnosisFallbackRun,
-    fallbackInvestigateCommand,
+    diffPanelText.diagnosisRiskRun,
+    riskInvestigateCommand,
     buildDiagnosisRunbookActionHandler,
     handlePrepareTraceSummaryCommand,
     handleRunTraceSummaryCommand,
@@ -5873,10 +6778,28 @@ export default function AgentWorkstationView({
     handleInvestigateHottestTraceTool,
     handlePrepareFallbackInvestigateCommand,
     handleRunFallbackInvestigateCommand,
+    diagnosisRuntimeEnabled,
   ]);
   const diagnosisRecommendations = useMemo(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return [] as Array<{
+        id: DiagnosisRecommendationId;
+        label: string;
+        reason: string;
+        severity: "high" | "medium" | "low";
+        reversibility: PermissionReversibilityLevel;
+        blastRadius: PermissionBlastRadiusLevel;
+        matrixScore: number;
+        trendWeight: number;
+        priorityScore: number;
+        command: string;
+        canRun: boolean;
+        onPrepare: () => void;
+        onRun: () => void;
+      }>;
+    }
     const rows: Array<{
-      id: string;
+      id: DiagnosisRecommendationId;
       label: string;
       reason: string;
       severity: "high" | "medium" | "low";
@@ -5902,107 +6825,114 @@ export default function AgentWorkstationView({
         ? getDominantTracePermissionBlastRadius(currentThreadPermissionDiagnostics.profile)
         : null) ??
       "workspace";
-    const getRecommendationTrendWeight = (kind: TraceQuickCommandKind, command: string): number => {
-      const normalizedCommand = command.trim();
-      if (!normalizedCommand) {
-        return 0;
+    const getRecommendationTrendWeight = (kind: TraceQuickCommandKind, command: string): number =>
+      deriveDiagnosisTrendWeight({
+        history: diagnosisHistory,
+        kind,
+        command,
+        failedStatuses: DIAGNOSIS_HISTORY_FAILED_STATUS_SET,
+        maxWindow: 3,
+      });
+    const recoverPlanRequiresQueueHeal = recoverShouldRelieveQueueWithHeal;
+    const recoverRecommendationReversibility: PermissionReversibilityLevel = "reversible";
+    const recoverRecommendationBlastRadius: PermissionBlastRadiusLevel = "local";
+    const recoverRecommendationPresentations = deriveRecoverDoctorRecommendationPresentations(
+      recoverRunbook.recommendations,
+      {
+        shouldRelieveQueueWithHeal: recoverPlanRequiresQueueHeal,
+        hasFailureSignals: recoverHasFailureSignals,
+        failureTotal: recoverFailureTotal,
+        queueInvestigateCommand,
+      },
+    );
+    for (const presentation of recoverRecommendationPresentations) {
+      const recommendation = presentation.recommendation;
+      const descriptor = presentation.descriptor;
+      const command = presentation.resolvedCommand.trim();
+      if (!command) {
+        continue;
       }
-      const tool = extractTraceToolFromCommand(normalizedCommand);
-      const related = diagnosisHistory
-        .filter((item) => {
-          if (item.kind !== kind) return false;
-          if (!tool) return true;
-          return extractTraceToolFromCommand(item.command) === tool;
-        })
-        .sort((a, b) => b.at - a.at)
-        .slice(0, 3);
-      if (related.length < 2) {
-        return 0;
-      }
-      const latest = related[0];
-      const previous = related[1];
-      const latestFailed = DIAGNOSIS_HISTORY_FAILED_STATUS_SET.has(latest.status);
-      const previousFailed = DIAGNOSIS_HISTORY_FAILED_STATUS_SET.has(previous.status);
-      if (latestFailed && previousFailed) return 2;
-      if (!latestFailed && previousFailed) return -1;
-      if (latestFailed && !previousFailed) return 1;
-      return 0;
-    };
-    const getPriorityScore = (
-      severity: "high" | "medium" | "low",
-      matrixScore: number,
-      trendWeight: number,
-    ): number => {
-      const severityWeight = severity === "high" ? 3 : severity === "medium" ? 2 : 1;
-      return severityWeight * 5 + matrixScore * 2 + trendWeight;
-    };
-
-    if (cockpitQueuePressure === "saturated" || cockpitQueuePressure === "congested" || cockpitQueuePressure === "busy") {
-      const reversibility: PermissionReversibilityLevel = "reversible";
-      const blastRadius: PermissionBlastRadiusLevel = "local";
-      const trendWeight = getRecommendationTrendWeight("queue_diagnostics", traceQueueDiagnosticsCommand);
-      const matrixScore = getReversibilityMatrixScore(reversibility) + getBlastRadiusMatrixScore(blastRadius);
-      const severity: "high" | "medium" | "low" = cockpitQueuePressure === "busy" ? "medium" : "high";
+      const severity = presentation.severity;
+      const blueprint = buildRecoverDiagnosisRecommendationBlueprint({
+        recommendation,
+        label: translate(locale, descriptor.uiLabelKey),
+        reason: translate(locale, descriptor.uiReasonKey),
+        severity,
+        queueInvestigateTrendWeight: getRecommendationTrendWeight("queue_diagnostics", command),
+        recoverFailureTotal,
+        recoverHasFailureSignals,
+        command,
+        reversibility: recoverRecommendationReversibility,
+        blastRadius: recoverRecommendationBlastRadius,
+      });
       rows.push({
-        id: "queue",
+        ...blueprint,
+        onPrepare: () => {
+          focusComposerWithCommand(command);
+          setTraceQuickCommandState({
+            kind: descriptor.quickKind,
+            status: "prepared",
+            command,
+            at: Date.now(),
+          });
+        },
+        onRun: () => {
+          submitDiagnosisReplay({
+            kind: descriptor.quickKind,
+            command,
+          });
+        },
+      });
+    }
+
+    {
+      const queueBlueprint = buildQueueDiagnosisRecommendationBlueprint({
+        pressure: cockpitQueuePressure,
         label: tracePanelText.hotspotRunQueueDiagnostics,
         reason: diffPanelText.diagnosisRecommendationQueueReason,
-        severity,
-        reversibility,
-        blastRadius,
-        matrixScore,
-        trendWeight,
-        priorityScore: getPriorityScore(severity, matrixScore, trendWeight),
+        trendWeight: getRecommendationTrendWeight("queue_diagnostics", traceQueueDiagnosticsCommand),
         command: traceQueueDiagnosticsCommand,
-        canRun: traceQueueDiagnosticsCommand.trim().length > 0,
-        onPrepare: handlePrepareTraceQueueDiagnosticsCommand,
-        onRun: handleRunTraceQueueDiagnosticsCommand,
       });
+      if (queueBlueprint) {
+        rows.push({
+          ...queueBlueprint,
+          onPrepare: handlePrepareTraceQueueDiagnosticsCommand,
+          onRun: handleRunTraceQueueDiagnosticsCommand,
+        });
+      }
     }
 
     if (traceHotspotDiagnosisVisible && topTraceHotspot) {
       const investigateCommand = buildTraceInvestigateCommand(false)?.command ?? "";
-      const reversibility = dominantReversibility;
-      const blastRadius = dominantBlastRadius;
-      const severity: "high" | "medium" | "low" =
-        topTraceHotspot.errors > 0 || topTraceHotspot.denied > 0 ? "high" : "medium";
-      const matrixScore = getReversibilityMatrixScore(reversibility) + getBlastRadiusMatrixScore(blastRadius);
-      const trendWeight = getRecommendationTrendWeight("investigate", investigateCommand);
-      rows.push({
-        id: "hotspot",
+      const blueprint = buildHotspotDiagnosisRecommendationBlueprint({
         label: tracePanelText.hotspotInvestigate,
         reason: diffPanelText.diagnosisRecommendationHotspotReason.replace("{tool}", topTraceHotspot.tool),
-        severity,
-        reversibility,
-        blastRadius,
-        matrixScore,
-        trendWeight,
-        priorityScore: getPriorityScore(severity, matrixScore, trendWeight),
+        trendWeight: getRecommendationTrendWeight("investigate", investigateCommand),
         command: investigateCommand,
-        canRun: investigateCommand.trim().length > 0,
+        errors: topTraceHotspot.errors,
+        denied: topTraceHotspot.denied,
+        reversibility: dominantReversibility,
+        blastRadius: dominantBlastRadius,
+      });
+      rows.push({
+        ...blueprint,
         onPrepare: handlePrepareTraceInvestigateCommand,
         onRun: handleInvestigateHottestTraceTool,
       });
     }
 
     if (fallbackDiagnosisVisible) {
-      const reversibility = dominantReversibility;
-      const blastRadius = dominantBlastRadius;
-      const severity: "high" | "medium" | "low" = fallbackSuppressionRatioPct >= 50 ? "high" : "medium";
-      const matrixScore = getReversibilityMatrixScore(reversibility) + getBlastRadiusMatrixScore(blastRadius);
-      const trendWeight = getRecommendationTrendWeight("fallback_investigate", fallbackInvestigateCommand);
-      rows.push({
-        id: "fallback",
+      const blueprint = buildFallbackDiagnosisRecommendationBlueprint({
         label: diffPanelText.diagnosisFallbackRun,
         reason: diffPanelText.diagnosisRecommendationFallbackReason,
-        severity,
-        reversibility,
-        blastRadius,
-        matrixScore,
-        trendWeight,
-        priorityScore: getPriorityScore(severity, matrixScore, trendWeight),
+        trendWeight: getRecommendationTrendWeight("fallback_investigate", fallbackInvestigateCommand),
         command: fallbackInvestigateCommand,
-        canRun: fallbackInvestigateCommand.trim().length > 0,
+        suppressionRatioPct: fallbackSuppressionRatioPct,
+        reversibility: dominantReversibility,
+        blastRadius: dominantBlastRadius,
+      });
+      rows.push({
+        ...blueprint,
         onPrepare: handlePrepareFallbackInvestigateCommand,
         onRun: handleRunFallbackInvestigateCommand,
       });
@@ -6010,24 +6940,17 @@ export default function AgentWorkstationView({
 
     if (latestFailedDiagnosisHistoryEntry) {
       const failedCommand = latestFailedDiagnosisHistoryEntry.command.trim();
-      const reversibility: PermissionReversibilityLevel =
-        latestFailedDiagnosisHistoryEntry.kind === "summary" ? "reversible" : dominantReversibility;
-      const blastRadius: PermissionBlastRadiusLevel =
-        latestFailedDiagnosisHistoryEntry.kind === "summary" ? "local" : dominantBlastRadius;
-      const matrixScore = getReversibilityMatrixScore(reversibility) + getBlastRadiusMatrixScore(blastRadius);
-      const trendWeight = getRecommendationTrendWeight(latestFailedDiagnosisHistoryEntry.kind, failedCommand);
-      rows.push({
-        id: "replay_failed",
+      const blueprint = buildReplayFailedDiagnosisRecommendationBlueprint({
+        kind: latestFailedDiagnosisHistoryEntry.kind,
         label: diffPanelText.diagnosisReplayFailed,
         reason: diffPanelText.diagnosisRecommendationFailedReason,
-        severity: "high",
-        reversibility,
-        blastRadius,
-        matrixScore,
-        trendWeight,
-        priorityScore: getPriorityScore("high", matrixScore, trendWeight),
+        trendWeight: getRecommendationTrendWeight(latestFailedDiagnosisHistoryEntry.kind, failedCommand),
         command: failedCommand,
-        canRun: failedCommand.length > 0,
+        dominantReversibility,
+        dominantBlastRadius,
+      });
+      rows.push({
+        ...blueprint,
         onPrepare: () => {
           if (!failedCommand) {
             toast.warning(diffPanelText.diagnosisReplayFailedMissing);
@@ -6052,9 +6975,11 @@ export default function AgentWorkstationView({
       });
     }
 
-    rows.sort((a, b) => b.priorityScore - a.priorityScore || b.matrixScore - a.matrixScore || b.trendWeight - a.trendWeight);
+    rows.sort((a, b) => compareDiagnosisRecommendationPriority(a, b));
     return rows.slice(0, 4);
   }, [
+    diagnosisRuntimeEnabled,
+    locale,
     cockpitQueuePressure,
     tracePanelText.hotspotRunQueueDiagnostics,
     traceQueueDiagnosticsCommand,
@@ -6076,6 +7001,11 @@ export default function AgentWorkstationView({
     diffPanelText.diagnosisReplayFailed,
     diffPanelText.diagnosisReplayFailedMissing,
     diffPanelText.diagnosisReplayTemplateContextReady,
+    recoverRunbook.recommendations,
+    recoverFailureTotal,
+    recoverHasFailureSignals,
+    recoverShouldRelieveQueueWithHeal,
+    queueInvestigateCommand,
     fallbackDiagnosisVisible,
     fallbackSuppressionRatioPct,
     fallbackInvestigateCommand,
@@ -6088,7 +7018,107 @@ export default function AgentWorkstationView({
     buildReplayTemplateCommandWithContext,
     submitDiagnosisReplay,
   ]);
+  const recoverLadderSteps = useMemo(() => {
+    if (!recoverSnapshotVisible) {
+      return [] as Array<{
+        id: string;
+        label: string;
+        command: string;
+        canRun: boolean;
+        queued: boolean;
+        actionState: DiagnosisRunbookActionExecutionState | undefined;
+        onPrepare: () => void;
+        onRun: () => void;
+      }>;
+    }
+
+    const rows: Array<{
+      id: string;
+      label: string;
+      command: string;
+      canRun: boolean;
+      queued: boolean;
+      actionState: DiagnosisRunbookActionExecutionState | undefined;
+      onPrepare: () => void;
+      onRun: () => void;
+    }> = [];
+    const addStep = (options: {
+      id: string;
+      label: string;
+      command: string;
+      kind: TraceQuickCommandKind;
+      queued: boolean;
+    }) => {
+      const command = options.command.trim();
+      rows.push({
+        id: options.id,
+        label: options.label,
+        command: options.command,
+        canRun: command.length > 0,
+        queued: options.queued,
+        actionState: diagnosisRunbookActionStateById[options.id],
+        onPrepare: buildDiagnosisRunbookActionHandler(
+          options.id,
+          options.command,
+          "prepared",
+          () => handlePrepareRecoverCommand(options.command, options.kind),
+        ),
+        onRun: buildDiagnosisRunbookActionHandler(options.id, options.command, "started", () =>
+          handleRunRecoverCommand(options.command, options.kind),
+        ),
+      });
+    };
+
+    const queuedCommandSet = new Set(queuedQueries.map((item) => item.query.trim()));
+    for (const step of recoverRunbook.steps) {
+      const descriptor = getRecoverRunbookStepDescriptor(step);
+      const command = descriptor.command.trim();
+      if (!command) {
+        continue;
+      }
+      addStep({
+        id: `recover_ladder_${step}`,
+        label: translate(locale, descriptor.uiLabelKey),
+        command,
+        kind: descriptor.quickKind,
+        queued: queuedCommandSet.has(command),
+      });
+    }
+
+    return rows;
+  }, [
+    recoverSnapshotVisible,
+    recoverRunbook.steps,
+    queuedQueries,
+    locale,
+    diagnosisRunbookActionStateById,
+    buildDiagnosisRunbookActionHandler,
+    handlePrepareRecoverCommand,
+    handleRunRecoverCommand,
+  ]);
   const diagnosisFailureClusters = useMemo(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return [] as Array<{
+        key: string;
+        kind: TraceQuickCommandKind;
+        kindLabel: string;
+        tool: string | null;
+        status: TraceQuickCommandStatus;
+        statusLabel: string;
+        failureCount: number;
+        successCount: number;
+        totalCount: number;
+        trend: "improving" | "degrading" | "flaky" | "stable";
+        recoveryRatePct: number;
+        firstAt: number;
+        firstAtText: string;
+        lastAt: number;
+        lastAtText: string;
+        durationMinutes: number;
+        command: string;
+        events: Array<{ status: TraceQuickCommandStatus; at: number }>;
+      }>;
+    }
     const clusters = new Map<
       string,
       {
@@ -6114,7 +7144,7 @@ export default function AgentWorkstationView({
     >();
 
     for (const item of diagnosisHistory) {
-      const tool = extractTraceToolFromCommand(item.command);
+      const tool = extractDiagnosisCommandTool(item.command);
       const key = `${item.kind}:${tool ?? "-"}`;
       const existing = clusters.get(key);
       if (!existing) {
@@ -6189,8 +7219,20 @@ export default function AgentWorkstationView({
       })
       .sort((a, b) => b.failureCount - a.failureCount || b.lastAt - a.lastAt)
       .slice(0, 6);
-  }, [diagnosisHistory, getTraceQuickCommandKindLabel, getTraceQuickCommandStatusLabel, locale]);
+  }, [diagnosisRuntimeEnabled, diagnosisHistory, getTraceQuickCommandKindLabel, getTraceQuickCommandStatusLabel, locale]);
   const diagnosisReplayTemplates = useMemo(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return [] as Array<{
+        key: string;
+        kind: TraceQuickCommandKind;
+        kindLabel: string;
+        statusLabel: string;
+        command: string;
+        at: number;
+        atText: string;
+        riskScore: number;
+      }>;
+    }
     const seen = new Set<string>();
     const rows: Array<{
       key: string;
@@ -6225,8 +7267,11 @@ export default function AgentWorkstationView({
     }
 
     return rows.sort((a, b) => b.riskScore - a.riskScore || b.at - a.at).slice(0, 6);
-  }, [diagnosisHistorySorted, getTraceQuickCommandKindLabel, getTraceQuickCommandStatusLabel, locale]);
+  }, [diagnosisRuntimeEnabled, diagnosisHistorySorted, getTraceQuickCommandKindLabel, getTraceQuickCommandStatusLabel, locale]);
   const diagnosisReplayCompareReport = useMemo(() => {
+    if (!diagnosisRuntimeEnabled) {
+      return null;
+    }
     const grouped = new Map<string, TraceQuickCommandState[]>();
     for (const item of diagnosisHistory) {
       const command = item.command.trim();
@@ -6296,7 +7341,7 @@ export default function AgentWorkstationView({
     }
 
     return candidate;
-  }, [diagnosisHistory, getTraceQuickCommandKindLabel, getTraceQuickCommandStatusLabel, locale]);
+  }, [diagnosisRuntimeEnabled, diagnosisHistory, getTraceQuickCommandKindLabel, getTraceQuickCommandStatusLabel, locale]);
   const displayTraceRuns = useMemo(
     () => {
       if (!selectedTraceTool) {
@@ -6362,6 +7407,14 @@ export default function AgentWorkstationView({
       return changed ? next : prev;
     });
   }, [traceRunGroups]);
+  const showHeaderDiagnostics = SHOW_TRACE_PANEL && isTracePanelOpen;
+  const compactStatusDotClass = getStatusDotClass({
+    hasConnection,
+    isStalled: false,
+    hasActiveWork,
+    queuedCount,
+    queueLimit,
+  });
 
   return (
     <div className="relative flex h-full w-full flex-col bg-background text-foreground selection:bg-primary/10 overflow-hidden font-sans">
@@ -6369,7 +7422,7 @@ export default function AgentWorkstationView({
         <div className="flex items-center gap-3">
           <Terminal size={14} className="text-muted-foreground/70" />
           <h1 className="text-[13px] font-medium text-foreground/85">
-            {translate(locale, "agent.headerTitle")} 鐠?<span className="text-foreground/95" title={currentThreadName}>{compactThreadName}</span>{" "}
+            {translate(locale, "agent.headerTitle")} - <span className="text-foreground/95" title={currentThreadName}>{compactThreadName}</span>{" "}
             {effectiveWorkingDir && (
               <span className="text-[11px] text-muted-foreground/70 ml-1">@{effectiveWorkingDir}</span>
             )}
@@ -6377,83 +7430,89 @@ export default function AgentWorkstationView({
         </div>
 
         <div className="flex items-center gap-2.5">
-          <Badge variant="outline" className="h-6 text-[11px] px-2 border-border/50 text-muted-foreground/90 bg-background cursor-default">
-            {translate(locale, "agent.engineBadge")}
-          </Badge>
-          {toolCallCount > 0 && (
-            <Badge variant="outline" className="h-6 text-[11px] px-2 border-green-500/30 text-green-600 bg-green-500/5">
-              <Wrench size={11} className="mr-1" /> {toolCallCount} {translate(locale, "agent.toolRuns")}
+          {showHeaderDiagnostics ? (
+            <>
+              <Badge variant="outline" className="h-6 text-[11px] px-2 border-border/50 text-muted-foreground/90 bg-background cursor-default">
+                {translate(locale, "agent.engineBadge")}
+              </Badge>
+              {toolCallCount > 0 && (
+                <Badge variant="outline" className="h-6 text-[11px] px-2 border-green-500/30 text-green-600 bg-green-500/5">
+                  <Wrench size={11} className="mr-1" /> {toolCallCount} {translate(locale, "agent.toolRuns")}
+                </Badge>
+              )}
+              <ActivityStatusBadges
+                hasConnection={hasConnection}
+                hasActiveWork={hasActiveWork}
+                queuedCount={queuedCount}
+                queueLimit={queueLimit}
+                queueByPriority={queueByPriority}
+                runningTaskCount={runningTaskCount}
+                statusLabel={statusLabel}
+                queuePriorityCaption={translate(locale, "agent.metricQueuePriority")}
+                queuePriorityNowLabel={translate(locale, "agent.queue.priority.now")}
+                queuePriorityNextLabel={translate(locale, "agent.queue.priority.next")}
+                queuePriorityLaterLabel={translate(locale, "agent.queue.priority.later")}
+                queuePressureCaption={tracePanelText.queuePressureTitle}
+                queuePressureIdleLabel={tracePanelText.queuePressureIdle}
+                queuePressureBusyLabel={tracePanelText.queuePressureBusy}
+                queuePressureCongestedLabel={tracePanelText.queuePressureCongested}
+                queuePressureSaturatedLabel={tracePanelText.queuePressureSaturated}
+                lastActivityAt={lastUiActivityAtRef.current}
+                stalledLabel={translate(locale, "agent.trace.stall")}
+                continueLabel={lastContinueReasonLabel}
+                continueCaption={translate(locale, "agent.metricContinue")}
+                retryDiagnosticLabel={latestRetryDiagnosticLabel}
+                retryDiagnosticCaption={translate(locale, "agent.metricRetry")}
+                retryDiagnosticWarn={latestRetryDiagnosticWarn}
+                retryDiagnosticHint={translate(locale, "agent.trace.openRetryDiagnostics")}
+                onRetryDiagnosticClick={handleOpenRetryTraceDiagnostics}
+                latestEventLabel={latestStreamEventLabel}
+                latestEventCaption={translate(locale, "agent.trace.latest")}
+              />
+            </>
+          ) : (
+            <Badge variant="outline" className="h-6 px-2 text-[11px] border-border/50 text-foreground/80 bg-background">
+              <span className={cn("mr-1.5 h-1.5 w-1.5 rounded-full", compactStatusDotClass)} />
+              {statusLabel}
+              {queuedCount > 0 && (
+                <span className="ml-1 text-[10px] text-muted-foreground/75">
+                  {queueLimit > 0 ? `Q${queuedCount}/${queueLimit}` : `Q${queuedCount}`}
+                </span>
+              )}
             </Badge>
           )}
-          <ActivityStatusBadges
-            hasConnection={hasConnection}
-            hasActiveWork={hasActiveWork}
-            queuedCount={queuedCount}
-            queueLimit={queueLimit}
-            queueByPriority={queueByPriority}
-            runningTaskCount={runningTaskCount}
-            statusLabel={statusLabel}
-            queuePriorityCaption={translate(locale, "agent.metricQueuePriority")}
-            queuePriorityNowLabel={translate(locale, "agent.queue.priority.now")}
-            queuePriorityNextLabel={translate(locale, "agent.queue.priority.next")}
-            queuePriorityLaterLabel={translate(locale, "agent.queue.priority.later")}
-            queuePressureCaption={tracePanelText.queuePressureTitle}
-            queuePressureIdleLabel={tracePanelText.queuePressureIdle}
-            queuePressureBusyLabel={tracePanelText.queuePressureBusy}
-            queuePressureCongestedLabel={tracePanelText.queuePressureCongested}
-            queuePressureSaturatedLabel={tracePanelText.queuePressureSaturated}
-            lastActivityAt={lastUiActivityAtRef.current}
-            stalledLabel={translate(locale, "agent.trace.stall")}
-            continueLabel={lastContinueReasonLabel}
-            continueCaption={translate(locale, "agent.metricContinue")}
-            retryDiagnosticLabel={latestRetryDiagnosticLabel}
-            retryDiagnosticCaption={translate(locale, "agent.metricRetry")}
-            retryDiagnosticWarn={latestRetryDiagnosticWarn}
-            retryDiagnosticHint={translate(locale, "agent.trace.openRetryDiagnostics")}
-            onRetryDiagnosticClick={handleOpenRetryTraceDiagnostics}
-            latestEventLabel={latestStreamEventLabel}
-            latestEventCaption={translate(locale, "agent.trace.latest")}
-          />
+          {SHOW_TRACE_PANEL && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className={cn(
+                "h-8 w-8 rounded-md border border-border/50 bg-background hover:bg-muted",
+                isTracePanelOpen && "border-primary/35 text-primary",
+              )}
+              onClick={handleToggleTracePanel}
+              title={isTracePanelOpen ? tracePanelText.close : tracePanelText.open}
+            >
+              <ListTree size={14} />
+            </Button>
+          )}
+          {SHOW_CONSOLE_PANEL && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className={cn(
+                "h-8 w-8 rounded-md border border-border/50 bg-background hover:bg-muted",
+                isConsolePanelOpen && "border-primary/35 text-primary",
+              )}
+              onClick={handleToggleConsolePanel}
+              title={isConsolePanelOpen ? consoleText.close : consoleText.open}
+            >
+              <Terminal size={14} />
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="icon"
-            className={cn(
-              "h-8 w-8 rounded-md border border-border/50 bg-background hover:bg-muted",
-              isTracePanelOpen && "border-primary/35 text-primary",
-            )}
-            onClick={handleToggleTracePanel}
-            title={isTracePanelOpen ? tracePanelText.close : tracePanelText.open}
-          >
-            <ListTree size={14} />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className={cn(
-              "h-8 w-8 rounded-md border border-border/50 bg-background hover:bg-muted",
-              isConsolePanelOpen && "border-primary/35 text-primary",
-            )}
-            onClick={handleToggleConsolePanel}
-            title={isConsolePanelOpen ? consoleText.close : consoleText.open}
-          >
-            <Terminal size={14} />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className={cn(
-              "h-8 w-8 rounded-md border border-border/50 bg-background hover:bg-muted",
-              isSidebarPanelOpen && "border-primary/35 text-primary",
-            )}
-            onClick={toggleSidebarPanel}
-            title={isSidebarPanelOpen ? translate(locale, "agent.sidebarCollapse") : translate(locale, "agent.sidebarTitle")}
-          >
-            {isSidebarPanelOpen ? <ChevronLeft size={14} /> : <ChevronRight size={14} />}
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8 rounded-md border border-border/50 bg-background hover:bg-muted"
+            className="h-8 w-8 rounded-md bg-background hover:bg-muted"
             onClick={toggleDiffPanel}
             title={isDiffPanelOpen ? diffPanelText.close : diffPanelText.open}
           >
@@ -6461,7 +7520,7 @@ export default function AgentWorkstationView({
           </Button>
         </div>
       </header>
-      {isTracePanelOpen && (
+      {SHOW_TRACE_PANEL && isTracePanelOpen && (
         <div className="shrink-0 border-b border-border/40 bg-background/90">
           <div className="flex items-center justify-between px-4 py-2">
             <div className="text-[11px] font-medium text-muted-foreground/85">
@@ -7312,13 +8371,15 @@ export default function AgentWorkstationView({
                       {translate(locale, "agent.permission.prompt.title")}
                     </div>
                     <div className="flex items-center gap-2">
-                      <button
-                        onClick={handleOpenPermissionTraceDiagnostics}
-                        className="rounded-md border border-border/40 bg-background px-2 py-1 text-[10px] text-muted-foreground/90 transition-colors hover:bg-muted hover:text-foreground"
-                        title={translate(locale, "agent.permission.prompt.openTraceHint")}
-                      >
-                        {translate(locale, "agent.permission.prompt.openTrace")}
-                      </button>
+                      {SHOW_TRACE_PANEL && (
+                        <button
+                          onClick={handleOpenPermissionTraceDiagnostics}
+                          className="rounded-md border border-border/40 bg-background px-2 py-1 text-[10px] text-muted-foreground/90 transition-colors hover:bg-muted hover:text-foreground"
+                          title={translate(locale, "agent.permission.prompt.openTraceHint")}
+                        >
+                          {translate(locale, "agent.permission.prompt.openTrace")}
+                        </button>
+                      )}
                       {pendingPermissionCount > 1 && (
                         <Badge variant="outline" className="h-5 border-border/40 text-[10px]">
                           {translate(locale, "agent.permission.prompt.queue", { count: pendingPermissionCount })}
@@ -7432,6 +8493,7 @@ export default function AgentWorkstationView({
               queuedItems={queuedQueries}
               onRemoveQueuedItem={handleRemoveQueuedQuery}
               onEditQueuedItem={handleEditQueuedQuery}
+              onChangeQueuedItemPriority={handleChangeQueuedQueryPriority}
               queuedCount={queuedCount}
               queueLimit={queueLimit}
               queueByPriority={queueByPriority}
@@ -7470,212 +8532,214 @@ export default function AgentWorkstationView({
               !isDiffPanelOpen && "border-l-0"
             )}
           >
-            <div className="flex h-11 shrink-0 items-center justify-between px-3">
-              <div className="flex min-w-0 items-center gap-2 text-[12px] font-semibold text-foreground/85">
-                <DropdownMenu open={isDiffScopeMenuOpen} onOpenChange={setIsDiffScopeMenuOpen}>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-7 max-w-[170px] gap-1 px-2 text-[12px] font-medium text-foreground/85"
-                    >
-                      <span className="truncate">{diffScopeLabel}</span>
-                      {isDiffScopeMenuOpen ? (
-                        <ChevronRight size={12} className="shrink-0 text-muted-foreground/70" />
-                      ) : (
-                        <ChevronDown size={12} className="shrink-0 text-muted-foreground/70" />
-                      )}
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start" className="w-[180px]">
-                    <DropdownMenuRadioGroup
-                      value={diffScope}
-                      onValueChange={(value) => setDiffScope(value as typeof diffScope)}
-                    >
-                      <DropdownMenuRadioItem value="unstaged">
-                        {diffPanelText.scopeUnstaged}
-                      </DropdownMenuRadioItem>
-                      <DropdownMenuRadioItem value="staged">
-                        {diffPanelText.scopeStaged}
-                      </DropdownMenuRadioItem>
-                      <DropdownMenuRadioItem value="allBranches">
-                        {diffPanelText.scopeAllBranches}
-                      </DropdownMenuRadioItem>
-                      <DropdownMenuRadioItem value="lastRound">
-                        {diffPanelText.scopeLastRound}
-                      </DropdownMenuRadioItem>
-                    </DropdownMenuRadioGroup>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </div>
-              <div className="flex items-center gap-1">
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7 rounded-md text-muted-foreground/80 hover:text-foreground"
-                  onClick={() => {
-                    void loadGitSnapshot();
-                  }}
-                  title={diffPanelText.refresh}
-                  disabled={gitSnapshotLoading}
-                >
-                  <RefreshCw
-                    size={13}
-                    className={cn(gitSnapshotLoading && "animate-spin")}
-                  />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7 rounded-md text-muted-foreground/80 hover:text-foreground"
-                  onClick={() => {
-                    void handleOpenRewindPreview();
-                  }}
-                  title={diffPanelText.rewindPreview}
-                  disabled={!effectiveWorkingDir || !currentThreadId || rewindPreviewLoading}
-                >
-                  <AlertTriangle
-                    size={13}
-                    className={cn(rewindPreviewLoading && "animate-pulse")}
-                  />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7 rounded-md text-muted-foreground/80 hover:text-foreground"
-                  onClick={toggleDiffPanelExpand}
-                  title={isDiffPanelExpanded ? diffPanelText.restore : diffPanelText.expand}
-                >
-                  {isDiffPanelExpanded ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
-                </Button>
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
+            {isDiffPanelOpen ? (
+              <>
+                <div className="flex h-11 shrink-0 items-center justify-between px-3">
+                  <div className="flex min-w-0 items-center gap-2 text-[12px] font-semibold text-foreground/85">
+                    <DropdownMenu open={isDiffScopeMenuOpen} onOpenChange={setIsDiffScopeMenuOpen}>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 max-w-[170px] gap-1 px-2 text-[12px] font-medium text-foreground/85"
+                        >
+                          <span className="truncate">{diffScopeLabel}</span>
+                          {isDiffScopeMenuOpen ? (
+                            <ChevronRight size={12} className="shrink-0 text-muted-foreground/70" />
+                          ) : (
+                            <ChevronDown size={12} className="shrink-0 text-muted-foreground/70" />
+                          )}
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="start" className="w-[180px]">
+                        <DropdownMenuRadioGroup
+                          value={diffScope}
+                          onValueChange={(value) => setDiffScope(value as typeof diffScope)}
+                        >
+                          <DropdownMenuRadioItem value="unstaged">
+                            {diffPanelText.scopeUnstaged}
+                          </DropdownMenuRadioItem>
+                          <DropdownMenuRadioItem value="staged">
+                            {diffPanelText.scopeStaged}
+                          </DropdownMenuRadioItem>
+                          <DropdownMenuRadioItem value="allBranches">
+                            {diffPanelText.scopeAllBranches}
+                          </DropdownMenuRadioItem>
+                          <DropdownMenuRadioItem value="lastRound">
+                            {diffPanelText.scopeLastRound}
+                          </DropdownMenuRadioItem>
+                        </DropdownMenuRadioGroup>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </div>
+                  <div className="flex items-center gap-1">
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 rounded-md text-muted-foreground/80 hover:text-foreground data-[state=open]:text-foreground"
-                      title={diffPanelText.menu}
+                      className="h-7 w-7 rounded-md text-muted-foreground/80 hover:text-foreground"
+                      onClick={() => {
+                        void loadGitSnapshot();
+                      }}
+                      title={diffPanelText.refresh}
+                      disabled={gitSnapshotLoading}
                     >
-                      <MoreHorizontal size={13} />
+                      <RefreshCw
+                        size={13}
+                        className={cn(gitSnapshotLoading && "animate-spin")}
+                      />
                     </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-[220px]">
-                    <DropdownMenuItem onSelect={() => { void loadGitSnapshot(); }}>
-                      {diffPanelText.refresh}
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      disabled={!effectiveWorkingDir || !currentThreadId || rewindPreviewLoading}
-                      onSelect={() => {
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 rounded-md text-muted-foreground/80 hover:text-foreground"
+                      onClick={() => {
                         void handleOpenRewindPreview();
                       }}
+                      title={diffPanelText.rewindPreview}
+                      disabled={!effectiveWorkingDir || !currentThreadId || rewindPreviewLoading}
                     >
-                      {diffPanelText.rewindPreview}
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onSelect={() => {
-                        setDiffSplitViewEnabled((prev) => !prev);
-                      }}
+                      <AlertTriangle
+                        size={13}
+                        className={cn(rewindPreviewLoading && "animate-pulse")}
+                      />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 rounded-md text-muted-foreground/80 hover:text-foreground"
+                      onClick={toggleDiffPanelExpand}
+                      title={isDiffPanelExpanded ? diffPanelText.restore : diffPanelText.expand}
                     >
-                      {diffPanelText.splitView}
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onSelect={() => {
-                        setDiffWordWrapEnabled((prev) => !prev);
-                      }}
-                    >
-                      {diffPanelText.disableWrap}
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onSelect={() => {
-                        setDiffCollapsedAll((prev) => !prev);
-                      }}
-                    >
-                      {diffPanelText.collapseAll}
-                    </DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem
-                      onSelect={() => {
-                        setDiffLoadFullFileEnabled((prev) => !prev);
-                      }}
-                    >
-                      {diffPanelText.noFullFile}
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onSelect={() => {
-                        setDiffRichTextPreviewEnabled((prev) => !prev);
-                      }}
-                    >
-                      {diffPanelText.richPreview}
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onSelect={() => {
-                        setDiffTextDiffEnabled((prev) => !prev);
-                      }}
-                    >
-                      {diffPanelText.disableTextDiff}
-                    </DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem
-                      disabled={!canCopyGitApplyCommand}
-                      onSelect={() => {
-                        void handleCopyGitApplyCommand();
-                      }}
-                    >
-                      {diffPanelText.copyGitApply}
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </div>
-            </div>
+                      {isDiffPanelExpanded ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+                    </Button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 rounded-md text-muted-foreground/80 hover:text-foreground data-[state=open]:text-foreground"
+                          title={diffPanelText.menu}
+                        >
+                          <MoreHorizontal size={13} />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="w-[220px]">
+                        <DropdownMenuItem onSelect={() => { void loadGitSnapshot(); }}>
+                          {diffPanelText.refresh}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          disabled={!effectiveWorkingDir || !currentThreadId || rewindPreviewLoading}
+                          onSelect={() => {
+                            void handleOpenRewindPreview();
+                          }}
+                        >
+                          {diffPanelText.rewindPreview}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onSelect={() => {
+                            setDiffSplitViewEnabled((prev) => !prev);
+                          }}
+                        >
+                          {diffPanelText.splitView}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onSelect={() => {
+                            setDiffWordWrapEnabled((prev) => !prev);
+                          }}
+                        >
+                          {diffPanelText.disableWrap}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onSelect={() => {
+                            setDiffCollapsedAll((prev) => !prev);
+                          }}
+                        >
+                          {diffPanelText.collapseAll}
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          onSelect={() => {
+                            setDiffLoadFullFileEnabled((prev) => !prev);
+                          }}
+                        >
+                          {diffPanelText.noFullFile}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onSelect={() => {
+                            setDiffRichTextPreviewEnabled((prev) => !prev);
+                          }}
+                        >
+                          {diffPanelText.richPreview}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onSelect={() => {
+                            setDiffTextDiffEnabled((prev) => !prev);
+                          }}
+                        >
+                          {diffPanelText.disableTextDiff}
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          disabled={!canCopyGitApplyCommand}
+                          onSelect={() => {
+                            void handleCopyGitApplyCommand();
+                          }}
+                        >
+                          {diffPanelText.copyGitApply}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </div>
+                </div>
 
-            <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden px-3 py-3">
-              {!effectiveWorkingDir ? (
-                <div className="flex h-full min-h-[220px] items-center justify-center bg-background/60 p-4 text-center">
-                  <div className="max-w-[260px] space-y-3">
-                    <FilePlus2 size={46} className="mx-auto text-muted-foreground/45" />
-                    <div className="text-[16px] font-medium text-foreground/90">{diffPanelText.initRepo}</div>
-                    <div className="text-[12px] text-muted-foreground/80">{diffPanelText.initRepoHint}</div>
-                    <div className="text-[12px] text-muted-foreground/70">{diffPanelText.noWorkspace}</div>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-8 rounded-xl bg-muted/55 px-3.5 text-[12px]"
-                      onClick={() => {
-                        void handleCreateGitRepository();
-                      }}
-                    >
-                      {diffPanelText.initRepo}
-                    </Button>
-                  </div>
-                </div>
-              ) : gitSnapshotLoading ? (
-                <div className="rounded-lg border border-border/40 bg-background/70 p-3 text-[12px] text-muted-foreground/85">
-                  {diffPanelText.loading}
-                </div>
-              ) : gitSnapshotError ? (
-                <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-[12px] text-destructive">
-                  {gitSnapshotError}
-                </div>
-              ) : !gitSnapshot?.is_git_repo ? (
-                <div className="flex h-full min-h-[220px] items-center justify-center bg-background/60 p-4 text-center">
-                  <div className="max-w-[260px] space-y-3">
-                    <FilePlus2 size={46} className="mx-auto text-muted-foreground/45" />
-                    <div className="text-[16px] font-medium text-foreground/90">{diffPanelText.initRepo}</div>
-                    <div className="text-[12px] text-muted-foreground/80">{diffPanelText.initRepoHint}</div>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-8 rounded-xl bg-muted/55 px-3.5 text-[12px]"
-                      onClick={() => {
-                        void handleCreateGitRepository();
-                      }}
-                    >
-                      {diffPanelText.initRepo}
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                <div className="min-w-0 space-y-3">
+                <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden px-3 py-3">
+                  {!effectiveWorkingDir ? (
+                    <div className="flex h-full min-h-[220px] items-center justify-center bg-background/60 p-4 text-center">
+                      <div className="max-w-[260px] space-y-3">
+                        <FilePlus2 size={46} className="mx-auto text-muted-foreground/45" />
+                        <div className="text-[16px] font-medium text-foreground/90">{diffPanelText.initRepo}</div>
+                        <div className="text-[12px] text-muted-foreground/80">{diffPanelText.initRepoHint}</div>
+                        <div className="text-[12px] text-muted-foreground/70">{diffPanelText.noWorkspace}</div>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-8 rounded-xl bg-muted/55 px-3.5 text-[12px]"
+                          onClick={() => {
+                            void handleCreateGitRepository();
+                          }}
+                        >
+                          {diffPanelText.initRepo}
+                        </Button>
+                      </div>
+                    </div>
+                  ) : gitSnapshotLoading ? (
+                    <div className="rounded-lg border border-border/40 bg-background/70 p-3 text-[12px] text-muted-foreground/85">
+                      {diffPanelText.loading}
+                    </div>
+                  ) : gitSnapshotError ? (
+                    <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-[12px] text-destructive">
+                      {gitSnapshotError}
+                    </div>
+                  ) : !gitSnapshot?.is_git_repo ? (
+                    <div className="flex h-full min-h-[220px] items-center justify-center bg-background/60 p-4 text-center">
+                      <div className="max-w-[260px] space-y-3">
+                        <FilePlus2 size={46} className="mx-auto text-muted-foreground/45" />
+                        <div className="text-[16px] font-medium text-foreground/90">{diffPanelText.initRepo}</div>
+                        <div className="text-[12px] text-muted-foreground/80">{diffPanelText.initRepoHint}</div>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-8 rounded-xl bg-muted/55 px-3.5 text-[12px]"
+                          onClick={() => {
+                            void handleCreateGitRepository();
+                          }}
+                        >
+                          {diffPanelText.initRepo}
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="min-w-0 space-y-3">
                   {diagnosisCockpitVisible && (
                     <div className="rounded-lg border border-primary/20 bg-primary/5 p-3">
                       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -7743,6 +8807,99 @@ export default function AgentWorkstationView({
                           </p>
                         </div>
                       </div>
+                      {recoverSnapshotVisible && (
+                        <div className="mt-2 rounded border border-border/30 bg-background/60 px-2 py-1.5">
+                          <div className="mb-1 text-[10px] text-muted-foreground/70">
+                            {diffPanelText.diagnosisRecoveryTitle}
+                          </div>
+                          <div className="text-[9px] text-muted-foreground/80">{recoverSnapshotSummaryText}</div>
+                          {recoverSnapshotQueuedId && (
+                            <div className="mt-0.5 text-[9px] text-muted-foreground/75">
+                              {diffPanelText.diagnosisRecoveryQueuedId.replace("{id}", recoverSnapshotQueuedId)}
+                            </div>
+                          )}
+                          <div className="mt-0.5 text-[9px] text-muted-foreground/75">{recoverSnapshotFailureText}</div>
+                          <div className="mt-1.5 text-[10px] text-muted-foreground/70">
+                            {translate(locale, "agent.command.doctor.recoveryLadderTitle")}
+                          </div>
+                          <div className="mt-1 space-y-1">
+                            {recoverLadderSteps.map((step, index) => {
+                              const actionStatusLabel = step.actionState
+                                ? getTraceQuickCommandStatusLabel(step.actionState.status)
+                                : null;
+                              const actionAtText = step.actionState
+                                ? new Date(step.actionState.at).toLocaleTimeString(locale, { hour12: false })
+                                : null;
+                              return (
+                                <div key={step.id} className="rounded border border-border/30 bg-background/70 px-1.5 py-1">
+                                  <div className="flex flex-wrap items-center justify-between gap-1 text-[9px]">
+                                    <div className="flex flex-wrap items-center gap-1">
+                                      <span className="rounded border border-border/35 bg-muted/40 px-1 py-0.5 text-muted-foreground/80">
+                                        {index + 1}
+                                      </span>
+                                      <span className="rounded border border-border/35 bg-muted/40 px-1 py-0.5 text-muted-foreground/85">
+                                        {step.label}
+                                      </span>
+                                      {step.queued && (
+                                        <span className="rounded border border-amber-500/45 bg-amber-500/10 px-1 py-0.5 text-amber-700 dark:text-amber-300">
+                                          {tracePanelText.commandStatusQueued}
+                                        </span>
+                                      )}
+                                      {actionStatusLabel && (
+                                        <span className="rounded border border-border/35 bg-muted/40 px-1 py-0.5 text-muted-foreground/80">
+                                          {actionStatusLabel}
+                                        </span>
+                                      )}
+                                      {actionAtText && (
+                                        <span className="rounded border border-border/35 bg-muted/40 px-1 py-0.5 text-muted-foreground/70">
+                                          {actionAtText}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="flex items-center gap-1">
+                                      <button
+                                        type="button"
+                                        className={cn(
+                                          "rounded border px-1 py-0.5 text-[9px] transition-colors",
+                                          step.canRun
+                                            ? "border-border/35 bg-background/70 text-muted-foreground/85 hover:text-foreground"
+                                            : "cursor-not-allowed border-border/20 bg-muted/40 text-muted-foreground/45",
+                                        )}
+                                        disabled={!step.canRun}
+                                        onClick={step.onPrepare}
+                                      >
+                                        {diffPanelText.diagnosisActionPrepare}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className={cn(
+                                          "rounded border px-1 py-0.5 text-[9px] transition-colors",
+                                          step.canRun
+                                            ? "border-primary/45 bg-primary/10 text-foreground"
+                                            : "cursor-not-allowed border-border/20 bg-muted/40 text-muted-foreground/45",
+                                        )}
+                                        disabled={!step.canRun}
+                                        onClick={step.onRun}
+                                      >
+                                        {diffPanelText.diagnosisActionRun}
+                                      </button>
+                                    </div>
+                                  </div>
+                                  <div
+                                    className={cn(
+                                      "mt-0.5 font-mono text-[9px] text-muted-foreground/75",
+                                      diffWordWrapEnabled ? "break-all" : "truncate",
+                                    )}
+                                    title={!diffWordWrapEnabled ? step.command : undefined}
+                                  >
+                                    {step.command}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
                       <div className="mt-2 rounded border border-border/30 bg-background/60 px-2 py-1.5">
                         <div className="mb-1 text-[10px] text-muted-foreground/70">
                           {diffPanelText.diagnosisRecommendationsTitle}
@@ -8479,6 +9636,13 @@ export default function AgentWorkstationView({
                                   .replace("{depth}", cockpitQueueDepthLabel)}
                               </span>
                             </div>
+                            {cockpitRecordedQueueInfo && (
+                              <div className="mt-1 space-y-0.5 font-mono text-[9px] text-amber-700/80 dark:text-amber-300/85">
+                                <div>{cockpitRecordedQueueInfo.summary}</div>
+                                <div>{cockpitRecordedQueueInfo.reasons}</div>
+                                <div>{cockpitRecordedQueueInfo.priority}</div>
+                              </div>
+                            )}
                             <div className="mt-1 grid gap-0.5 text-muted-foreground/90">
                               <p>
                                 <span className="text-[9px] uppercase tracking-wide">{tracePanelText.diagnosisRootCause}</span>{" "}
@@ -8508,7 +9672,30 @@ export default function AgentWorkstationView({
                               >
                                 {tracePanelText.hotspotRunQueueDiagnostics}
                               </button>
+                              {queueInvestigateCommand && (
+                                <>
+                                  <button
+                                    type="button"
+                                    className="rounded border border-border/35 bg-background/70 px-1.5 py-0.5 text-[9px] text-muted-foreground/85 transition-colors hover:text-foreground"
+                                    onClick={handlePrepareFallbackInvestigateCommand}
+                                  >
+                                    {diffPanelText.diagnosisRiskPrepare}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="rounded border border-border/35 bg-background/70 px-1.5 py-0.5 text-[9px] text-muted-foreground/85 transition-colors hover:text-foreground"
+                                    onClick={handleRunFallbackInvestigateCommand}
+                                  >
+                                    {diffPanelText.diagnosisRiskRun}
+                                  </button>
+                                </>
+                              )}
                               {traceQueueDiagnosticsQueued && (
+                                <span className="rounded border border-amber-500/45 bg-amber-500/10 px-1.5 py-0.5 text-[9px] text-amber-700 dark:text-amber-300">
+                                  {tracePanelText.commandStatusQueued}
+                                </span>
+                              )}
+                              {queueInvestigateQueued && (
                                 <span className="rounded border border-amber-500/45 bg-amber-500/10 px-1.5 py-0.5 text-[9px] text-amber-700 dark:text-amber-300">
                                   {tracePanelText.commandStatusQueued}
                                 </span>
@@ -8604,14 +9791,14 @@ export default function AgentWorkstationView({
                                 className="rounded border border-border/35 bg-background/70 px-1.5 py-0.5 text-[9px] text-muted-foreground/85 transition-colors hover:text-foreground"
                                 onClick={handlePrepareFallbackInvestigateCommand}
                               >
-                                {diffPanelText.diagnosisFallbackPrepare}
+                                {diffPanelText.diagnosisRiskPrepare}
                               </button>
                               <button
                                 type="button"
                                 className="rounded border border-border/35 bg-background/70 px-1.5 py-0.5 text-[9px] text-muted-foreground/85 transition-colors hover:text-foreground"
                                 onClick={handleRunFallbackInvestigateCommand}
                               >
-                                {diffPanelText.diagnosisFallbackRun}
+                                {diffPanelText.diagnosisRiskRun}
                               </button>
                               {fallbackInvestigateQueued && (
                                 <span className="rounded border border-amber-500/45 bg-amber-500/10 px-1.5 py-0.5 text-[9px] text-amber-700 dark:text-amber-300">
@@ -8631,138 +9818,51 @@ export default function AgentWorkstationView({
                         )}
                     </div>
                   )}
-                  <div className="rounded-lg border border-border/40 bg-background/70 p-3">
-                    <div className="text-[11px] text-muted-foreground/70">{diffPanelText.branch}</div>
-                    <div
-                      className={cn(
-                        "mt-1 min-w-0 font-mono text-[12px]",
-                        diffWordWrapEnabled ? "break-all" : "truncate"
-                      )}
-                      title={!diffWordWrapEnabled ? diffBranch : undefined}
-                    >
-                      {diffBranch}
-                      <span
-                        className={cn(
-                          "ml-2 text-muted-foreground/70",
-                          diffWordWrapEnabled ? "break-all" : "truncate"
-                        )}
-                        title={!diffWordWrapEnabled ? diffBaseBranch : undefined}
-                      >
-                        ({diffBaseBranch})
-                      </span>
-                    </div>
-                    {diffUpdatedText && (
-                      <div className="mt-1 text-[10px] text-muted-foreground/70">
-                        {diffPanelText.updatedAt}: {diffUpdatedText}
+                  <Suspense
+                    fallback={
+                      <div className="rounded-lg border border-border/40 bg-background/70 p-3 text-[12px] text-muted-foreground/75">
+                        {diffPanelText.loading}
                       </div>
-                    )}
-                  </div>
-
-                  <div className={cn("grid gap-3", useTwoColumnDiffLayout ? "grid-cols-2" : "grid-cols-1")}>
-                    <div className="rounded-lg border border-border/40 bg-background/70 p-3">
-                      <div className="mb-2 flex items-center justify-between gap-2">
-                        <div className="text-[11px] text-muted-foreground/70">
-                          {diffPanelText.changed} ({visibleDiffChangedFiles.length})
-                        </div>
-                        {!diffLoadFullFileEnabled && (
-                          <div className="text-[10px] text-muted-foreground/60">{diffPanelText.noFullFile}</div>
-                        )}
-                      </div>
-                      {!diffTextDiffEnabled ? (
-                        <div className="text-[12px] text-muted-foreground/80">{diffPanelText.textDiffDisabledHint}</div>
-                      ) : diffCollapsedAll ? (
-                        <div className="text-[12px] text-muted-foreground/80">{diffPanelText.collapsedHint}</div>
-                      ) : visibleDiffChangedFiles.length === 0 ? (
-                        <div className="text-[12px] text-muted-foreground/80">
-                          {diffScope === "lastRound" ? diffPanelText.noLastRoundChanges : diffPanelText.clean}
-                        </div>
-                      ) : (
-                        <div className="space-y-1.5">
-                          {visibleDiffChangedFiles.map((entry, index) => (
-                            <div
-                              key={`${entry.code}:${entry.path}:${index}`}
-                              className="flex min-w-0 items-start gap-2 rounded-md border border-border/30 px-2 py-1.5"
-                            >
-                              <span className="w-6 shrink-0 font-mono text-[11px] text-primary/80">
-                                {entry.code}
-                              </span>
-                              <span
-                                className={cn(
-                                  "min-w-0 font-mono text-[11px] text-foreground/85",
-                                  diffWordWrapEnabled ? "break-all" : "truncate"
-                                )}
-                                title={!diffWordWrapEnabled ? entry.path : undefined}
-                              >
-                                {entry.path}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
+                    }
+                  >
+                    <DiffGitSummarySection
+                      diffWordWrapEnabled={diffWordWrapEnabled}
+                      diffCollapsedAll={diffCollapsedAll}
+                      diffLoadFullFileEnabled={diffLoadFullFileEnabled}
+                      diffTextDiffEnabled={diffTextDiffEnabled}
+                      diffRichTextPreviewEnabled={diffRichTextPreviewEnabled}
+                      visibleDiffChangedFiles={visibleDiffChangedFiles}
+                      diffScope={diffScope}
+                      gitSnapshot={gitSnapshot as RuntimeGitSnapshotView}
+                      diffBranch={diffBranch}
+                      diffBaseBranch={diffBaseBranch}
+                      diffUpdatedText={diffUpdatedText}
+                      useTwoColumnDiffLayout={useTwoColumnDiffLayout}
+                      text={{
+                        branch: diffPanelText.branch,
+                        updatedAt: diffPanelText.updatedAt,
+                        changed: diffPanelText.changed,
+                        noFullFile: diffPanelText.noFullFile,
+                        textDiffDisabledHint: diffPanelText.textDiffDisabledHint,
+                        collapsedHint: diffPanelText.collapsedHint,
+                        noLastRoundChanges: diffPanelText.noLastRoundChanges,
+                        clean: diffPanelText.clean,
+                        commits: diffPanelText.commits,
+                        richPreview: diffPanelText.richPreview,
+                        noCommits: diffPanelText.noCommits,
+                      }}
+                    />
+                  </Suspense>
                     </div>
-
-                    <div className="rounded-lg border border-border/40 bg-background/70 p-3">
-                      <div className="mb-2 flex items-center justify-between gap-2">
-                        <div className="text-[11px] text-muted-foreground/70">{diffPanelText.commits}</div>
-                        {diffRichTextPreviewEnabled && (
-                          <div className="text-[10px] text-muted-foreground/60">{diffPanelText.richPreview}</div>
-                        )}
-                      </div>
-                      {diffCollapsedAll ? (
-                        <div className="text-[12px] text-muted-foreground/80">{diffPanelText.collapsedHint}</div>
-                      ) : (
-                        <div className="space-y-1.5">
-                          {(gitSnapshot.recent_commits.length > 0
-                            ? gitSnapshot.recent_commits
-                            : [diffPanelText.noCommits]
-                          ).map((line, index) => {
-                            const trimmed = line.trim();
-                            const [hash, ...restParts] = trimmed.split(" ");
-                            const message = restParts.join(" ").trim();
-                            if (diffRichTextPreviewEnabled && hash && message) {
-                              return (
-                                <div
-                                  key={`${line}:${index}`}
-                                  className="rounded-md border border-border/30 bg-background/60 px-2 py-1.5"
-                                >
-                                  <div className="font-mono text-[10px] text-primary/80">{hash}</div>
-                                  <div
-                                    className={cn(
-                                      "text-[11px] text-foreground/85",
-                                      diffWordWrapEnabled ? "break-all" : "truncate"
-                                    )}
-                                    title={!diffWordWrapEnabled ? message : undefined}
-                                  >
-                                    {message}
-                                  </div>
-                                </div>
-                              );
-                            }
-                            return (
-                              <div
-                                key={`${line}:${index}`}
-                                className={cn(
-                                  "font-mono text-[11px] text-foreground/80",
-                                  diffWordWrapEnabled ? "break-all" : "truncate"
-                                )}
-                                title={!diffWordWrapEnabled ? line : undefined}
-                              >
-                                {line}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  </div>
+                  )}
                 </div>
-              )}
-            </div>
+              </>
+            ) : null}
           </ResizablePanel>
         </ResizablePanelGroup>
       </div>
 
-      {isConsolePanelOpen && (
+      {SHOW_CONSOLE_PANEL && isConsolePanelOpen && (
         <div className="shrink-0 border-t border-border/40 bg-background/95">
           <div className="flex items-center justify-between px-4 py-2">
             <div className="flex items-center gap-2 text-[12px] font-semibold text-foreground/85">

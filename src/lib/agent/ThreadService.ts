@@ -33,6 +33,62 @@ export interface ThreadPermissionDiagnostics {
   profile: ThreadPermissionRiskProfileDiagnostics;
 }
 
+export type ThreadQueuePressure = "idle" | "busy" | "congested" | "saturated";
+
+export interface ThreadQueuePriorityDiagnostics {
+  now: number;
+  next: number;
+  later: number;
+}
+
+export interface ThreadQueueReasonDiagnostics {
+  capacity: number;
+  stale: number;
+  manual: number;
+  deduplicated: number;
+}
+
+export interface ThreadQueueDiagnostics {
+  queue_limit: number;
+  latest_depth: number;
+  max_depth: number;
+  pressure: ThreadQueuePressure;
+  queued_count: number;
+  dequeued_count: number;
+  rejected_count: number;
+  deduplicated_count: number;
+  reason: ThreadQueueReasonDiagnostics;
+  queued_priority: ThreadQueuePriorityDiagnostics;
+  dequeued_priority: ThreadQueuePriorityDiagnostics;
+  rejected_priority: ThreadQueuePriorityDiagnostics;
+}
+
+export type ThreadRecoverState = "none" | "awaiting_assistant" | "assistant_incomplete";
+export type ThreadRecoverPlan = "none" | "queued_recovery" | "resume_now" | "heal_then_resume";
+
+export interface ThreadRecoveryFailureDiagnostics {
+  query_end_aborted: number;
+  query_end_error: number;
+  query_end_max_iterations: number;
+  query_end_stop_hook_prevented: number;
+  lifecycle_failed: number;
+  lifecycle_aborted: number;
+}
+
+export interface ThreadRecoveryDiagnostics {
+  state: ThreadRecoverState;
+  plan: ThreadRecoverPlan;
+  interrupted_message_id?: string | null;
+  queued_recovery_id?: string | null;
+  queue_count: number;
+  queue_limit: number;
+  pressure: ThreadQueuePressure;
+  failure: ThreadRecoveryFailureDiagnostics;
+  failure_total?: number;
+  queue_rejected_count?: number;
+  queue_deduplicated_count?: number;
+}
+
 export interface ThreadDiagnosisActivity {
   kind: string;
   status: string;
@@ -44,6 +100,8 @@ export interface ThreadDiagnosisActivity {
 export interface ThreadDiagnostics {
   retry: ThreadRetryDiagnostics;
   permission?: ThreadPermissionDiagnostics;
+  queue?: ThreadQueueDiagnostics;
+  recovery?: ThreadRecoveryDiagnostics;
   diagnosis_activity?: ThreadDiagnosisActivity;
   diagnosis_history?: ThreadDiagnosisActivity[];
   updated_at: number;

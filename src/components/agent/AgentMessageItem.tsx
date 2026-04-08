@@ -1,4 +1,4 @@
-import { Suspense, lazy, memo } from "react";
+import { Suspense, lazy, memo, useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { AgentStep } from "@/components/agent/AgentStep";
@@ -8,6 +8,19 @@ import { translate } from "@/lib/i18n";
 import type { AgentMessage } from "@/lib/agent/QueryEngine";
 
 const LazyMarkdownBlock = lazy(() => import("@/components/ui/MarkdownBlock"));
+const RICH_MARKDOWN_HINT_RE =
+  /```|`[^`\n]+`|(^|\n)\s*#{1,6}\s|(^|\n)\s*[-*+]\s|(^|\n)\s*\d+\.\s|(^|\n)\s*>\s|\[[^\]]+\]\([^)]+\)|(^|\n)\s*\|.+\|/m;
+const STREAMING_MARKDOWN_PLAIN_THRESHOLD_CHARS = 1_600;
+
+function shouldUseMarkdownRenderer(content: string): boolean {
+  if (!content) {
+    return false;
+  }
+  if (content.length > 1200) {
+    return true;
+  }
+  return RICH_MARKDOWN_HINT_RE.test(content);
+}
 
 interface AgentMessageItemProps {
   message: AgentMessage;
@@ -21,11 +34,26 @@ interface AgentMessageItemProps {
 function AgentMessageItemImpl({ message, previousCallArgsByTool }: AgentMessageItemProps) {
   const { uiFontSize } = useThemeStore();
   const { locale } = useLocaleStore();
-  const previousCallArgumentsByTool = new Map<string, string>(
-    Object.entries(previousCallArgsByTool ?? {}),
+  const previousCallArgumentsByTool = useMemo(
+    () => new Map<string, string>(Object.entries(previousCallArgsByTool ?? {})),
+    [previousCallArgsByTool],
   );
   const isUser = message.role === "user";
   const messageFontSize = isUser ? uiFontSize + 1.5 : uiFontSize + 0.5;
+  const useMarkdownRenderer = useMemo(
+    () => shouldUseMarkdownRenderer(message.content),
+    [message.content],
+  );
+  const isStreamingAssistant = !isUser && message.status === "running";
+  const shouldUseMarkdownBlock = useMemo(() => {
+    if (!useMarkdownRenderer) return false;
+    if (!isStreamingAssistant) return true;
+    return message.content.length <= STREAMING_MARKDOWN_PLAIN_THRESHOLD_CHARS;
+  }, [useMarkdownRenderer, isStreamingAssistant, message.content.length]);
+  const roleLabel = useMemo(
+    () => (isUser ? translate(locale, "agent.taskInstruction") : translate(locale, "agent.assistant")),
+    [isUser, locale],
+  );
 
   return (
     <div
@@ -43,9 +71,7 @@ function AgentMessageItemImpl({ message, previousCallArgsByTool }: AgentMessageI
             )}
             style={{ fontSize: `${uiFontSize - 1}px` }}
           >
-            {isUser
-              ? translate(locale, "agent.taskInstruction")
-              : translate(locale, "agent.assistant")}
+            {roleLabel}
           </span>
           {message.status === "rejected" && (
             <Badge variant="outline" className="h-4 text-[8px] px-1 border-amber-500/40 text-amber-600">
@@ -90,14 +116,18 @@ function AgentMessageItemImpl({ message, previousCallArgsByTool }: AgentMessageI
           )}
           style={{ fontSize: `${messageFontSize}px` }}
         >
-          <Suspense
-            fallback={<div className="whitespace-pre-wrap break-words">{message.content}</div>}
-          >
-            <LazyMarkdownBlock
-              content={message.content}
-              isStreaming={message.status === "running"}
-            />
-          </Suspense>
+          {shouldUseMarkdownBlock ? (
+            <Suspense
+              fallback={<div className="whitespace-pre-wrap break-words">{message.content}</div>}
+            >
+              <LazyMarkdownBlock
+                content={message.content}
+                isStreaming={message.status === "running"}
+              />
+            </Suspense>
+          ) : (
+            <div className="whitespace-pre-wrap break-words">{message.content}</div>
+          )}
         </div>
       </div>
     </div>

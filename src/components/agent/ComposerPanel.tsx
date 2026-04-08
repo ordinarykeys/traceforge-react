@@ -6,7 +6,6 @@ import {
   ChevronDown,
   Coins,
   CornerUpLeft,
-  Monitor,
   Square,
   Trash2,
 } from "lucide-react";
@@ -15,7 +14,6 @@ import { useLocaleStore } from "@/hooks/useLocaleStore";
 import { translate } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Badge } from "@/components/ui/badge";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -46,9 +44,10 @@ interface ComposerPanelProps {
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
   toolNames: string[];
   slashCommands: SlashCommandDescriptor[];
-  queuedItems: QueuedQueryItem[];
+  queuedItems: readonly QueuedQueryItem[];
   onRemoveQueuedItem: (queueId: string) => void;
   onEditQueuedItem: (queueId: string) => void;
+  onChangeQueuedItemPriority: (queueId: string, priority: QueuePriority) => void;
   queuedCount: number;
   queueLimit: number;
   queueByPriority: Readonly<Record<QueuePriority, number>>;
@@ -104,6 +103,7 @@ export function ComposerPanel({
   queuedItems,
   onRemoveQueuedItem,
   onEditQueuedItem,
+  onChangeQueuedItemPriority,
   queuedCount,
   queueLimit,
   queueByPriority,
@@ -180,6 +180,7 @@ export function ComposerPanel({
   const visibleQueuedItems = useMemo(() => queuedItems.slice(0, 3), [queuedItems]);
   const queuedOverflowCount = Math.max(0, queuedItems.length - visibleQueuedItems.length);
   const [queueNow, setQueueNow] = useState(() => Date.now());
+  const [isQueuePreviewExpanded, setIsQueuePreviewExpanded] = useState(false);
 
   useEffect(() => {
     if (queuedItems.length === 0) {
@@ -194,12 +195,23 @@ export function ComposerPanel({
     };
   }, [queuedItems.length]);
 
+  useEffect(() => {
+    if (queuedItems.length === 0) {
+      setIsQueuePreviewExpanded(false);
+    }
+  }, [queuedItems.length]);
+
   const formatQueuedAge = (queuedAt: number) => {
     const seconds = Math.max(0, Math.floor((queueNow - queuedAt) / 1000));
     return translate(locale, "agent.queue.waiting", { seconds });
   };
   const formatQueuePriority = (priority: QueuePriority) => {
     return translate(locale, `agent.queue.priority.${priority}`);
+  };
+  const cycleQueuePriority = (priority: QueuePriority): QueuePriority => {
+    if (priority === "now") return "next";
+    if (priority === "next") return "later";
+    return "now";
   };
   const queuePrioritySummary = useMemo(() => {
     const order: QueuePriority[] = ["now", "next", "later"];
@@ -287,56 +299,84 @@ export function ComposerPanel({
       {queuedItems.length > 0 && (
         <div className="max-w-3xl w-full px-2">
           <div className="rounded-xl border border-border/50 bg-muted/20 p-2">
-            <div className="mb-1 px-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/70">
-              {translate(locale, "agent.queue.previewTitle", { count: queuedItems.length })}
-            </div>
-            {queuePrioritySummary && (
-              <div className="mb-1 px-1 text-[10px] text-muted-foreground/70">{queuePrioritySummary}</div>
-            )}
-            <div className="space-y-1">
-              {visibleQueuedItems.map((item, index) => (
-                <div
-                  key={item.id}
-                  className="flex items-center justify-between gap-2 rounded-md border border-border/40 bg-background/70 px-2 py-1.5"
-                >
-                  <div className="min-w-0 flex-1 text-[12px] text-foreground/85">
-                    <div className="mb-0.5 flex items-center gap-2 text-[10px] text-muted-foreground/70">
-                      <span className="font-mono">#{index + 1}</span>
-                      <span>{formatQueuedAge(item.queuedAt)}</span>
-                      <Badge variant="outline" className="h-4 px-1.5 text-[9px] leading-none">
-                        {formatQueuePriority(item.priority)}
-                      </Badge>
-                    </div>
-                    <span className="block truncate">{item.query}</span>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-6 px-2 text-[10px] text-muted-foreground/80 hover:bg-muted/50"
-                      onClick={() => onEditQueuedItem(item.id)}
-                      title={translate(locale, "agent.queue.action.edit")}
-                    >
-                      <CornerUpLeft size={11} className="mr-1" />
-                      {translate(locale, "agent.queue.action.edit")}
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-6 w-6 text-muted-foreground/70 hover:bg-destructive/10 hover:text-destructive"
-                      onClick={() => onRemoveQueuedItem(item.id)}
-                      title={translate(locale, "agent.queue.action.remove")}
-                    >
-                      <Trash2 size={12} />
-                    </Button>
-                  </div>
+            <button
+              type="button"
+              className="flex w-full items-center justify-between rounded-md px-1 py-1 text-left transition-colors hover:bg-background/40"
+              onClick={() => setIsQueuePreviewExpanded((prev) => !prev)}
+              title={translate(locale, "agent.queue.previewTitle", { count: queuedItems.length })}
+            >
+              <div className="min-w-0">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/70">
+                  {translate(locale, "agent.queue.previewTitle", { count: queuedItems.length })}
                 </div>
-              ))}
-            </div>
-            {queuedOverflowCount > 0 && (
-              <div className="mt-1 px-1 text-[10px] text-muted-foreground/70">
-                {translate(locale, "agent.queue.previewOverflow", { count: queuedOverflowCount })}
+                {queuePrioritySummary && (
+                  <div className="text-[10px] text-muted-foreground/70">{queuePrioritySummary}</div>
+                )}
               </div>
+              <ChevronDown
+                size={13}
+                className={cn(
+                  "ml-2 shrink-0 text-muted-foreground/75 transition-transform",
+                  isQueuePreviewExpanded && "rotate-180",
+                )}
+              />
+            </button>
+            {isQueuePreviewExpanded && (
+              <>
+                <div className="mt-1 space-y-1">
+                  {visibleQueuedItems.map((item, index) => (
+                    <div
+                      key={item.id}
+                      className="flex items-center justify-between gap-2 rounded-md border border-border/40 bg-background/70 px-2 py-1.5"
+                    >
+                      <div className="min-w-0 flex-1 text-[12px] text-foreground/85">
+                        <div className="mb-0.5 flex items-center gap-2 text-[10px] text-muted-foreground/70">
+                          <span className="font-mono">#{index + 1}</span>
+                          <span>{formatQueuedAge(item.queuedAt)}</span>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-4 rounded border border-border/50 px-1.5 text-[9px] leading-none text-muted-foreground/85 hover:bg-muted/60"
+                            onClick={() =>
+                              onChangeQueuedItemPriority(item.id, cycleQueuePriority(item.priority))
+                            }
+                            title={translate(locale, "agent.metricQueuePriority")}
+                          >
+                            {formatQueuePriority(item.priority)}
+                          </Button>
+                        </div>
+                        <span className="block truncate">{item.query}</span>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-2 text-[10px] text-muted-foreground/80 hover:bg-muted/50"
+                          onClick={() => onEditQueuedItem(item.id)}
+                          title={translate(locale, "agent.queue.action.edit")}
+                        >
+                          <CornerUpLeft size={11} className="mr-1" />
+                          {translate(locale, "agent.queue.action.edit")}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-6 w-6 text-muted-foreground/70 hover:bg-destructive/10 hover:text-destructive"
+                          onClick={() => onRemoveQueuedItem(item.id)}
+                          title={translate(locale, "agent.queue.action.remove")}
+                        >
+                          <Trash2 size={12} />
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                {queuedOverflowCount > 0 && (
+                  <div className="mt-1 px-1 text-[10px] text-muted-foreground/70">
+                    {translate(locale, "agent.queue.previewOverflow", { count: queuedOverflowCount })}
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -510,37 +550,10 @@ export function ComposerPanel({
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 text-[10px] text-muted-foreground/50 hover:bg-muted flex items-center gap-2 px-2 rounded-lg bg-muted/20"
-            >
-              <Monitor size={12} className="opacity-70" /> {translate(locale, "agent.engineReady")}: {toolCount}
-              <ChevronDown size={10} />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="w-[200px] bg-card/95 border-border/50">
-            {toolNames.map((toolName) => (
-              <DropdownMenuItem key={toolName} className="text-[11px] font-mono">
-                {translate(locale, "agent.toolPrefix")}: {toolName}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
-
-        {queuedCount > 0 && (
-          <Badge
-            variant="outline"
-            className="h-7 text-[10px] px-2.5 font-bold border-yellow-500/30 text-yellow-500 bg-yellow-500/5 animate-pulse flex items-center gap-1.5 rounded-lg shrink-0"
-          >
-            <div className="h-1.5 w-1.5 rounded-full bg-yellow-500" />
-            {translate(locale, "agent.queue")}: {queueLimit > 0 ? `${queuedCount}/${queueLimit}` : queuedCount}
-          </Badge>
-        )}
-
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              variant="ghost"
-              size="sm"
               className="h-7 text-[10px] text-muted-foreground/50 hover:bg-muted flex items-center gap-2 px-2 rounded-lg bg-muted/20 shrink-0"
+              title={`${translate(locale, "agent.engineReady")}: ${toolCount} · ${translate(locale, "agent.queue")}: ${
+                queueLimit > 0 ? `${queuedCount}/${queueLimit}` : queuedCount
+              }`}
             >
               <Activity size={12} className="opacity-70" /> {permissionLabel}
               <span className="rounded border border-border/40 px-1 font-mono text-[9px] opacity-70">

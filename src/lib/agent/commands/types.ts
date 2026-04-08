@@ -1,6 +1,12 @@
 import type { PermissionRule } from "../permissions/toolPermissions";
 import type { AgentTaskManager } from "../tasks/TaskManager";
-import type { AgentMessage, QueuePriority, UsageSnapshot } from "../QueryEngine";
+import type {
+  AgentMessage,
+  QueuePriority,
+  QueuedQueryItem,
+  ToolCallBudgetPolicy,
+  UsageSnapshot,
+} from "../QueryEngine";
 import type { QueryStreamEvent } from "../query/events";
 import type { AppLocale, TranslationKey } from "@/lib/i18n";
 
@@ -37,8 +43,13 @@ export interface CommandContext {
   getMessages: () => AgentMessage[];
   getUsageSnapshot: () => UsageSnapshot;
   resetUsageSnapshot: () => void;
+  getToolCallBudgetPolicy: () => ToolCallBudgetPolicy;
+  setToolCallBudgetPolicy: (patch: Partial<ToolCallBudgetPolicy> | null) => ToolCallBudgetPolicy;
   getRecentQueryEvents: (limit?: number) => QueryStreamEvent[];
   clearQueryEvents: () => void;
+  getQueuedQueries: () => QueuedQueryItem[];
+  setQueuedQueryPriority: (queueId: string, priority: QueuePriority) => boolean;
+  removeQueuedQuery: (queueId: string) => boolean;
   submitFollowupQuery: (
     query: string,
     options?: {

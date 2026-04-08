@@ -2,6 +2,44 @@ import { z } from "zod";
 import { invoke } from "@tauri-apps/api/core";
 import type { Tool, ToolContext } from "../types";
 
+const SHELL_TIMEOUT_MIN_MS = 1_000;
+const SHELL_TIMEOUT_DEFAULT_MS = 120_000;
+const SHELL_TIMEOUT_LONG_TASK_MS = 600_000;
+const SHELL_TIMEOUT_MAX_MS = 30 * 60_000;
+
+function clampShellTimeoutMs(value: number): number {
+  if (!Number.isFinite(value)) return SHELL_TIMEOUT_DEFAULT_MS;
+  const rounded = Math.round(value);
+  if (rounded < SHELL_TIMEOUT_MIN_MS) return SHELL_TIMEOUT_MIN_MS;
+  if (rounded > SHELL_TIMEOUT_MAX_MS) return SHELL_TIMEOUT_MAX_MS;
+  return rounded;
+}
+
+function inferShellTimeoutMs(cmd: string, args: string[]): number {
+  const joined = `${cmd} ${args.join(" ")}`.toLowerCase();
+  if (
+    /\b(npm|pnpm|yarn|bun|cargo|rustc|go|dotnet|gradle|mvn|msbuild|pytest|jest|vitest|playwright|webpack|vite|tsc)\b/.test(
+      joined,
+    )
+  ) {
+    return SHELL_TIMEOUT_LONG_TASK_MS;
+  }
+  if (/\bgit\s+(clone|fetch|pull|gc|fsck|submodule)\b/.test(joined)) {
+    return 300_000;
+  }
+  if (/\b(rg|ripgrep|grep|findstr)\b/.test(joined) && /(--glob|-g|-r|--recursive)/.test(joined)) {
+    return 240_000;
+  }
+  return SHELL_TIMEOUT_DEFAULT_MS;
+}
+
+function resolveShellTimeoutMs(rawTimeoutMs: unknown, cmd: string, args: string[]): number {
+  if (typeof rawTimeoutMs === "number") {
+    return clampShellTimeoutMs(rawTimeoutMs);
+  }
+  return clampShellTimeoutMs(inferShellTimeoutMs(cmd, args));
+}
+
 /**
  * ShellTool: High-performance shell executor via Rust/Tokio
  * Used for: file operations, grep/find searches, general CLI tasks
@@ -13,7 +51,10 @@ export const ShellTool: Tool<any, any> = {
     cmd: z.string().describe("The command to execute (e.g., 'grep', 'find', 'cat')"),
     args: z.array(z.string()).optional().describe("Arguments for the command"),
     cwd: z.string().optional().describe("Working directory for the command"),
-    timeout_ms: z.number().optional().describe("Optional timeout in milliseconds (default: 30000)")
+    timeout_ms: z
+      .number()
+      .optional()
+      .describe("Optional timeout in milliseconds (adaptive default: 120000, long tasks up to 600000)")
   }),
   jsonSchema: {
     type: "object",
@@ -21,7 +62,10 @@ export const ShellTool: Tool<any, any> = {
       cmd: { type: "string", description: "The command to execute (e.g., 'grep', 'find', 'cat')" },
       args: { type: "array", items: { type: "string" }, description: "Arguments for the command" },
       cwd: { type: "string", description: "Working directory for the command" },
-      timeout_ms: { type: "number", description: "Optional timeout in milliseconds (default: 30000)" }
+      timeout_ms: {
+        type: "number",
+        description: "Optional timeout in milliseconds (adaptive default: 120000, long tasks up to 600000)",
+      }
     },
     required: ["cmd"]
   },
@@ -38,14 +82,24 @@ export const ShellTool: Tool<any, any> = {
       context.log(`[Shell] auto-fix: prepended "/c" for cmd`);
     }
 
-    const timeoutMs = params.timeout_ms || 30000;
-    const workingDirForCommand = params.cwd || context.workingDir || null;
+    const timeoutMs = resolveShellTimeoutMs(params.timeout_ms, cmd, args);
+    const cwdInput = params.cwd || context.workingDir || "";
+    if (!cwdInput.trim()) {
+      throw new Error(buildWorkspaceGuardError("shell", "(missing cwd)", getWorkspaceRoots(context)));
+    }
+    const workingDirForCommand = ensureWorkspacePath(cwdInput, context, "shell cwd");
+    const scopedShellContext: ToolContext = {
+      ...context,
+      workingDir: workingDirForCommand,
+    };
+    const referencedPaths = extractShellPathCandidates(cmd, args);
+    for (const referencedPath of referencedPaths) {
+      ensureWorkspacePath(referencedPath, scopedShellContext, "shell path");
+    }
+
     const deleteTargetRaw = detectDeleteTargetFromShell(cmd, args);
     const deleteTargetPath = deleteTargetRaw
-      ? resolveWorkspacePath(deleteTargetRaw, {
-          ...context,
-          workingDir: workingDirForCommand || context.workingDir,
-        })
+      ? ensureWorkspacePath(deleteTargetRaw, scopedShellContext, "shell delete target")
       : null;
     const deletedFileBefore = deleteTargetPath
       ? await readFileTextForPreview(deleteTargetPath)
@@ -116,7 +170,7 @@ export const FileReadTool: Tool<any, any> = {
   isReadOnly: true,
   maxOutputChars: 50000,
   call: async (params, context: ToolContext) => {
-    const resolvedPath = resolveWorkspacePath(params.path, context);
+    const resolvedPath = ensureWorkspacePath(params.path, context, "file_read");
     const lineRange = params.start_line ? ` (lines ${params.start_line}-${params.end_line || 'end'})` : '';
     context.log(`[FileRead] ${resolvedPath}${lineRange}`);
 
@@ -148,22 +202,144 @@ function isAbsolutePathLike(path: string): boolean {
 }
 
 function normalizeRuntimePath(path: string): string {
-  return path.replace(/\\/g, "/");
+  const normalized = path.replace(/\\/g, "/").trim();
+  if (normalized.startsWith("//")) {
+    return `//${normalized.slice(2).replace(/\/+/g, "/")}`;
+  }
+  return normalized.replace(/\/+/g, "/");
+}
+
+function canonicalizeRuntimePath(path: string): string {
+  const normalized = normalizeRuntimePath(path);
+  if (!normalized) {
+    return normalized;
+  }
+
+  const driveMatch = normalized.match(/^[a-zA-Z]:/);
+  const hasUncPrefix = normalized.startsWith("//");
+  const hasUnixRoot = !driveMatch && !hasUncPrefix && normalized.startsWith("/");
+
+  let prefix = "";
+  let remainder = normalized;
+  if (driveMatch) {
+    prefix = driveMatch[0].toLowerCase();
+    remainder = normalized.slice(driveMatch[0].length);
+  } else if (hasUncPrefix) {
+    prefix = "//";
+    remainder = normalized.slice(2);
+  } else if (hasUnixRoot) {
+    prefix = "/";
+    remainder = normalized.slice(1);
+  }
+
+  const segments = remainder.split("/");
+  const stack: string[] = [];
+  for (const segment of segments) {
+    if (!segment || segment === ".") {
+      continue;
+    }
+    if (segment === "..") {
+      if (stack.length > 0 && stack[stack.length - 1] !== "..") {
+        stack.pop();
+      } else if (!prefix) {
+        stack.push("..");
+      }
+      continue;
+    }
+    stack.push(segment);
+  }
+
+  const joined = stack.join("/");
+  if (driveMatch) {
+    return joined ? `${prefix}/${joined}` : `${prefix}/`;
+  }
+  if (hasUncPrefix) {
+    return joined ? `//${joined}` : "//";
+  }
+  if (hasUnixRoot) {
+    return joined ? `/${joined}` : "/";
+  }
+  return joined || ".";
+}
+
+function normalizePathForCompare(path: string): string {
+  return canonicalizeRuntimePath(path).toLowerCase();
+}
+
+function dedupeRoots(paths: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const path of paths) {
+    const normalized = normalizePathForCompare(path);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    output.push(canonicalizeRuntimePath(path));
+  }
+  return output;
+}
+
+function getWorkspaceRoots(context: ToolContext): string[] {
+  const appState = context.getAppState?.() ?? {};
+  const additionalWorkingDirectories = Array.isArray(appState.additionalWorkingDirectories)
+    ? appState.additionalWorkingDirectories.filter((value: unknown): value is string => typeof value === "string")
+    : [];
+  const candidates = [
+    context.workingDir,
+    typeof appState.workingDir === "string" ? appState.workingDir : undefined,
+    ...additionalWorkingDirectories,
+  ]
+    .filter((value): value is string => Boolean(value && value.trim().length > 0))
+    .map((value) => canonicalizeRuntimePath(value))
+    .filter((value) => isAbsolutePathLike(value));
+  return dedupeRoots(candidates);
+}
+
+function isPathWithinWorkspaceRoots(path: string, roots: string[]): boolean {
+  if (roots.length === 0) {
+    return false;
+  }
+  const normalizedPath = normalizePathForCompare(path);
+  if (!isAbsolutePathLike(normalizedPath)) {
+    return false;
+  }
+  return roots.some((root) => {
+    const normalizedRoot = normalizePathForCompare(root).replace(/\/+$/, "");
+    return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
+  });
+}
+
+function buildWorkspaceGuardError(operation: string, path: string, roots: string[]): string {
+  if (roots.length === 0) {
+    return `[WorkspaceGuard] Blocked ${operation}: no workspace is bound. Select a workspace first.`;
+  }
+  const rootLines = roots.map((root) => `- ${root}`).join("\n");
+  return `[WorkspaceGuard] Blocked ${operation}: "${path}" is outside workspace boundaries.\nAllowed roots:\n${rootLines}`;
+}
+
+function ensureWorkspacePath(path: string, context: ToolContext, operation: string): string {
+  const resolved = resolveWorkspacePath(path, context);
+  const roots = getWorkspaceRoots(context);
+  if (!isPathWithinWorkspaceRoots(resolved, roots)) {
+    throw new Error(buildWorkspaceGuardError(operation, resolved, roots));
+  }
+  return resolved;
 }
 
 function resolveWorkspacePath(path: string, context: ToolContext): string {
   const trimmed = path.trim();
   if (!trimmed) return trimmed;
   if (isAbsolutePathLike(trimmed)) {
-    return normalizeRuntimePath(trimmed);
+    return canonicalizeRuntimePath(trimmed);
   }
-  const workspace = (context.workingDir || "").trim();
-  if (!workspace) {
-    return normalizeRuntimePath(trimmed);
+  const workspace = canonicalizeRuntimePath((context.workingDir || "").trim());
+  if (!workspace || workspace === ".") {
+    return canonicalizeRuntimePath(trimmed);
   }
-  const base = normalizeRuntimePath(workspace).replace(/\/+$/, "");
-  const rel = normalizeRuntimePath(trimmed).replace(/^\.\/+/, "").replace(/^\/+/, "");
-  return `${base}/${rel}`;
+  const base = workspace.replace(/\/+$/, "");
+  const rel = canonicalizeRuntimePath(trimmed).replace(/^\.\/+/, "").replace(/^\/+/, "");
+  return canonicalizeRuntimePath(`${base}/${rel}`);
 }
 
 function splitLines(text: string): string[] {
@@ -265,6 +441,64 @@ function normalizeShellToken(token: string): string {
     return trimmed.slice(1, -1).trim();
   }
   return trimmed;
+}
+
+function looksLikePathToken(token: string): boolean {
+  const normalized = normalizeShellToken(token);
+  if (!normalized) {
+    return false;
+  }
+  if (/^\/[a-z?]{1,2}$/i.test(normalized)) {
+    return false;
+  }
+  if (normalized.startsWith("-")) {
+    return false;
+  }
+  if (isAbsolutePathLike(normalized)) {
+    return true;
+  }
+  if (normalized === "." || normalized === "..") {
+    return true;
+  }
+  if (normalized.startsWith("./") || normalized.startsWith("../")) {
+    return true;
+  }
+  return normalized.includes("/") || normalized.includes("\\");
+}
+
+function extractShellPathCandidates(cmd: string, args: string[]): string[] {
+  const normalizedArgs = args.map((arg) => normalizeShellToken(arg)).filter(Boolean);
+  const command = cmd.trim().toLowerCase();
+  const candidates = new Set<string>();
+
+  const collectFromTokens = (tokens: string[]) => {
+    for (const token of tokens) {
+      if (looksLikePathToken(token)) {
+        candidates.add(normalizeShellToken(token));
+      }
+    }
+  };
+
+  const rootTokens =
+    command === "cmd" && normalizedArgs.length > 0 && normalizedArgs[0]?.startsWith("/")
+      ? normalizedArgs.slice(1)
+      : normalizedArgs;
+  collectFromTokens(rootTokens);
+
+  if (command === "cmd" && normalizedArgs.length >= 2 && normalizedArgs[0].toLowerCase() === "/c") {
+    collectFromTokens(tokenizeShellScript(normalizedArgs.slice(1).join(" ")));
+  }
+  if (command === "powershell" || command === "pwsh") {
+    const scriptIndex = normalizedArgs.findIndex((arg) => {
+      const normalized = arg.toLowerCase();
+      return normalized === "-command" || normalized === "-c";
+    });
+    if (scriptIndex >= 0 && normalizedArgs[scriptIndex + 1]) {
+      collectFromTokens(tokenizeShellScript(normalizedArgs.slice(scriptIndex + 1).join(" ")));
+    }
+  }
+
+  return [...candidates];
 }
 
 function detectDeleteTargetFromTokens(tokens: string[]): string | null {
@@ -467,7 +701,7 @@ export const GrepTool: Tool<any, any> = {
   isReadOnly: true,
   maxOutputChars: 40000,
   call: async (params, context: ToolContext) => {
-    const resolvedSearchPath = resolveWorkspacePath(params.search_path, context);
+    const resolvedSearchPath = ensureWorkspacePath(params.search_path, context, "grep");
     context.log(`[Grep/Rust] Searching "${params.pattern}" in ${resolvedSearchPath}`);
 
     try {
@@ -524,7 +758,7 @@ export const HexDumpTool: Tool<any, any> = {
   isReadOnly: true,
   maxOutputChars: 20000,
   call: async (params, context: ToolContext) => {
-    const resolvedPath = resolveWorkspacePath(params.path, context);
+    const resolvedPath = ensureWorkspacePath(params.path, context, "hexdump");
     context.log(`[HexDump/Rust] ${resolvedPath} @ offset ${params.offset || 0}`);
 
     try {
@@ -563,7 +797,7 @@ export const FileHashTool: Tool<any, any> = {
   isReadOnly: true,
   maxOutputChars: 500,
   call: async (params, context: ToolContext) => {
-    const resolvedPath = resolveWorkspacePath(params.path, context);
+    const resolvedPath = ensureWorkspacePath(params.path, context, "file_hash");
     context.log(`[Hash/Rust] Computing hashes for ${resolvedPath}`);
 
     try {
@@ -608,7 +842,7 @@ export const ListDirTool: Tool<any, any> = {
   isReadOnly: true,
   maxOutputChars: 30000,
   call: async (params, context: ToolContext) => {
-    const resolvedPath = resolveWorkspacePath(params.path, context);
+    const resolvedPath = ensureWorkspacePath(params.path, context, "list_dir");
     context.log(`[ListDir/Rust] ${resolvedPath} (recursive: ${params.recursive || false})`);
 
     try {
@@ -664,7 +898,7 @@ export const BinaryInfoTool: Tool<any, any> = {
   isReadOnly: true,
   maxOutputChars: 2000,
   call: async (params, context: ToolContext) => {
-    const resolvedPath = resolveWorkspacePath(params.path, context);
+    const resolvedPath = ensureWorkspacePath(params.path, context, "binary_info");
     context.log(`[BinaryInfo/Rust] Identifying ${resolvedPath}`);
 
     try {
@@ -707,7 +941,7 @@ export const StringsTool: Tool<any, any> = {
   isReadOnly: true,
   maxOutputChars: 50000,
   call: async (params, context: ToolContext) => {
-    const resolvedPath = resolveWorkspacePath(params.path, context);
+    const resolvedPath = ensureWorkspacePath(params.path, context, "strings");
     context.log(`[Strings/Rust] Extracting from ${resolvedPath} (min_len: ${params.min_length || 4})`);
 
     try {
@@ -759,7 +993,7 @@ export const FileWriteTool: Tool<any, any> = {
   isReadOnly: false,
   maxOutputChars: 500,
   call: async (params, context: ToolContext) => {
-    const resolvedPath = resolveWorkspacePath(params.path, context);
+    const resolvedPath = ensureWorkspacePath(params.path, context, "file_write");
     context.log(`[FileWrite/Rust] Writing to ${resolvedPath}`);
     const previousContent = await readFileTextForPreview(resolvedPath);
 

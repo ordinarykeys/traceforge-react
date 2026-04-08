@@ -71,6 +71,11 @@ function VirtualMessageListInner<T>({
   const [measuredHeights, setMeasuredHeights] = useState<Map<string, number>>(() => new Map());
   const scrollRafRef = useRef<number | null>(null);
   const pendingScrollTopRef = useRef<number>(0);
+  const previousKeyWindowRef = useRef<{
+    length: number;
+    firstKey: string;
+    lastKey: string;
+  } | null>(null);
 
   useEffect(() => {
     const scrollParent = scrollParentRef.current;
@@ -121,6 +126,25 @@ function VirtualMessageListInner<T>({
   );
 
   useEffect(() => {
+    const firstKey = itemKeys[0] ?? "";
+    const lastKey = itemKeys[itemKeys.length - 1] ?? "";
+    const previous = previousKeyWindowRef.current;
+    const isAppendOnlyUpdate =
+      previous !== null &&
+      itemKeys.length >= previous.length &&
+      previous.firstKey === firstKey &&
+      (previous.length === 0 || itemKeys[Math.max(0, previous.length - 1)] === previous.lastKey);
+
+    previousKeyWindowRef.current = {
+      length: itemKeys.length,
+      firstKey,
+      lastKey,
+    };
+
+    if (isAppendOnlyUpdate) {
+      return;
+    }
+
     setMeasuredHeights((previous) => {
       const keySet = new Set(itemKeys);
       const next = new Map(previous);

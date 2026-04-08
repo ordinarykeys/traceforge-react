@@ -1,9 +1,121 @@
 import { invoke } from "@tauri-apps/api/core";
 import { translate, type AppLocale } from "@/lib/i18n";
+import {
+  getRecoverDoctorRecommendationDescriptor,
+  type RecoverDoctorRecommendation,
+} from "../recoveryPolicy";
+import {
+  prioritizeDoctorRecommendations,
+  type DoctorRecommendationEntry,
+  type DoctorRecommendationId,
+} from "../diagnosisRecommendationPolicy";
+import {
+  deriveDoctorOperationalSectionRuntime,
+} from "../doctorOperationalSectionRuntime";
+import { deriveDoctorPromptSectionLineDescriptors } from "../doctorPromptRuntime";
+import { deriveDoctorQueueSectionRuntime } from "../doctorQueueSectionRuntime";
+import { deriveDoctorRecoverySectionRuntime } from "../doctorRecoverySectionRuntime";
+import { deriveDoctorPermissionSectionRuntime } from "../doctorPermissionSectionRuntime";
+import { deriveDoctorQueueInvestigateRuntime } from "../doctorQueueInvestigateRuntime";
+import { deriveDoctorFallbackInvestigateRuntime } from "../doctorFallbackInvestigateRuntime";
+import {
+  deriveDoctorRecoverInvestigateRuntime,
+  deriveDoctorRecoverInvestigateStats,
+} from "../doctorRecoverInvestigateRuntime";
+import {
+  deriveDoctorApiStateLine,
+  deriveDoctorGitLineFromError,
+  deriveDoctorGitLineFromSnapshot,
+  deriveDoctorWorkspaceFail,
+  deriveDoctorWorkspaceMissing,
+  deriveDoctorWorkspaceOk,
+  type DoctorEnvironmentEvaluation,
+} from "../doctorEnvironmentRuntime";
+import {
+  getDoctorRecommendationTextDescriptor,
+  getDoctorRecommendationTextVars,
+} from "../doctorRecommendationTextRuntime";
+import {
+  formatDoctorLine,
+} from "../doctorLineRuntime";
+import { createDoctorSectionComposer } from "../doctorSectionRuntime";
+import {
+  buildRecoverContinuePromptFingerprintSet,
+  deriveQueuePressure,
+  normalizeRecoverContinuePromptFingerprint,
+  RECOVER_CONTINUE_PROMPT_LOCALES,
+  type RecoverStateKind,
+} from "../recoveryRuntime";
+import { buildRecoverCommandRuntimeSnapshot } from "../recoverCommandRuntime";
+import { deriveTraceCommandParseSnapshot } from "../traceCommandParseRuntime";
+import { createTraceAppliedFilterLabelOptions } from "../traceFilterLabelOptionsRuntime";
+import { deriveTraceVisibilitySnapshot } from "../traceVisibilityRuntime";
+import {
+  buildTraceFallbackStats,
+  buildTraceQueuePriorityStats,
+  buildTraceQueueReasonStats,
+  type TraceQueuePriority,
+} from "../traceSummaryRuntime";
+import {
+  parseQueueOpsActionFilter,
+  parseQueueOpsPriorityFilter,
+  parseQueueOpsReasonFilter,
+} from "../queueOpsFilterRuntime";
+import {
+  collectQueueUpdateEvents,
+  deriveQueueOpsSummarySnapshot,
+  filterQueueOpsEvents,
+} from "../queueOpsRuntime";
+import {
+  deriveCompactDuplicateRemovalPlan,
+  deriveHealDuplicateRemovalPlan,
+  deriveStaleQueuedQueryIds,
+} from "../queueMaintenanceRuntime";
+import {
+  buildRecoverResumeFailedLineDescriptors,
+  buildRecoverResumeNoInterruptionLineDescriptors,
+  buildRecoverResumeQueueFullLineDescriptors,
+  buildRecoverResumeQueuedLineDescriptors,
+  buildRecoverResumeQueuedReuseLineDescriptors,
+  buildRecoverResumeStartedLineDescriptors,
+  deriveRecoverResumePolicy,
+  shouldPromoteRecoverQueuedPriority,
+  type RecoverResumeLineDescriptor,
+} from "../recoverResumeRuntime";
+import {
+  deriveTraceInvestigateMessage,
+  deriveTraceInvestigateSubmitResultLine,
+} from "../traceInvestigateMessageRuntime";
+import { deriveTraceInvestigateActionPlan } from "../traceInvestigateActionRuntime";
+import { deriveTraceListMessage } from "../traceListMessageRuntime";
+import { deriveTraceSummarySnapshot } from "../traceSummaryRenderRuntime";
+import { deriveTraceHotspotsMessage } from "../traceHotspotsMessageRuntime";
+import { deriveTraceSummaryMessage } from "../traceSummaryMessageRuntime";
+import {
+  createTraceHotspotsMessageOptions,
+  createTraceInvestigateMessageOptions,
+  createTraceListMessageOptions,
+  createTraceSummaryMessageOptions,
+} from "../traceMessageOptionsRuntime";
+import { deriveTraceAppliedFilterLabelSnapshot } from "../traceFilterRuntime";
+import {
+  buildToolBudgetGuardReasonStats,
+  buildToolFailureClassStats,
+  collectToolFailureClassCounts,
+  countToolBudgetGuards,
+} from "../traceToolingRuntime";
+import {
+  formatTraceFallbackSuppressedReasonLabel,
+  formatTraceRetryStrategyLabel,
+  formatTraceTerminalReasonLabel,
+  formatTraceToolBudgetReasonLabel,
+  formatTraceToolFailureClassLabel,
+} from "../traceLabelRuntime";
+import { renderTraceEventLine } from "../traceEventRendererRuntime";
+import type { QueuePriority, ToolCallBudgetPolicy } from "../QueryEngine";
 import type { PermissionRule } from "../permissions/toolPermissions";
 import type { AgentTask, AgentTaskStatus } from "../tasks/types";
 import type {
-  PermissionRiskClass,
   PromptCompiledSectionMetadata,
   QueryStreamEvent,
 } from "../query/events";
@@ -23,71 +135,21 @@ function formatTime(locale: AppLocale, value: number): string {
   return new Date(value).toLocaleTimeString(locale);
 }
 
-function formatContinueReasonLabel(context: CommandContext, event: Extract<QueryStreamEvent, { type: "continue" }>): string {
-  const transition = event.transition;
-  if (transition.reason === "tool_results") {
-    return context.t("agent.continue.toolResults");
-  }
-  if (transition.reason === "fallback_retry") {
-    return context.t("agent.continue.fallbackRetry", { model: transition.fallbackModel });
-  }
-  if (transition.reason === "token_budget_continuation") {
-    return context.t("agent.continue.tokenBudget", { attempt: transition.attempt });
-  }
-  if (transition.reason === "stop_hook_retry") {
-    return context.t("agent.continue.stopHookRetry", { attempt: transition.attempt });
-  }
-  return context.t("agent.continue.none");
-}
-
-function formatTerminalReasonLabel(
-  context: CommandContext,
-  event: Extract<QueryStreamEvent, { type: "query_end" }>,
-): string {
-  switch (event.terminalReason) {
-    case "completed":
-      return context.t("agent.trace.terminal.completed");
-    case "aborted":
-      return context.t("agent.trace.terminal.aborted");
-    case "stop_hook_prevented":
-      return context.t("agent.trace.terminal.stopHookPrevented");
-    case "max_iterations":
-      return context.t("agent.trace.terminal.maxIterations");
-    case "error":
-      return context.t("agent.trace.terminal.error");
-    default:
-      return event.terminalReason;
-  }
-}
-
-function formatRetryStrategyLabel(
-  context: CommandContext,
-  strategy: string | undefined,
-): string {
-  if (typeof strategy !== "string" || strategy.length === 0) {
-    return context.t("agent.trace.retryStrategy.balanced");
-  }
-  return context.t(`agent.trace.retryStrategy.${strategy}`);
-}
-
-function formatCommandLifecycleStateLabel(
-  context: CommandContext,
-  state: Extract<QueryStreamEvent, { type: "command_lifecycle" }>["state"],
-): string {
-  return context.t(`agent.trace.commandLifecycle.state.${state}`);
-}
-
-function formatQueuePriorityLabel(
-  context: CommandContext,
-  priority: Extract<QueryStreamEvent, { type: "queue_update" }>["priority"],
-): string {
-  if (!priority) {
-    return "";
-  }
-  return context.t(`agent.queue.priority.${priority}`);
+function traceTranslate(context: CommandContext) {
+  return (key: string, vars?: Record<string, string | number>) =>
+    context.t(key as any, vars);
 }
 
 const DOCTOR_FALLBACK_SUPPRESSION_WARN_RATIO_PCT = 50;
+const RECOVER_CONTINUE_PROMPT_FINGERPRINTS = buildRecoverContinuePromptFingerprintSet(
+  RECOVER_CONTINUE_PROMPT_LOCALES.map((locale) =>
+    translate(locale as AppLocale, "agent.command.recover.continuePrompt"),
+  ),
+);
+
+function isRecoverContinuePrompt(query: string): boolean {
+  return RECOVER_CONTINUE_PROMPT_FINGERPRINTS.has(normalizeRecoverContinuePromptFingerprint(query));
+}
 
 function parseKeyValueArgs(args: string[]): Record<string, string> {
   const next: Record<string, string> = {};
@@ -117,373 +179,72 @@ function parseNonNegativeNumber(value: string | undefined, fallback = 0): number
   return Math.max(0, Math.round(parsed));
 }
 
-function formatFallbackSuppressedReasonLabel(context: CommandContext, reason: string | undefined): string {
-  const normalized = (reason ?? "").trim().toLowerCase().replace(/\s+/g, "_");
-  if (!normalized) {
-    return context.t("agent.command.unknown");
+const QUEUE_HEAL_STALE_AGE_MS = 10 * 60_000;
+
+function parseToolBudgetPolicyPatch(args: string[]): {
+  patch: Partial<ToolCallBudgetPolicy>;
+  unknownKeys: string[];
+  invalidKeys: string[];
+} {
+  const kv = parseKeyValueArgs(args);
+  const patch: Partial<ToolCallBudgetPolicy> = {};
+  const unknownKeys: string[] = [];
+  const invalidKeys: string[] = [];
+  for (const [rawKey, rawValue] of Object.entries(kv)) {
+    const key = rawKey.replace(/[\s_-]+/g, "").toLowerCase();
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed)) {
+      invalidKeys.push(rawKey);
+      continue;
+    }
+    const rounded = Math.round(parsed);
+    switch (key) {
+      case "readonly":
+      case "readbase":
+      case "readonlybase":
+      case "ro":
+        patch.readOnlyBase = rounded;
+        break;
+      case "mutating":
+      case "mutate":
+      case "writebase":
+      case "mutatingbase":
+      case "rw":
+        patch.mutatingBase = rounded;
+        break;
+      case "shell":
+      case "shellbase":
+        patch.shellBase = rounded;
+        break;
+      case "backoff":
+      case "backoffstep":
+      case "failurebackoffstep":
+        patch.failureBackoffStep = rounded;
+        break;
+      case "min":
+      case "minimum":
+        patch.minimum = rounded;
+        break;
+      default:
+        unknownKeys.push(rawKey);
+        break;
+    }
   }
-  const key = `agent.trace.fallbackSuppressedReason.${normalized}`;
-  const translated = context.t(key);
-  return translated === key ? normalized : translated;
-}
-
-interface PermissionRiskCounters {
-  critical: number;
-  high_risk: number;
-  interactive: number;
-  path_outside: number;
-  policy: number;
-  scopeNotices: number;
-  reversibilityReversible: number;
-  reversibilityMixed: number;
-  reversibilityHardToReverse: number;
-  blastLocal: number;
-  blastWorkspace: number;
-  blastShared: number;
-}
-
-function createEmptyPermissionRiskCounters(): PermissionRiskCounters {
   return {
-    critical: 0,
-    high_risk: 0,
-    interactive: 0,
-    path_outside: 0,
-    policy: 0,
-    scopeNotices: 0,
-    reversibilityReversible: 0,
-    reversibilityMixed: 0,
-    reversibilityHardToReverse: 0,
-    blastLocal: 0,
-    blastWorkspace: 0,
-    blastShared: 0,
+    patch,
+    unknownKeys,
+    invalidKeys,
   };
 }
 
-function collectPermissionRiskCounters(events: QueryStreamEvent[]): PermissionRiskCounters {
-  const counters = createEmptyPermissionRiskCounters();
-  for (const event of events) {
-    if (event.type === "authorization_scope_notice") {
-      counters.scopeNotices += 1;
-      continue;
-    }
-    if (event.type !== "permission_decision") {
-      if (event.type === "permission_risk_profile") {
-        if (event.reversibility === "reversible") counters.reversibilityReversible += 1;
-        else if (event.reversibility === "mixed") counters.reversibilityMixed += 1;
-        else counters.reversibilityHardToReverse += 1;
-
-        if (event.blastRadius === "local") counters.blastLocal += 1;
-        else if (event.blastRadius === "workspace") counters.blastWorkspace += 1;
-        else counters.blastShared += 1;
-      }
-      continue;
-    }
-    if (!event.riskClass) {
-      continue;
-    }
-    counters[event.riskClass] += 1;
-  }
-  return counters;
-}
-
 function formatTraceEventLine(context: CommandContext, event: QueryStreamEvent): string {
-  switch (event.type) {
-    case "prompt_compiled":
-      {
-        const baseLine = context.t("agent.trace.event.promptCompiled", {
-          staticSections: event.staticSections,
-          dynamicSections: event.dynamicSections,
-          staticChars: event.staticChars,
-          dynamicChars: event.dynamicChars,
-          totalChars: event.totalChars,
-        });
-        const suffix: string[] = [];
-        if (event.staticHash && event.dynamicHash) {
-          suffix.push(`hash=${event.staticHash}/${event.dynamicHash}`);
-        }
-        if (Array.isArray(event.modelLaunchTags) && event.modelLaunchTags.length > 0) {
-          suffix.push(`tags=${event.modelLaunchTags.join(",")}`);
-        }
-        if (suffix.length === 0) {
-          return baseLine;
-        }
-        return `${baseLine} | ${suffix.join(" | ")}`;
-      }
-    case "query_start": {
-      if (
-        event.lane === undefined &&
-        event.retryMax === undefined &&
-        event.fallbackEnabled === undefined &&
-        event.retryStrategy === undefined
-      ) {
-        return context.t("agent.trace.event.queryStart", {
-          model: event.model,
-          queueCount: event.queueCount,
-        });
-      }
-      const laneLabel = context.t(`agent.trace.queryLane.${event.lane ?? "foreground"}`);
-      const retries = typeof event.retryMax === "number" ? String(event.retryMax) : "-";
-      const fallbackLabel = context.t(`agent.trace.queryFallback.${event.fallbackEnabled ? "on" : "off"}`);
-      const baseLine = context.t("agent.trace.event.queryStartDetailed", {
-        model: event.model,
-        queueCount: event.queueCount,
-        lane: laneLabel,
-        retries,
-        fallback: fallbackLabel,
-      });
-      if (!event.retryStrategy) {
-        return baseLine;
-      }
-      const strategyLabel = formatRetryStrategyLabel(context, event.retryStrategy);
-      return `${baseLine} | ${context.t("agent.trace.retryStrategyLabel", { strategy: strategyLabel })}`;
-    }
-    case "iteration_start":
-      return context.t("agent.trace.event.iterationStart", {
-        iteration: event.iteration,
-        model: event.model,
-      });
-    case "retry_attempt": {
-      const laneLabel = context.t(`agent.trace.queryLane.${event.lane ?? "foreground"}`);
-      const baseLine = context.t("agent.trace.event.retryAttempt", {
-        iteration: event.iteration,
-        model: event.model,
-        lane: laneLabel,
-        attempt: event.attempt,
-        delaySec: (event.nextDelayMs / 1000).toFixed(1),
-        reason: event.reason,
-      });
-      if (!event.retryStrategy) {
-        return baseLine;
-      }
-      const strategyLabel = formatRetryStrategyLabel(context, event.retryStrategy);
-      return `${baseLine} | ${context.t("agent.trace.retryStrategyLabel", { strategy: strategyLabel })}`;
-    }
-    case "retry_profile_update":
-      return context.t("agent.trace.event.retryProfileUpdate", {
-        lane: context.t(`agent.trace.queryLane.${event.lane}`),
-        queue: event.queueCount,
-        retries: event.retryMax,
-        fallback: context.t(`agent.trace.queryFallback.${event.fallbackEnabled ? "on" : "off"}`),
-        strategy: formatRetryStrategyLabel(context, event.retryStrategy),
-        reason: context.t(`agent.trace.retryProfileReason.${event.reason}`),
-      });
-    case "fallback_suppressed":
-      return context.t("agent.trace.event.fallbackSuppressed", {
-        iteration: event.iteration,
-        model: event.model,
-        lane: context.t(`agent.trace.queryLane.${event.lane}`),
-        reason: context.t(`agent.trace.fallbackSuppressedReason.${event.reason}`),
-        strategy: formatRetryStrategyLabel(context, event.retryStrategy),
-      });
-    case "tool_batch_start":
-      return context.t("agent.trace.event.toolBatchStart", {
-        iteration: event.iteration,
-        count: event.count,
-      });
-    case "tool_batch_complete":
-      return context.t("agent.trace.event.toolBatchComplete", {
-        count: event.count,
-        errorCount: event.errorCount,
-      });
-    case "tool_result":
-      return context.t("agent.trace.event.toolResult", {
-        tool: event.tool,
-        outcome: context.t(`agent.trace.toolOutcome.${event.outcome}`),
-      });
-    case "tool_retry_guard":
-      return context.t("agent.trace.event.toolRetryGuard", {
-        tool: event.tool,
-        streak: event.streak,
-      });
-    case "continue":
-      return context.t("agent.trace.event.continue", {
-        reason: formatContinueReasonLabel(context, event),
-      });
-    case "stop_hook_review":
-      return context.t("agent.trace.event.stopHookReview", {
-        notes: event.noteCount,
-        continuation: event.continuationCount,
-      });
-    case "permission_decision":
-      {
-        const baseLine = context.t("agent.trace.event.permissionDecision", {
-          behavior: event.behavior,
-          tool: event.tool,
-          reason: event.reason,
-        });
-        if (!event.riskClass) {
-          return baseLine;
-        }
-        const riskLabel = context.t(`agent.trace.permissionRisk.${event.riskClass}`);
-        return `${baseLine} | ${context.t("agent.trace.permissionRiskLabel", { risk: riskLabel })}`;
-      }
-    case "permission_risk_profile":
-      return context.t("agent.trace.event.permissionRiskProfile", {
-        tool: event.tool,
-        risk: event.riskClass
-          ? context.t(`agent.trace.permissionRisk.${event.riskClass}`)
-          : context.t("agent.trace.permissionRisk.policy"),
-        reversibility: context.t(`agent.permission.prompt.reversibility.${event.reversibility}`),
-        blastRadius: context.t(`agent.permission.prompt.blastRadius.${event.blastRadius}`),
-      });
-    case "authorization_scope_notice":
-      return context.t("agent.trace.event.authorizationScope", {
-        tool: event.tool,
-        risk: context.t(`agent.trace.permissionRisk.${event.riskClass}`),
-        count: event.priorApprovals,
-      });
-    case "queue_update": {
-      const reasonLabel = event.reason
-        ? context.t(`agent.trace.queueReason.${event.reason}`)
-        : "";
-      const priorityLabel = formatQueuePriorityLabel(context, event.priority);
-      return context.t("agent.trace.event.queueUpdate", {
-        action: context.t(`agent.trace.queueAction.${event.action}`),
-        queueCount: event.queueCount,
-        queueLimit: event.queueLimit,
-        reason: `${priorityLabel ? ` [${priorityLabel}]` : ""}${reasonLabel ? ` (${reasonLabel})` : ""}`,
-      });
-    }
-    case "command_lifecycle":
-      return context.t("agent.trace.event.commandLifecycle", {
-        state: formatCommandLifecycleStateLabel(context, event.state),
-        command: event.command,
-      });
-    case "query_end":
-      return context.t("agent.trace.event.queryEnd", {
-        terminalReason: formatTerminalReasonLabel(context, event),
-        durationSec: (event.durationMs / 1000).toFixed(1),
-      });
-    default:
-      return context.t("agent.trace.event.unknown");
-  }
-}
-
-type TraceFilter = "all" | "queue" | "tools" | "permission" | "query" | "prompt" | "retry" | "continue";
-type TraceCategory = Exclude<TraceFilter, "all">;
-type TraceRunWindow = number | "all";
-type TracePermissionRiskFilter = "all" | PermissionRiskClass;
-type TracePermissionReversibilityFilter =
-  | "all"
-  | Extract<QueryStreamEvent, { type: "permission_risk_profile" }>["reversibility"];
-type TracePermissionBlastRadiusFilter =
-  | "all"
-  | Extract<QueryStreamEvent, { type: "permission_risk_profile" }>["blastRadius"];
-const TRACE_CATEGORY_ORDER: TraceCategory[] = ["query", "prompt", "tools", "permission", "queue", "retry", "continue"];
-const TRACE_PERMISSION_RISK_ORDER: PermissionRiskClass[] = [
-  "critical",
-  "high_risk",
-  "interactive",
-  "path_outside",
-  "policy",
-];
-
-function getTraceEventFilter(event: QueryStreamEvent): Exclude<TraceFilter, "all"> {
-  switch (event.type) {
-    case "queue_update":
-      return "queue";
-    case "tool_result":
-      return "tools";
-    case "tool_retry_guard":
-      return "retry";
-    case "tool_batch_start":
-    case "tool_batch_complete":
-      return "tools";
-    case "permission_decision":
-    case "permission_risk_profile":
-    case "authorization_scope_notice":
-      return "permission";
-    case "retry_attempt":
-    case "retry_profile_update":
-    case "fallback_suppressed":
-      return "retry";
-    case "continue":
-      return "continue";
-    case "stop_hook_review":
-      return "continue";
-    case "prompt_compiled":
-      return "prompt";
-    case "command_lifecycle":
-      return "query";
-    case "query_start":
-    case "iteration_start":
-    case "query_end":
-    default:
-      return "query";
-  }
-}
-
-function getTraceEventSeverity(event: QueryStreamEvent): "info" | "warn" | "error" {
-  if (event.type === "tool_result") {
-    if (event.outcome === "error") {
-      return "error";
-    }
-    if (event.outcome === "rejected") {
-      return "warn";
-    }
-    return "info";
-  }
-
-  if (event.type === "query_end") {
-    if (
-      event.terminalReason === "error" ||
-      event.terminalReason === "max_iterations" ||
-      event.terminalReason === "stop_hook_prevented"
-    ) {
-      return "error";
-    }
-    if (event.terminalReason === "aborted") {
-      return "warn";
-    }
-    return "info";
-  }
-
-  if (event.type === "command_lifecycle") {
-    if (event.state === "failed") {
-      return "error";
-    }
-    if (event.state === "aborted") {
-      return "warn";
-    }
-    return "info";
-  }
-
-  if (event.type === "retry_attempt") {
-    return event.attempt >= 2 ? "warn" : "info";
-  }
-  if (event.type === "retry_profile_update") {
-    return event.reason === "load_shed" ? "warn" : "info";
-  }
-  if (event.type === "fallback_suppressed") {
-    return "warn";
-  }
-  if (event.type === "tool_retry_guard") {
-    return "warn";
-  }
-  if (event.type === "stop_hook_review") {
-    return event.continuationCount > 0 ? "warn" : "info";
-  }
-  if (event.type === "authorization_scope_notice") {
-    return "warn";
-  }
-  if (event.type === "permission_risk_profile") {
-    if (event.reversibility === "hard_to_reverse" || event.blastRadius === "shared") {
-      return "warn";
-    }
-    return "info";
-  }
-
-  if (event.type === "queue_update" && event.action === "rejected") {
-    return "warn";
-  }
-  if (event.type === "tool_batch_complete" && event.errorCount > 0) {
-    return "warn";
-  }
-  if (event.type === "permission_decision" && event.behavior === "deny") {
-    return "warn";
-  }
-
-  return "info";
+  const t = traceTranslate(context);
+  return renderTraceEventLine(
+    {
+      t,
+    },
+    event,
+  );
 }
 
 function summarizePromptGovernance(sectionMetadata: PromptCompiledSectionMetadata[]) {
@@ -510,740 +271,23 @@ function summarizePromptGovernance(sectionMetadata: PromptCompiledSectionMetadat
   };
 }
 
-interface TraceRunSummary {
-  runIndex: number;
-  startedAt: number;
-  endedAt: number;
-  terminalReason?: Extract<QueryStreamEvent, { type: "query_end" }>["terminalReason"];
-  events: QueryStreamEvent[];
-}
-
-function mapCommandLifecycleTerminalReason(
-  event: Extract<QueryStreamEvent, { type: "command_lifecycle" }>,
-): Extract<QueryStreamEvent, { type: "query_end" }>["terminalReason"] | undefined {
-  if (event.state === "completed") {
-    return "completed";
-  }
-  if (event.state === "aborted") {
-    return "aborted";
-  }
-  if (event.state === "failed") {
-    return "error";
-  }
-  return undefined;
-}
-
-function buildTraceRunSummaries(events: QueryStreamEvent[]): TraceRunSummary[] {
-  if (events.length === 0) {
-    return [];
-  }
-  const runs: TraceRunSummary[] = [];
-  let current: TraceRunSummary | null = null;
-  let runIndex = 0;
-
-  const ensureCurrent = (at: number) => {
-    if (current) return;
-    runIndex += 1;
-    current = {
-      runIndex,
-      startedAt: at,
-      endedAt: at,
-      events: [],
-    };
-  };
-
-  for (const event of events) {
-    if (event.type === "query_start") {
-      if (
-        current &&
-        current.events.length === 1 &&
-        current.events[0]?.type === "command_lifecycle" &&
-        current.events[0].state === "started"
-      ) {
-        current.events.push(event);
-        current.endedAt = event.at;
-        continue;
-      }
-      if (current && current.events.length > 0) {
-        runs.push(current);
-      }
-      runIndex += 1;
-      current = {
-        runIndex,
-        startedAt: event.at,
-        endedAt: event.at,
-        events: [event],
-      };
-      continue;
-    }
-
-    ensureCurrent(event.at);
-    const active = current as TraceRunSummary;
-    active.events.push(event);
-    active.endedAt = event.at;
-    if (event.type === "query_end") {
-      active.terminalReason = event.terminalReason;
-      continue;
-    }
-    if (event.type === "command_lifecycle") {
-      const lifecycleTerminalReason = mapCommandLifecycleTerminalReason(event);
-      if (lifecycleTerminalReason && !active.terminalReason) {
-        active.terminalReason = lifecycleTerminalReason;
-      }
-    }
-  }
-
-  if (current && current.events.length > 0) {
-    runs.push(current);
-  }
-
-  return runs;
-}
-
-function createEmptyTraceCategoryCounts(): Record<TraceCategory, number> {
-  return {
-    query: 0,
-    prompt: 0,
-    tools: 0,
-    permission: 0,
-    queue: 0,
-    retry: 0,
-    continue: 0,
-  };
-}
-
-function parseTraceFilterToken(token: string): TraceFilter | null {
-  const normalized = token.toLowerCase();
-  if (normalized === "all") return "all";
-  if (normalized === "queue") return "queue";
-  if (normalized === "tools" || normalized === "tool") return "tools";
-  if (normalized === "permission" || normalized === "permissions" || normalized === "perm") return "permission";
-  if (normalized === "query" || normalized === "lifecycle") return "query";
-  if (normalized === "prompt" || normalized === "prompts") return "prompt";
-  if (normalized === "retry" || normalized === "retries" || normalized === "backoff") return "retry";
-  if (normalized === "continue" || normalized === "cont") return "continue";
-  return null;
-}
-
-function parseTraceSummaryToken(token: string): boolean {
-  const normalized = token.toLowerCase();
-  return normalized === "summary" || normalized === "runs" || normalized === "run";
-}
-
-function parseTraceToolToken(token: string): string | null {
-  const normalized = token.toLowerCase();
-  if (normalized.startsWith("tool=")) {
-    return token.slice(token.indexOf("=") + 1).trim();
-  }
-  if (normalized.startsWith("tool:")) {
-    return token.slice(token.indexOf(":") + 1).trim();
-  }
-  return null;
-}
-
-function parseTraceRunWindowToken(token: string): TraceRunWindow | null {
-  const normalized = token.toLowerCase();
-  let payload: string | null = null;
-  if (normalized.startsWith("runs=")) {
-    payload = token.slice(token.indexOf("=") + 1).trim();
-  } else if (normalized.startsWith("window=")) {
-    payload = token.slice(token.indexOf("=") + 1).trim();
-  }
-  if (payload === null) {
-    return null;
-  }
-  if (payload.toLowerCase() === "all") {
-    return "all";
-  }
-  const parsed = Number.parseInt(payload, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return null;
-  }
-  return parsed;
-}
-
-function normalizeTraceRiskAlias(value: string): TracePermissionRiskFilter | null {
-  const normalized = value.trim().toLowerCase().replace(/-/g, "_");
-  if (!normalized) {
-    return null;
-  }
-  if (normalized === "all" || normalized === "any") {
-    return "all";
-  }
-  if (normalized === "critical" || normalized === "crit" || normalized === "fatal") {
-    return "critical";
-  }
-  if (normalized === "high_risk" || normalized === "highrisk" || normalized === "high") {
-    return "high_risk";
-  }
-  if (normalized === "interactive" || normalized === "interact" || normalized === "tty") {
-    return "interactive";
-  }
-  if (normalized === "path_outside" || normalized === "pathoutside" || normalized === "outside") {
-    return "path_outside";
-  }
-  if (normalized === "policy" || normalized === "default") {
-    return "policy";
-  }
-  return null;
-}
-
-function parseTraceRiskToken(token: string): TracePermissionRiskFilter | "invalid" | null {
-  const normalized = token.toLowerCase();
-  let payload: string | null = null;
-  if (normalized.startsWith("risk=")) {
-    payload = token.slice(token.indexOf("=") + 1).trim();
-  } else if (normalized.startsWith("risk:")) {
-    payload = token.slice(token.indexOf(":") + 1).trim();
-  }
-  if (payload === null) {
-    return null;
-  }
-  const parsed = normalizeTraceRiskAlias(payload);
-  return parsed ?? "invalid";
-}
-
-function normalizeTraceReversibilityAlias(value: string): TracePermissionReversibilityFilter | null {
-  const normalized = value.trim().toLowerCase().replace(/-/g, "_");
-  if (!normalized) {
-    return null;
-  }
-  if (normalized === "all" || normalized === "any") {
-    return "all";
-  }
-  if (normalized === "reversible" || normalized === "rev" || normalized === "safe") {
-    return "reversible";
-  }
-  if (normalized === "mixed" || normalized === "partial") {
-    return "mixed";
-  }
-  if (normalized === "hard_to_reverse" || normalized === "irreversible" || normalized === "hard") {
-    return "hard_to_reverse";
-  }
-  return null;
-}
-
-function parseTraceReversibilityToken(token: string): TracePermissionReversibilityFilter | "invalid" | null {
-  const normalized = token.toLowerCase();
-  let payload: string | null = null;
-  if (normalized.startsWith("reversibility=")) {
-    payload = token.slice(token.indexOf("=") + 1).trim();
-  } else if (normalized.startsWith("reversibility:")) {
-    payload = token.slice(token.indexOf(":") + 1).trim();
-  } else if (normalized.startsWith("rev=")) {
-    payload = token.slice(token.indexOf("=") + 1).trim();
-  } else if (normalized.startsWith("rev:")) {
-    payload = token.slice(token.indexOf(":") + 1).trim();
-  }
-  if (payload === null) {
-    return null;
-  }
-  const parsed = normalizeTraceReversibilityAlias(payload);
-  return parsed ?? "invalid";
-}
-
-function normalizeTraceBlastRadiusAlias(value: string): TracePermissionBlastRadiusFilter | null {
-  const normalized = value.trim().toLowerCase().replace(/-/g, "_");
-  if (!normalized) {
-    return null;
-  }
-  if (normalized === "all" || normalized === "any") {
-    return "all";
-  }
-  if (normalized === "local" || normalized === "local_only") {
-    return "local";
-  }
-  if (normalized === "workspace" || normalized === "workdir") {
-    return "workspace";
-  }
-  if (normalized === "shared" || normalized === "global") {
-    return "shared";
-  }
-  return null;
-}
-
-function parseTraceBlastRadiusToken(token: string): TracePermissionBlastRadiusFilter | "invalid" | null {
-  const normalized = token.toLowerCase();
-  let payload: string | null = null;
-  if (normalized.startsWith("blast=")) {
-    payload = token.slice(token.indexOf("=") + 1).trim();
-  } else if (normalized.startsWith("blast:")) {
-    payload = token.slice(token.indexOf(":") + 1).trim();
-  } else if (normalized.startsWith("blast_radius=")) {
-    payload = token.slice(token.indexOf("=") + 1).trim();
-  } else if (normalized.startsWith("blast_radius:")) {
-    payload = token.slice(token.indexOf(":") + 1).trim();
-  } else if (normalized.startsWith("radius=")) {
-    payload = token.slice(token.indexOf("=") + 1).trim();
-  } else if (normalized.startsWith("radius:")) {
-    payload = token.slice(token.indexOf(":") + 1).trim();
-  }
-  if (payload === null) {
-    return null;
-  }
-  const parsed = normalizeTraceBlastRadiusAlias(payload);
-  return parsed ?? "invalid";
-}
-
-function getTracePermissionRisk(event: QueryStreamEvent): PermissionRiskClass | null {
-  if (event.type === "permission_decision") {
-    return event.riskClass ?? "policy";
-  }
-  if (event.type === "permission_risk_profile") {
-    return event.riskClass ?? "policy";
-  }
-  if (event.type === "authorization_scope_notice") {
-    return event.riskClass;
-  }
-  return null;
-}
-
-function getTracePermissionReversibility(
-  event: QueryStreamEvent,
-): Extract<QueryStreamEvent, { type: "permission_risk_profile" }>["reversibility"] | null {
-  if (event.type === "permission_risk_profile") {
-    return event.reversibility;
-  }
-  return null;
-}
-
-function getTracePermissionBlastRadius(
-  event: QueryStreamEvent,
-): Extract<QueryStreamEvent, { type: "permission_risk_profile" }>["blastRadius"] | null {
-  if (event.type === "permission_risk_profile") {
-    return event.blastRadius;
-  }
-  return null;
-}
-
-function isTraceEventToolMatched(event: QueryStreamEvent, toolName: string): boolean {
-  if (event.type === "tool_result") {
-    return event.tool === toolName;
-  }
-  if (event.type === "permission_decision") {
-    return event.tool === toolName;
-  }
-  if (event.type === "permission_risk_profile") {
-    return event.tool === toolName;
-  }
-  if (event.type === "tool_retry_guard") {
-    return event.tool === toolName;
-  }
-  if (event.type === "authorization_scope_notice") {
-    return event.tool === toolName;
-  }
-  return false;
-}
-
-function includeTraceEventForToolFocus(event: QueryStreamEvent, toolName: string): boolean {
-  if (event.type === "tool_result") {
-    return event.tool === toolName;
-  }
-  if (event.type === "permission_decision") {
-    return event.tool === toolName;
-  }
-  if (event.type === "permission_risk_profile") {
-    return event.tool === toolName;
-  }
-  if (event.type === "tool_retry_guard") {
-    return event.tool === toolName;
-  }
-  if (event.type === "authorization_scope_notice") {
-    return event.tool === toolName;
-  }
-  return true;
-}
-
-interface VisibleTraceRunSummary extends TraceRunSummary {
-  visibleEvents: QueryStreamEvent[];
-  warningCount: number;
-  errorCount: number;
-  categoryCounts: Record<TraceCategory, number>;
-}
-
-interface TraceHotspotSummary {
-  tool: string;
-  total: number;
-  errors: number;
-  rejected: number;
-  denied: number;
-}
-
-function buildTraceHotspotSummaries(events: QueryStreamEvent[], limit = 8): TraceHotspotSummary[] {
-  const counter = new Map<string, TraceHotspotSummary>();
-  for (const event of events) {
-    if (event.type === "tool_result" && event.outcome !== "result") {
-      const current = counter.get(event.tool) ?? {
-        tool: event.tool,
-        total: 0,
-        errors: 0,
-        rejected: 0,
-        denied: 0,
-      };
-      current.total += 1;
-      if (event.outcome === "error") {
-        current.errors += 1;
-      } else if (event.outcome === "rejected") {
-        current.rejected += 1;
-      }
-      counter.set(event.tool, current);
-    }
-    if (event.type === "permission_decision" && event.behavior === "deny") {
-      const current = counter.get(event.tool) ?? {
-        tool: event.tool,
-        total: 0,
-        errors: 0,
-        rejected: 0,
-        denied: 0,
-      };
-      current.total += 1;
-      current.denied += 1;
-      counter.set(event.tool, current);
-    }
-    if (event.type === "tool_retry_guard") {
-      const current = counter.get(event.tool) ?? {
-        tool: event.tool,
-        total: 0,
-        errors: 0,
-        rejected: 0,
-        denied: 0,
-      };
-      current.total += 1;
-      current.errors += 1;
-      counter.set(event.tool, current);
-    }
-  }
-  return [...counter.values()]
-    .sort((a, b) => b.total - a.total || b.errors - a.errors || b.denied - a.denied || a.tool.localeCompare(b.tool))
-    .slice(0, limit);
-}
-
-function buildTraceHotspotParts(events: QueryStreamEvent[], limit = 5): string {
-  return buildTraceHotspotSummaries(events, limit)
-    .map((item) => `${item.tool}=${item.total}`)
-    .join(" ");
-}
-
-function buildTracePermissionRiskParts(context: CommandContext, events: QueryStreamEvent[]): string {
-  const counts = new Map<PermissionRiskClass, number>();
-  for (const event of events) {
-    const risk = getTracePermissionRisk(event);
-    if (!risk) {
-      continue;
-    }
-    counts.set(risk, (counts.get(risk) ?? 0) + 1);
-  }
-  return TRACE_PERMISSION_RISK_ORDER
-    .filter((risk) => (counts.get(risk) ?? 0) > 0)
-    .map((risk) => `${context.t(`agent.trace.permissionRisk.${risk}`)}=${counts.get(risk)}`)
-    .join(" ");
-}
-
-interface TracePermissionRiskProfileStats {
-  reversible: number;
-  mixed: number;
-  hardToReverse: number;
-  local: number;
-  workspace: number;
-  shared: number;
-  total: number;
-}
-
-function buildTracePermissionRiskProfileStats(events: QueryStreamEvent[]): TracePermissionRiskProfileStats {
-  const stats: TracePermissionRiskProfileStats = {
-    reversible: 0,
-    mixed: 0,
-    hardToReverse: 0,
-    local: 0,
-    workspace: 0,
-    shared: 0,
-    total: 0,
-  };
-
-  for (const event of events) {
-    if (event.type !== "permission_risk_profile") {
-      continue;
-    }
-    stats.total += 1;
-    if (event.reversibility === "reversible") stats.reversible += 1;
-    else if (event.reversibility === "mixed") stats.mixed += 1;
-    else stats.hardToReverse += 1;
-
-    if (event.blastRadius === "local") stats.local += 1;
-    else if (event.blastRadius === "workspace") stats.workspace += 1;
-    else stats.shared += 1;
-  }
-
-  return stats;
-}
-
-function buildTracePermissionRiskProfileLine(
+function getDominantQueuePriorityLabel(
   context: CommandContext,
-  events: QueryStreamEvent[],
-): string | null {
-  const stats = buildTracePermissionRiskProfileStats(events);
-  if (stats.total === 0) {
-    return null;
+  counter: Record<TraceQueuePriority, number>,
+): string {
+  const now = counter.now;
+  const next = counter.next;
+  const later = counter.later;
+  if (now === 0 && next === 0 && later === 0) {
+    return context.t("agent.command.notSet");
   }
-  return context.t("agent.command.trace.riskProfileMatrix", {
-    reversible: stats.reversible,
-    mixed: stats.mixed,
-    hardToReverse: stats.hardToReverse,
-    local: stats.local,
-    workspace: stats.workspace,
-    shared: stats.shared,
-  });
-}
-
-type FallbackSuppressedEvent = Extract<QueryStreamEvent, { type: "fallback_suppressed" }>;
-
-interface TraceFallbackStats {
-  used: number;
-  suppressed: number;
-  latestSuppressed: FallbackSuppressedEvent | null;
-}
-
-function buildTraceFallbackStats(events: QueryStreamEvent[]): TraceFallbackStats {
-  let used = 0;
-  let suppressed = 0;
-  let latestSuppressed: FallbackSuppressedEvent | null = null;
-
-  for (const event of events) {
-    if (event.type === "continue" && event.transition.reason === "fallback_retry") {
-      used += 1;
-      continue;
-    }
-    if (event.type === "fallback_suppressed") {
-      suppressed += 1;
-      latestSuppressed = event;
-    }
+  if (now >= next && now >= later) {
+    return context.t("agent.queue.priority.now");
   }
-
-  return {
-    used,
-    suppressed,
-    latestSuppressed,
-  };
-}
-
-type TraceQueuePriority = NonNullable<Extract<QueryStreamEvent, { type: "queue_update" }>["priority"]>;
-type TraceQueueAction = Extract<QueryStreamEvent, { type: "queue_update" }>["action"];
-type TraceQueuePressure = "idle" | "busy" | "congested" | "saturated";
-
-interface TraceQueuePriorityStats {
-  total: number;
-  queued: Record<TraceQueuePriority, number>;
-  dequeued: Record<TraceQueuePriority, number>;
-  rejected: Record<TraceQueuePriority, number>;
-  latestQueueDepth: number;
-  maxQueueDepth: number;
-  pressure: TraceQueuePressure;
-}
-
-function createEmptyTraceQueuePriorityCounter(): Record<TraceQueuePriority, number> {
-  return {
-    now: 0,
-    next: 0,
-    later: 0,
-  };
-}
-
-function deriveQueuePressure(depth: number, queueLimit: number): TraceQueuePressure {
-  const normalizedDepth = Math.max(0, depth);
-  if (normalizedDepth <= 0) {
-    return "idle";
+  if (next >= now && next >= later) {
+    return context.t("agent.queue.priority.next");
   }
-  if (queueLimit > 0) {
-    const ratio = normalizedDepth / queueLimit;
-    if (ratio >= 1) {
-      return "saturated";
-    }
-    if (ratio >= 0.75) {
-      return "congested";
-    }
-    return "busy";
-  }
-  if (normalizedDepth >= 8) {
-    return "saturated";
-  }
-  if (normalizedDepth >= 4) {
-    return "congested";
-  }
-  return "busy";
-}
-
-function buildTraceQueuePriorityStats(events: QueryStreamEvent[], queueLimit = 0): TraceQueuePriorityStats {
-  const stats: TraceQueuePriorityStats = {
-    total: 0,
-    queued: createEmptyTraceQueuePriorityCounter(),
-    dequeued: createEmptyTraceQueuePriorityCounter(),
-    rejected: createEmptyTraceQueuePriorityCounter(),
-    latestQueueDepth: 0,
-    maxQueueDepth: 0,
-    pressure: "idle",
-  };
-  for (const event of events) {
-    if (event.type !== "queue_update") {
-      continue;
-    }
-    stats.latestQueueDepth = Math.max(0, event.queueCount);
-    if (event.queueCount > stats.maxQueueDepth) {
-      stats.maxQueueDepth = event.queueCount;
-    }
-    if (!event.priority) {
-      continue;
-    }
-    const action: TraceQueueAction = event.action;
-    stats[action][event.priority] += 1;
-    stats.total += 1;
-  }
-  const pressureDepth = Math.max(stats.latestQueueDepth, stats.maxQueueDepth);
-  stats.pressure = deriveQueuePressure(pressureDepth, queueLimit);
-  return stats;
-}
-
-function buildTraceInvestigateRunbookLines(options: {
-  context: CommandContext;
-  tool: string;
-  total: number;
-  errors: number;
-  rejected: number;
-  denied: number;
-  runWindow: TraceRunWindow;
-  riskFilter: TracePermissionRiskFilter;
-  reversibilityFilter: TracePermissionReversibilityFilter;
-  blastRadiusFilter: TracePermissionBlastRadiusFilter;
-}): string[] {
-  const {
-    context,
-    tool,
-    total,
-    errors,
-    rejected,
-    denied,
-    runWindow,
-    riskFilter,
-    reversibilityFilter,
-    blastRadiusFilter,
-  } = options;
-  const scopedFilters: string[] = [];
-  if (riskFilter !== "all") scopedFilters.push(`risk=${riskFilter}`);
-  if (reversibilityFilter !== "all") scopedFilters.push(`reversibility=${reversibilityFilter}`);
-  if (blastRadiusFilter !== "all") scopedFilters.push(`blast=${blastRadiusFilter}`);
-  const traceCommand = `/trace summary failure tool=${tool} ${
-    runWindow === "all" ? "runs=all" : `runs=${runWindow}`
-  }${scopedFilters.length > 0 ? ` ${scopedFilters.join(" ")}` : ""}`;
-  return [
-    context.t("agent.command.trace.investigateRunbookTitle"),
-    context.t("agent.command.trace.investigateRunbookScope", {
-      tool,
-      total,
-      errors,
-      rejected,
-      denied,
-    }),
-    context.t("agent.command.trace.investigateRunbookDiagnosis"),
-    context.t("agent.command.trace.investigateRunbookDiagnosisItem", { command: traceCommand }),
-    context.t("agent.command.trace.investigateRunbookFix"),
-    context.t("agent.command.trace.investigateRunbookFixItem"),
-    context.t("agent.command.trace.investigateRunbookVerify"),
-    context.t("agent.command.trace.investigateRunbookVerifyItemLint"),
-    context.t("agent.command.trace.investigateRunbookVerifyItemBuild"),
-    context.t("agent.command.trace.investigateRunbookVerifyItemTest"),
-    context.t("agent.command.trace.investigateRunbookRollback"),
-    context.t("agent.command.trace.investigateRunbookRollbackItem"),
-  ];
-}
-
-function buildVisibleTraceRunSummaries(options: {
-  events: QueryStreamEvent[];
-  filter: TraceFilter;
-  riskFilter: TracePermissionRiskFilter;
-  reversibilityFilter: TracePermissionReversibilityFilter;
-  blastRadiusFilter: TracePermissionBlastRadiusFilter;
-  warningsOnly: boolean;
-  failureFocus: boolean;
-  toolFocus: string | null;
-  runWindow: TraceRunWindow;
-}): VisibleTraceRunSummary[] {
-  const {
-    events,
-    filter,
-    riskFilter,
-    reversibilityFilter,
-    blastRadiusFilter,
-    warningsOnly,
-    failureFocus,
-    toolFocus,
-    runWindow,
-  } = options;
-  const runs = buildTraceRunSummaries(events);
-  const scopedRuns = runWindow === "all" ? runs : runs.slice(-runWindow);
-  const next: VisibleTraceRunSummary[] = [];
-
-  for (const run of scopedRuns) {
-    if (toolFocus && !run.events.some((event) => isTraceEventToolMatched(event, toolFocus))) {
-      continue;
-    }
-    const visibleEvents = run.events.filter((event) => {
-      if (filter !== "all" && getTraceEventFilter(event) !== filter) {
-        return false;
-      }
-      if (warningsOnly && getTraceEventSeverity(event) === "info") {
-        return false;
-      }
-      if (toolFocus && !includeTraceEventForToolFocus(event, toolFocus)) {
-        return false;
-      }
-      if (riskFilter !== "all") {
-        const risk = getTracePermissionRisk(event);
-        if (!risk || risk !== riskFilter) {
-          return false;
-        }
-      }
-      if (reversibilityFilter !== "all") {
-        const reversibility = getTracePermissionReversibility(event);
-        if (!reversibility || reversibility !== reversibilityFilter) {
-          return false;
-        }
-      }
-      if (blastRadiusFilter !== "all") {
-        const blastRadius = getTracePermissionBlastRadius(event);
-        if (!blastRadius || blastRadius !== blastRadiusFilter) {
-          return false;
-        }
-      }
-      return true;
-    });
-    if (visibleEvents.length === 0) {
-      continue;
-    }
-
-    const warningCount = visibleEvents.reduce((count, event) => {
-      return getTraceEventSeverity(event) === "warn" ? count + 1 : count;
-    }, 0);
-    const errorCount = visibleEvents.reduce((count, event) => {
-      return getTraceEventSeverity(event) === "error" ? count + 1 : count;
-    }, 0);
-    if (failureFocus && warningCount === 0 && errorCount === 0) {
-      continue;
-    }
-    const categoryCounts = visibleEvents.reduce((acc, event) => {
-      const category = getTraceEventFilter(event);
-      acc[category] += 1;
-      return acc;
-    }, createEmptyTraceCategoryCounts());
-
-    next.push({
-      ...run,
-      visibleEvents,
-      warningCount,
-      errorCount,
-      categoryCounts,
-    });
-  }
-
-  return next;
+  return context.t("agent.queue.priority.later");
 }
 
 function formatTaskStatus(context: CommandContext, status: AgentTaskStatus): string {
@@ -1276,6 +320,87 @@ function formatTask(task: AgentTask, context: CommandContext): string {
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat("en-US").format(value);
+}
+
+function formatRecoverReasonLabel(context: CommandContext, kind: Exclude<RecoverStateKind, "none">): string {
+  return context.t(`agent.command.recover.reason.${kind}`);
+}
+
+function renderRecoverResumeLines(
+  context: CommandContext,
+  lines: readonly RecoverResumeLineDescriptor[],
+): string {
+  return lines
+    .map((line) => context.t(line.key as any, line.vars))
+    .join("\n");
+}
+
+function getRecoverRecommendationEntry(
+  context: CommandContext,
+  recommendation: RecoverDoctorRecommendation,
+): DoctorRecommendationEntry {
+  return {
+    id: recommendation,
+    text: context.t(getRecoverDoctorRecommendationDescriptor(recommendation).doctorTextKey),
+  };
+}
+
+function getDoctorRecommendationText(
+  context: CommandContext,
+  id: DoctorRecommendationId,
+  options?: { workspace?: string | null },
+): string {
+  const descriptor = getDoctorRecommendationTextDescriptor(id);
+  const vars = getDoctorRecommendationTextVars(id, {
+    workspace: options?.workspace,
+    fallbackWorkspace: context.workingDir ?? context.t("agent.command.notSet"),
+  });
+  return context.t(descriptor.key, vars);
+}
+
+function buildRecoverInvestigateMessage(context: CommandContext, kv: Record<string, string>): string {
+  const recentEvents = context.getRecentQueryEvents(320);
+  const queuedQueries = context.getQueuedQueries();
+  const currentQueueCount = Math.max(0, queuedQueries.length);
+  const queueLimit = parseNonNegativeNumber(kv.queue_limit, Math.max(0, context.queueLimit));
+  const queueCount = parseNonNegativeNumber(kv.queue_count, currentQueueCount);
+  const recoverRuntimeSnapshot = buildRecoverCommandRuntimeSnapshot({
+    messages: context.getMessages(),
+    queuedQueries,
+    queueLimit: context.queueLimit,
+    queueCountOverride: queueCount,
+    queueLimitOverride: queueLimit,
+    events: recentEvents,
+    queuedRecoveryMatcher: isRecoverContinuePrompt,
+  });
+  const state = recoverRuntimeSnapshot.state;
+  const recoverSignals = recoverRuntimeSnapshot.signals;
+  const stats = deriveDoctorRecoverInvestigateStats(recoverSignals);
+  const runningTasks = context.taskManager.listTasks().filter((task) => task.status === "running").length;
+  const pressure = deriveQueuePressure(queueCount, queueLimit);
+  const pressureLabel = context.t(`agent.trace.queuePressure.${pressure}`);
+  const stateLabel =
+    state.kind === "none"
+      ? context.t("agent.command.status.recovery.none")
+      : formatRecoverReasonLabel(context, state.kind);
+  const messageId = state.lastMessageId ?? context.t("agent.command.notSet");
+  const recoverInvestigateRuntime = deriveDoctorRecoverInvestigateRuntime({
+    stateKind: state.kind,
+    stateLabel,
+    messageIdLabel: messageId,
+    queueCount,
+    queueLimit,
+    pressureLabel,
+    runningTaskCount: runningTasks,
+    stats,
+    queueDeduplicatedCount: recoverSignals.queueDeduplicatedCount,
+    queueRejectedCount: recoverSignals.queueRejectedCount,
+    failureTotal: recoverSignals.failureTotal,
+    formatNumber,
+  });
+  return recoverInvestigateRuntime.lines
+    .map((line) => context.t(line.key, line.vars))
+    .join("\n");
 }
 
 function unknownSubcommand(context: CommandContext, base: string): CommandResult {
@@ -1502,9 +627,30 @@ const statusCommand: SlashCommand = {
   descriptionKey: "agent.command.status.description",
   usageKey: "agent.command.status.usage",
   execute: async (context) => {
+    const tTrace = traceTranslate(context);
     const tasks = context.taskManager.listTasks();
     const runningTasks = tasks.filter((task) => task.status === "running").length;
     const queuePressureLabel = context.t(`agent.trace.queuePressure.${deriveQueuePressure(context.queueCount, context.queueLimit)}`);
+    const recentEvents = context.getRecentQueryEvents(160);
+      const failureClassStats = buildToolFailureClassStats({
+        events: recentEvents,
+        formatFailureClassLabel: (failureClass) =>
+          formatTraceToolFailureClassLabel(tTrace, failureClass),
+      });
+    const budgetGuardCount = countToolBudgetGuards(recentEvents);
+    const toolBudgetPolicy = context.getToolCallBudgetPolicy();
+    const recoverRuntimeSnapshot = buildRecoverCommandRuntimeSnapshot({
+      messages: context.getMessages(),
+      queuedQueries: context.getQueuedQueries(),
+      queueLimit: context.queueLimit,
+      queuedRecoveryMatcher: isRecoverContinuePrompt,
+    });
+    const recoverState = recoverRuntimeSnapshot.state;
+    const recoveryStatus =
+      recoverState.kind === "none"
+        ? context.t("agent.command.status.recovery.none")
+        : context.t(`agent.command.status.recovery.${recoverState.kind}`);
+    const recoverPlan = recoverRuntimeSnapshot.plan;
     return {
       message: [
         context.t("agent.command.status.title"),
@@ -1529,11 +675,679 @@ const statusCommand: SlashCommand = {
         context.t("agent.command.status.queuePressure", {
           pressure: queuePressureLabel,
         }),
+        context.t("agent.command.status.recovery", {
+          status: recoveryStatus,
+        }),
+        context.t("agent.command.status.recoveryQueue", {
+          count: recoverPlan.queuedRecovery ? 1 : 0,
+          id: recoverPlan.queuedRecovery?.id ?? context.t("agent.command.notSet"),
+        }),
+        context.t("agent.command.status.recoveryPlan", {
+          plan: context.t(`agent.command.recover.plan.${recoverPlan.kind}`),
+        }),
         context.t("agent.command.status.tasks", { running: runningTasks, total: tasks.length }),
         context.t("agent.command.status.tools", { count: context.getToolNames().length }),
         context.t("agent.command.status.permissionMode", { mode: context.permissionMode }),
         context.t("agent.command.status.permissionRules", { count: context.permissionRules.length }),
+        context.t("agent.command.status.toolBudgetPolicy", {
+          readOnlyBase: toolBudgetPolicy.readOnlyBase,
+          mutatingBase: toolBudgetPolicy.mutatingBase,
+          shellBase: toolBudgetPolicy.shellBase,
+          minimum: toolBudgetPolicy.minimum,
+          failureBackoffStep: toolBudgetPolicy.failureBackoffStep,
+        }),
+        context.t("agent.command.status.failureClasses", {
+          details: failureClassStats.total > 0 ? failureClassStats.parts : "-",
+        }),
+        context.t("agent.command.status.budgetGuards", { count: budgetGuardCount }),
       ].join("\n"),
+    };
+  },
+};
+
+const queueCommand: SlashCommand = {
+  name: "queue",
+  aliases: ["q"],
+  category: "core",
+  descriptionKey: "agent.command.queue.description",
+  usageKey: "agent.command.queue.usage",
+  execute: async (context) => {
+    const action = context.parsed.args[0]?.toLowerCase() ?? "list";
+    const queued = context.getQueuedQueries();
+    const queueSummaryLine = context.t("agent.command.queue.summary", {
+      count: queued.length,
+      limit: context.queueLimit,
+      now: context.queueByPriority.now,
+      next: context.queueByPriority.next,
+      later: context.queueByPriority.later,
+      nowLabel: context.t("agent.queue.priority.now"),
+      nextLabel: context.t("agent.queue.priority.next"),
+      laterLabel: context.t("agent.queue.priority.later"),
+    });
+
+    if (action === "list" || action === "ls" || action === "status") {
+      if (queued.length === 0) {
+        return {
+          message: [
+            context.t("agent.command.queue.title"),
+            queueSummaryLine,
+            context.t("agent.command.queue.empty"),
+          ].join("\n"),
+        };
+      }
+      const lines = queued.map((item) => {
+        const previewRaw = item.query.trim().replace(/\s+/g, " ");
+        const preview =
+          previewRaw.length > 80 ? `${previewRaw.slice(0, 77)}...` : previewRaw;
+        return context.t("agent.command.queue.item", {
+          id: item.id,
+          priority: context.t(`agent.queue.priority.${item.priority}`),
+          queuedAt: formatTime(context.locale, item.queuedAt),
+          model: item.model,
+          preview,
+        });
+      });
+      return {
+        message: [
+          context.t("agent.command.queue.title"),
+          queueSummaryLine,
+          ...lines,
+        ].join("\n"),
+      };
+    }
+
+    if (action === "clear") {
+      let removed = 0;
+      for (const item of queued) {
+        if (context.removeQueuedQuery(item.id)) {
+          removed += 1;
+        }
+      }
+      return {
+        message: context.t("agent.command.queue.cleared", {
+          removed,
+          remaining: context.getQueuedQueries().length,
+        }),
+      };
+    }
+
+    if (action === "ops" || action === "events" || action === "history") {
+      const rawArgs = context.parsed.args.slice(1);
+      const firstArg = rawArgs[0]?.trim();
+      const positionalLimit =
+        firstArg && /^\d+$/.test(firstArg) ? parseNonNegativeNumber(firstArg, 12) : null;
+      const kv = parseKeyValueArgs(rawArgs);
+      const limit = parseNonNegativeNumber(
+        kv.limit ?? kv.last ?? (positionalLimit !== null ? String(positionalLimit) : undefined),
+        12,
+      );
+      const cappedLimit = Math.min(Math.max(limit, 1), 120);
+      const summaryMode =
+        rawArgs.some((token) => /^(summary|stats|overview)$/i.test(token)) ||
+        (kv.view?.toLowerCase() ?? "") === "summary";
+      const actionFilter = parseQueueOpsActionFilter(kv.action ?? kv.a);
+      const reasonFilter = parseQueueOpsReasonFilter(kv.reason ?? kv.r);
+      const priorityFilter = parseQueueOpsPriorityFilter(kv.priority ?? kv.p);
+      if (actionFilter === "invalid" || reasonFilter === "invalid" || priorityFilter === "invalid") {
+        return {
+          error: true,
+          message: context.t("agent.command.queue.opsInvalidFilter"),
+        };
+      }
+      const queueEvents = collectQueueUpdateEvents(context.getRecentQueryEvents(500));
+      const filtered = filterQueueOpsEvents({
+        events: queueEvents,
+        actionFilter,
+        reasonFilter,
+        priorityFilter,
+        limit: cappedLimit,
+      });
+      if (filtered.length === 0) {
+        return {
+          message: [
+            context.t("agent.command.queue.opsTitle", { count: 0 }),
+            context.t("agent.command.queue.opsEmpty"),
+          ].join("\n"),
+        };
+      }
+      const queueEventsDesc = [...filtered].reverse();
+      const lines = queueEventsDesc.map((event) =>
+        context.t("agent.command.queue.opsLine", {
+          at: formatTime(context.locale, event.at),
+          action: context.t(`agent.trace.queueAction.${event.action}`),
+          queueCount: event.queueCount,
+          queueLimit: event.queueLimit,
+          priority: event.priority
+            ? context.t(`agent.queue.priority.${event.priority}`)
+            : context.t("agent.command.notSet"),
+          reason: event.reason
+            ? context.t(`agent.trace.queueReason.${event.reason}`)
+            : context.t("agent.command.notSet"),
+        }),
+      );
+      if (!summaryMode) {
+        return {
+          message: [
+            context.t("agent.command.queue.opsTitle", { count: queueEventsDesc.length }),
+            ...lines,
+          ].join("\n"),
+        };
+      }
+      const summarySnapshot = deriveQueueOpsSummarySnapshot({
+        events: filtered,
+        fallbackLimit: context.queueLimit,
+      });
+      const pressure = deriveQueuePressure(
+        Math.max(summarySnapshot.latestDepth, summarySnapshot.maxDepth),
+        summarySnapshot.effectiveLimit,
+      );
+      const pressureLabel = context.t(`agent.trace.queuePressure.${pressure}`);
+      return {
+        message: [
+          context.t("agent.command.queue.opsTitle", { count: queueEventsDesc.length }),
+          context.t("agent.command.queue.opsSummaryWindow", {
+            count: queueEventsDesc.length,
+            pressure: pressureLabel,
+            latest: summarySnapshot.latestDepth,
+            max: summarySnapshot.maxDepth,
+            limit: summarySnapshot.effectiveLimit,
+          }),
+          context.t("agent.command.queue.opsSummaryActions", {
+            queued: summarySnapshot.actionStats.queued,
+            dequeued: summarySnapshot.actionStats.dequeued,
+            rejected: summarySnapshot.actionStats.rejected,
+          }),
+          context.t("agent.command.queue.opsSummaryReasons", {
+            capacity: summarySnapshot.reasonStats.capacity,
+            stale: summarySnapshot.reasonStats.stale,
+            manual: summarySnapshot.reasonStats.manual,
+            deduplicated: summarySnapshot.reasonStats.deduplicated,
+            none: summarySnapshot.reasonStats.none,
+          }),
+          context.t("agent.command.queue.opsSummaryPriorities", {
+            now: summarySnapshot.priorityStats.now,
+            next: summarySnapshot.priorityStats.next,
+            later: summarySnapshot.priorityStats.later,
+            none: summarySnapshot.priorityStats.none,
+          }),
+          context.t("agent.command.queue.opsSummaryRecent"),
+          ...lines,
+        ].join("\n"),
+      };
+    }
+
+    if (action === "heal" || action === "relieve" || action === "repair") {
+      const beforeCount = queued.length;
+      const staleIds = deriveStaleQueuedQueryIds({
+        items: queued,
+        now: Date.now(),
+        staleAgeMs: QUEUE_HEAL_STALE_AGE_MS,
+      });
+      let staleRemoved = 0;
+      let duplicateRemoved = 0;
+      for (const staleId of staleIds) {
+        if (context.removeQueuedQuery(staleId)) {
+          staleRemoved += 1;
+        }
+      }
+
+      const duplicatePlan = deriveHealDuplicateRemovalPlan(context.getQueuedQueries());
+      for (const duplicateId of duplicatePlan.removeIds) {
+        if (context.removeQueuedQuery(duplicateId)) {
+          duplicateRemoved += 1;
+        }
+      }
+
+      const afterCount = context.getQueuedQueries().length;
+      if (staleRemoved === 0 && duplicateRemoved === 0) {
+        return {
+          message: context.t("agent.command.queue.healNoChange", {
+            before: beforeCount,
+            after: afterCount,
+          }),
+        };
+      }
+      return {
+        message: [
+          context.t("agent.command.queue.healSummary", {
+            before: beforeCount,
+            after: afterCount,
+          }),
+          context.t("agent.command.queue.healStaleRemoved", {
+            count: staleRemoved,
+            minutes: Math.round(QUEUE_HEAL_STALE_AGE_MS / 60_000),
+          }),
+          context.t("agent.command.queue.healDuplicateRemoved", {
+            removed: duplicateRemoved,
+            groups: duplicatePlan.duplicateGroups,
+          }),
+          context.t("agent.command.queue.healNextStep"),
+        ].join("\n"),
+      };
+    }
+
+    if (action === "compact" || action === "dedupe") {
+      const compactPlan = deriveCompactDuplicateRemovalPlan(queued);
+      let removed = 0;
+      for (const duplicateId of compactPlan.removeIds) {
+        if (context.removeQueuedQuery(duplicateId)) {
+          removed += 1;
+        }
+      }
+      if (removed === 0) {
+        return {
+          message: context.t("agent.command.queue.compactNoChange"),
+        };
+      }
+      return {
+        message: context.t("agent.command.queue.compactResult", {
+          removed,
+          groups: compactPlan.duplicateGroups,
+          remaining: context.getQueuedQueries().length,
+        }),
+      };
+    }
+
+    if (action === "remove" || action === "rm" || action === "delete") {
+      const queueId = context.parsed.args[1]?.trim();
+      if (!queueId) {
+        return {
+          error: true,
+          message: context.t("agent.command.queue.missingId"),
+        };
+      }
+      const removed = context.removeQueuedQuery(queueId);
+      if (!removed) {
+        return {
+          error: true,
+          message: context.t("agent.command.queue.notFound", { id: queueId }),
+        };
+      }
+      return {
+        message: context.t("agent.command.queue.removed", { id: queueId }),
+      };
+    }
+
+    if (
+      action === "priority" ||
+      action === "prio" ||
+      action === "set-priority" ||
+      action === "now" ||
+      action === "next" ||
+      action === "later"
+    ) {
+      const directPriority = action === "now" || action === "next" || action === "later" ? action : null;
+      const queueId = directPriority ? context.parsed.args[1]?.trim() : context.parsed.args[1]?.trim();
+      const priorityRaw = directPriority ?? context.parsed.args[2]?.trim().toLowerCase();
+      if (!queueId) {
+        return {
+          error: true,
+          message: context.t("agent.command.queue.missingId"),
+        };
+      }
+      if (priorityRaw !== "now" && priorityRaw !== "next" && priorityRaw !== "later") {
+        return {
+          error: true,
+          message: context.t("agent.command.queue.invalidPriority", {
+            value: priorityRaw ?? context.t("agent.command.notSet"),
+          }),
+        };
+      }
+      const updated = context.setQueuedQueryPriority(queueId, priorityRaw);
+      if (!updated) {
+        return {
+          error: true,
+          message: context.t("agent.command.queue.notFound", { id: queueId }),
+        };
+      }
+      return {
+        message: context.t("agent.command.queue.priorityUpdated", {
+          id: queueId,
+          priority: context.t(`agent.queue.priority.${priorityRaw}`),
+        }),
+      };
+    }
+
+    return unknownSubcommand(context, "queue");
+  },
+};
+
+const recoverCommand: SlashCommand = {
+  name: "recover",
+  aliases: ["resume-turn"],
+  category: "core",
+  descriptionKey: "agent.command.recover.description",
+  usageKey: "agent.command.recover.usage",
+  execute: async (context) => {
+    const action = context.parsed.args[0]?.toLowerCase() ?? "status";
+    const recoverRuntimeSnapshot = buildRecoverCommandRuntimeSnapshot({
+      messages: context.getMessages(),
+      queuedQueries: context.getQueuedQueries(),
+      queueLimit: context.queueLimit,
+      queuedRecoveryMatcher: isRecoverContinuePrompt,
+    });
+    const state = recoverRuntimeSnapshot.state;
+    const recoverPlan = recoverRuntimeSnapshot.plan;
+    const runResume = (autoMode: boolean): CommandResult => {
+      const resumePolicy = deriveRecoverResumePolicy({
+        autoMode,
+        recoverPlanKind: recoverPlan.kind,
+      });
+      if (state.kind === "none") {
+        return {
+          message: renderRecoverResumeLines(
+            context,
+            buildRecoverResumeNoInterruptionLineDescriptors(),
+          ),
+        };
+      }
+      const preferredPriority: QueuePriority = resumePolicy.preferredPriority;
+      const continuePrompt = context.t("agent.command.recover.continuePrompt");
+      const queuedRecovery = recoverPlan.queuedRecovery;
+      if (queuedRecovery) {
+        const promoted =
+          shouldPromoteRecoverQueuedPriority({
+            queuedPriority: queuedRecovery.priority,
+            preferredPriority,
+          }) && context.setQueuedQueryPriority(queuedRecovery.id, preferredPriority);
+        return {
+          message: renderRecoverResumeLines(
+            context,
+            buildRecoverResumeQueuedReuseLineDescriptors({
+              policyLineKey: resumePolicy.policyLineKey,
+              queuedRecoveryId: queuedRecovery.id,
+              queueLabel: formatNumber(context.getQueuedQueries().length),
+              limitLabel: formatNumber(Math.max(0, context.queueLimit)),
+              promoted,
+            }),
+          ),
+        };
+      }
+
+      let staleRemoved = 0;
+      const staleIds = deriveStaleQueuedQueryIds({
+        items: context.getQueuedQueries(),
+        now: Date.now(),
+        staleAgeMs: QUEUE_HEAL_STALE_AGE_MS,
+      });
+      for (const staleId of staleIds) {
+        if (context.removeQueuedQuery(staleId)) {
+          staleRemoved += 1;
+        }
+      }
+
+      const submitResult = context.submitFollowupQuery(continuePrompt, {
+        priority: preferredPriority,
+      });
+      if (!submitResult.accepted) {
+        if (submitResult.reason === "queue_full") {
+          return {
+            error: true,
+            message: renderRecoverResumeLines(
+              context,
+              buildRecoverResumeQueueFullLineDescriptors({
+                policyLineKey: resumePolicy.policyLineKey,
+                queueCount: submitResult.queueCount,
+                queueLimit: submitResult.queueLimit,
+                staleRemoved,
+                staleMinutes: Math.round(QUEUE_HEAL_STALE_AGE_MS / 60_000),
+              }),
+            ),
+          };
+        }
+        return {
+          error: true,
+          message: renderRecoverResumeLines(
+            context,
+            buildRecoverResumeFailedLineDescriptors({
+              policyLineKey: resumePolicy.policyLineKey,
+            }),
+          ),
+        };
+      }
+      if (submitResult.started) {
+        return {
+          message: renderRecoverResumeLines(
+            context,
+            buildRecoverResumeStartedLineDescriptors({
+              policyLineKey: resumePolicy.policyLineKey,
+              staleRemoved,
+              staleMinutes: Math.round(QUEUE_HEAL_STALE_AGE_MS / 60_000),
+            }),
+          ),
+        };
+      }
+      return {
+        message: renderRecoverResumeLines(
+          context,
+          buildRecoverResumeQueuedLineDescriptors({
+            policyLineKey: resumePolicy.policyLineKey,
+            queueCount: submitResult.queueCount,
+            queueLimit: submitResult.queueLimit,
+            queuedId: submitResult.queuedId,
+            staleRemoved,
+            staleMinutes: Math.round(QUEUE_HEAL_STALE_AGE_MS / 60_000),
+          }),
+        ),
+      };
+    };
+    const runExecute = (strictMode: boolean): CommandResult => {
+      const resumeResult = runResume(true);
+      const checklistLines = [
+        context.t("agent.command.recover.executeChecklistTitle"),
+        context.t("agent.command.recover.executeChecklistStatus"),
+        recoverPlan.kind === "heal_then_resume"
+          ? context.t("agent.command.recover.executeChecklistQueueRequired")
+          : context.t("agent.command.recover.executeChecklistQueueOptional"),
+        context.t("agent.command.recover.executeChecklistInvestigate"),
+      ];
+      const strictLines = strictMode
+        ? [
+            context.t("agent.command.recover.executeStrictTitle"),
+            context.t(
+              resumeResult.error
+                ? "agent.command.recover.executeStrictFail"
+                : state.kind === "none"
+                  ? "agent.command.recover.executeStrictNoop"
+                  : "agent.command.recover.executeStrictPass",
+            ),
+            context.t("agent.command.recover.executeStrictStatusCheck"),
+            recoverPlan.kind === "heal_then_resume"
+              ? context.t("agent.command.recover.executeStrictQueueCheckRequired")
+              : context.t("agent.command.recover.executeStrictQueueCheckOptional"),
+          ]
+        : [];
+      return {
+        error: resumeResult.error,
+        message: [
+          context.t("agent.command.recover.executeTitle"),
+          resumeResult.message,
+          ...checklistLines,
+          ...strictLines,
+        ].join("\n"),
+      };
+    };
+    const runPlan = (): CommandResult => {
+      const queueCount = Math.max(0, context.getQueuedQueries().length);
+      const queueLimit = Math.max(0, context.queueLimit);
+      const pressure = deriveQueuePressure(queueCount, queueLimit);
+      const pressureLabel = context.t(`agent.trace.queuePressure.${pressure}`);
+      const stateLabel =
+        state.kind === "none"
+          ? context.t("agent.command.status.recovery.none")
+          : formatRecoverReasonLabel(context, state.kind);
+      const planLabel = context.t(`agent.command.recover.plan.${recoverPlan.kind}`);
+      const lines = [
+        context.t("agent.command.recover.planTitle"),
+        context.t("agent.command.recover.planScope", {
+          state: stateLabel,
+          plan: planLabel,
+          queue: formatNumber(queueCount),
+          limit: formatNumber(queueLimit),
+          pressure: pressureLabel,
+        }),
+      ];
+      if (recoverPlan.kind === "none") {
+        lines.push(context.t("agent.command.recover.planActionNone"));
+        return { message: lines.join("\n") };
+      }
+      if (recoverPlan.kind === "queued_recovery" && recoverPlan.queuedRecovery) {
+        lines.push(
+          context.t("agent.command.recover.planActionQueued", {
+            id: recoverPlan.queuedRecovery.id,
+            priority: context.t(`agent.queue.priority.${recoverPlan.queuedRecovery.priority}`),
+          }),
+        );
+      } else {
+        if (recoverPlan.kind === "heal_then_resume") {
+          lines.push(context.t("agent.command.recover.planActionHeal"));
+        }
+        lines.push(context.t("agent.command.recover.planActionResume"));
+      }
+      lines.push(context.t("agent.command.recover.planActionStrict"));
+      lines.push(context.t("agent.command.recover.planActionInvestigate"));
+      return {
+        message: lines.join("\n"),
+      };
+    };
+    if (action === "status" || action === "check") {
+      const lines = [
+        context.t("agent.command.recover.title"),
+        state.kind === "none"
+          ? context.t("agent.command.recover.state.none")
+          : context.t("agent.command.recover.state.interrupted", {
+              reason: formatRecoverReasonLabel(context, state.kind),
+              id: state.lastMessageId ?? context.t("agent.command.notSet"),
+            }),
+        context.t("agent.command.recover.statusPlan", {
+          plan: context.t(`agent.command.recover.plan.${recoverPlan.kind}`),
+        }),
+      ];
+      if (recoverPlan.queuedRecovery) {
+        lines.push(
+          context.t("agent.command.recover.statusQueuedRecovery", {
+            id: recoverPlan.queuedRecovery.id,
+            priority: context.t(`agent.queue.priority.${recoverPlan.queuedRecovery.priority}`),
+          }),
+        );
+      }
+      if (state.kind === "none") {
+        return { message: lines.join("\n") };
+      }
+      lines.push(context.t("agent.command.recover.statusHintPlan"));
+      lines.push(context.t("agent.command.recover.hint"));
+      return {
+        message: lines.join("\n"),
+      };
+    }
+
+    if (action === "investigate" || action === "diagnose" || action === "debug") {
+      return {
+        message: buildRecoverInvestigateMessage(context, parseKeyValueArgs(context.parsed.args.slice(1))),
+      };
+    }
+
+    if (action === "plan" || action === "strategy" || action === "runbook" || action === "playbook") {
+      return runPlan();
+    }
+
+    if (action === "execute" || action === "one-shot") {
+      const executeArgs = context.parsed.args.slice(1).map((arg) => arg.trim().toLowerCase());
+      const strictMode = executeArgs.includes("strict") || executeArgs.includes("--strict");
+      return runExecute(strictMode);
+    }
+
+    if (action === "strict" || action === "gate") {
+      return runExecute(true);
+    }
+
+    if (action === "resume" || action === "run" || action === "continue" || action === "auto" || action === "smart") {
+      return runResume(action === "auto" || action === "smart");
+    }
+
+    return {
+      error: true,
+      message: context.t("agent.command.recover.invalidSubcommand", {
+        subcommand: action,
+      }),
+    };
+  },
+};
+
+const budgetCommand: SlashCommand = {
+  name: "budget",
+  aliases: ["toolbudget", "tb"],
+  category: "core",
+  descriptionKey: "agent.command.budget.description",
+  usageKey: "agent.command.budget.usage",
+  execute: async (context) => {
+    const action = context.parsed.args[0]?.toLowerCase();
+    const formatPolicyLine = (policy: ToolCallBudgetPolicy) =>
+      context.t("agent.command.budget.policy", {
+        readOnlyBase: policy.readOnlyBase,
+        mutatingBase: policy.mutatingBase,
+        shellBase: policy.shellBase,
+        minimum: policy.minimum,
+        failureBackoffStep: policy.failureBackoffStep,
+      });
+
+    if (!action || action === "show" || action === "status") {
+      const current = context.getToolCallBudgetPolicy();
+      return {
+        message: [
+          context.t("agent.command.budget.title"),
+          formatPolicyLine(current),
+        ].join("\n"),
+      };
+    }
+
+    if (action === "reset") {
+      const next = context.setToolCallBudgetPolicy(null);
+      return {
+        message: [
+          context.t("agent.command.budget.title"),
+          context.t("agent.command.budget.reset"),
+          formatPolicyLine(next),
+        ].join("\n"),
+      };
+    }
+
+    if (action === "set") {
+      const { patch, unknownKeys, invalidKeys } = parseToolBudgetPolicyPatch(context.parsed.args.slice(1));
+      if (Object.keys(patch).length === 0) {
+        return {
+          error: true,
+          message: context.t("agent.command.budget.setMissing"),
+        };
+      }
+      const next = context.setToolCallBudgetPolicy(patch);
+      const lines = [
+        context.t("agent.command.budget.title"),
+        context.t("agent.command.budget.updated"),
+        formatPolicyLine(next),
+      ];
+      if (unknownKeys.length > 0) {
+        lines.push(
+          context.t("agent.command.budget.unknownKeys", {
+            keys: unknownKeys.join(", "),
+          }),
+        );
+      }
+      if (invalidKeys.length > 0) {
+        lines.push(
+          context.t("agent.command.budget.invalidKeys", {
+            keys: invalidKeys.join(", "),
+          }),
+        );
+      }
+      return { message: lines.join("\n") };
+    }
+
+    return {
+      error: true,
+      message: context.t("agent.command.budget.invalidSubcommand", {
+        subcommand: action,
+      }),
     };
   },
 };
@@ -1591,180 +1405,51 @@ const traceCommand: SlashCommand = {
   descriptionKey: "agent.command.trace.description",
   usageKey: "agent.command.trace.usage",
   execute: async (context) => {
+    const tTrace = traceTranslate(context);
     const args = context.parsed.args.map((arg) => arg.trim()).filter((arg) => arg.length > 0);
     if (args[0]?.toLowerCase() === "clear") {
       context.clearQueryEvents();
       return { message: context.t("agent.command.trace.cleared") };
     }
 
-    let limit = 20;
-    let filter: TraceFilter = "all";
-    let warningsOnly = false;
-    let summaryMode = false;
-    let hotspotsMode = false;
-    let hottestMode = false;
-    let investigateMode = false;
-    let investigateRunbookMode = false;
-    let investigateWorkflowMode = false;
-    let investigateSubmitMode = false;
-    let failureFocus = false;
-    let toolFocus: string | null = null;
-    let runWindow: TraceRunWindow = "all";
-    let riskFilter: TracePermissionRiskFilter = "all";
-    let reversibilityFilter: TracePermissionReversibilityFilter = "all";
-    let blastRadiusFilter: TracePermissionBlastRadiusFilter = "all";
-
-    for (const raw of args) {
-      const token = raw.toLowerCase();
-      if (token === "warn" || token === "warning" || token === "warnings") {
-        warningsOnly = true;
-        continue;
-      }
-      if (token === "failure" || token === "failures" || token === "failurefocus" || token === "focus") {
-        failureFocus = true;
-        continue;
-      }
-
-      if (parseTraceSummaryToken(token)) {
-        summaryMode = true;
-        continue;
-      }
-      if (token === "hotspots" || token === "hotspot") {
-        hotspotsMode = true;
-        continue;
-      }
-      if (token === "hottest" || token === "toptool" || token === "top-tool" || token === "top") {
-        hottestMode = true;
-        continue;
-      }
-      if (token === "investigate" || token === "investigation" || token === "invest") {
-        investigateMode = true;
-        continue;
-      }
-      if (token === "runbook" || token === "playbook") {
-        investigateRunbookMode = true;
-        continue;
-      }
-      if (token === "workflow" || token === "task") {
-        investigateWorkflowMode = true;
-        continue;
-      }
-      if (token === "execute" || token === "submit" || token === "run") {
-        investigateSubmitMode = true;
-        continue;
-      }
-
-      const parsedToolFocus = parseTraceToolToken(raw);
-      if (parsedToolFocus !== null) {
-        if (!parsedToolFocus) {
-          return { error: true, message: context.t("agent.command.trace.invalidLimit") };
-        }
-        toolFocus = parsedToolFocus;
-        continue;
-      }
-
-      const parsedRunWindow = parseTraceRunWindowToken(raw);
-      if (parsedRunWindow !== null) {
-        runWindow = parsedRunWindow;
-        continue;
-      }
-
-      const parsedRiskFilter = parseTraceRiskToken(raw);
-      if (parsedRiskFilter === "invalid") {
-        return { error: true, message: context.t("agent.command.trace.invalidLimit") };
-      }
-      if (parsedRiskFilter !== null) {
-        riskFilter = parsedRiskFilter;
-        continue;
-      }
-
-      const parsedReversibilityFilter = parseTraceReversibilityToken(raw);
-      if (parsedReversibilityFilter === "invalid") {
-        return { error: true, message: context.t("agent.command.trace.invalidLimit") };
-      }
-      if (parsedReversibilityFilter !== null) {
-        reversibilityFilter = parsedReversibilityFilter;
-        continue;
-      }
-
-      const parsedBlastRadiusFilter = parseTraceBlastRadiusToken(raw);
-      if (parsedBlastRadiusFilter === "invalid") {
-        return { error: true, message: context.t("agent.command.trace.invalidLimit") };
-      }
-      if (parsedBlastRadiusFilter !== null) {
-        blastRadiusFilter = parsedBlastRadiusFilter;
-        continue;
-      }
-
-      const parsedFilter = parseTraceFilterToken(token);
-      if (parsedFilter) {
-        filter = parsedFilter;
-        continue;
-      }
-
-      const parsedLimit = Number.parseInt(token, 10);
-      if (Number.isFinite(parsedLimit) && parsedLimit > 0) {
-        limit = parsedLimit;
-        continue;
-      }
-
+    const parseResult = deriveTraceCommandParseSnapshot(args);
+    if (!parseResult.ok) {
       return { error: true, message: context.t("agent.command.trace.invalidLimit") };
     }
-
-    const usingPromptOnlyShortcut =
-      args.length === 1 &&
-      parseTraceFilterToken(args[0]?.toLowerCase() ?? "") === "prompt";
-    if (
-      usingPromptOnlyShortcut &&
-      !summaryMode &&
-      !hotspotsMode &&
-      !investigateMode
-    ) {
-      summaryMode = true;
-      limit = Math.max(limit, 8);
-    }
+    const {
+      limit,
+      filter,
+      warningsOnly,
+      summaryMode,
+      hotspotsMode,
+      hottestMode,
+      investigateMode,
+      investigateRunbookMode,
+      investigateWorkflowMode,
+      investigateSubmitMode,
+      failureFocus,
+      toolFocus,
+      runWindow,
+      riskFilter,
+      reversibilityFilter,
+      blastRadiusFilter,
+    } = parseResult.snapshot;
 
     const fetchLimit = 80;
-    const allEvents = context.getRecentQueryEvents(fetchLimit);
-    let effectiveToolFocus = toolFocus;
-    let hottestApplied = false;
-    if (hottestMode && !effectiveToolFocus) {
-      const candidateRuns = buildVisibleTraceRunSummaries({
-        events: allEvents,
-        filter,
-        riskFilter,
-        reversibilityFilter,
-        blastRadiusFilter,
-        warningsOnly,
-        failureFocus,
-        toolFocus: null,
-        runWindow,
-      });
-      const hottest = buildTraceHotspotSummaries(
-        candidateRuns.flatMap((run) => run.visibleEvents),
-        1,
-      )[0];
-      if (hottest) {
-        effectiveToolFocus = hottest.tool;
-        hottestApplied = true;
-      }
-    }
-    const visibleRuns = buildVisibleTraceRunSummaries({
-      events: allEvents,
+    const traceVisibility = deriveTraceVisibilitySnapshot({
+      allEvents: context.getRecentQueryEvents(fetchLimit),
       filter,
       riskFilter,
       reversibilityFilter,
       blastRadiusFilter,
       warningsOnly,
       failureFocus,
-      toolFocus: effectiveToolFocus,
+      toolFocus,
       runWindow,
+      hottestMode,
+      limit,
     });
-    const flattenedVisibleEvents = visibleRuns.flatMap((run) => run.visibleEvents);
-    const visibleEvents =
-      flattenedVisibleEvents.length > limit
-        ? flattenedVisibleEvents.slice(flattenedVisibleEvents.length - limit)
-        : flattenedVisibleEvents;
+    const { effectiveToolFocus, hottestApplied, visibleRuns, visibleEvents } = traceVisibility;
 
     if (visibleEvents.length === 0) {
       return {
@@ -1775,447 +1460,139 @@ const traceCommand: SlashCommand = {
       };
     }
 
-    const lines = visibleEvents.map((event) => {
-      const at = formatTime(context.locale, event.at);
-      return `[${at}] ${formatTraceEventLine(context, event)}`;
-    });
-
-    const filterLabel =
-      filter === "all"
-        ? context.t("agent.trace.filter.all")
-        : context.t(`agent.trace.filter.${filter}`);
-    const filterSuffixes: string[] = [];
-    if (warningsOnly) {
-      filterSuffixes.push(context.t("agent.trace.filter.warningsOnly"));
-    }
-    if (failureFocus) {
-      filterSuffixes.push(context.t("agent.trace.filter.failureFocus"));
-    }
-    if (hottestMode) {
-      if (hottestApplied && effectiveToolFocus) {
-        filterSuffixes.push(context.t("agent.command.trace.filterHottestApplied", { tool: effectiveToolFocus }));
-      } else {
-        filterSuffixes.push(context.t("agent.command.trace.filterHottestNoData"));
-      }
-    }
-    if (effectiveToolFocus) {
-      filterSuffixes.push(context.t("agent.command.trace.filterTool", { tool: effectiveToolFocus }));
-    }
-    if (runWindow === "all") {
-      filterSuffixes.push(context.t("agent.command.trace.filterRunsAll"));
-    } else {
-      filterSuffixes.push(context.t("agent.command.trace.filterRunsWindow", { runs: runWindow }));
-    }
-    if (riskFilter !== "all") {
-      filterSuffixes.push(
-        context.t("agent.command.trace.filterRisk", {
-          risk: context.t(`agent.trace.permissionRisk.${riskFilter}`),
-        }),
-      );
-    }
-    if (reversibilityFilter !== "all") {
-      filterSuffixes.push(
-        context.t("agent.command.trace.filterReversibility", {
-          value: context.t(`agent.permission.prompt.reversibility.${reversibilityFilter}`),
-        }),
-      );
-    }
-    if (blastRadiusFilter !== "all") {
-      filterSuffixes.push(
-        context.t("agent.command.trace.filterBlastRadius", {
-          value: context.t(`agent.permission.prompt.blastRadius.${blastRadiusFilter}`),
-        }),
-      );
-    }
-    const warningLabel = filterSuffixes.length > 0 ? ` | ${filterSuffixes.join(" | ")}` : "";
-
-    if (hotspotsMode) {
-      const hotspotLimit = Math.max(1, Math.min(20, limit));
-      const hotspotVisibleEvents = visibleRuns.flatMap((run) => run.visibleEvents);
-      const hotspotSummaries = buildTraceHotspotSummaries(
-        hotspotVisibleEvents,
-        hotspotLimit,
-      );
-      if (hotspotSummaries.length === 0) {
-        return {
-          message: [
-            context.t("agent.command.trace.hotspotsTitle", { count: 0 }),
-            context.t("agent.command.trace.appliedFilter", {
-              filter: filterLabel,
-              warnings: warningLabel,
-            }),
-            context.t("agent.command.trace.hotspotsEmpty"),
-          ].join("\n"),
-        };
-      }
-      const lines = hotspotSummaries.map((item, index) =>
-        context.t("agent.command.trace.hotspotLine", {
-          index: index + 1,
-          tool: item.tool,
-          total: item.total,
-          errors: item.errors,
-          rejected: item.rejected,
-          denied: item.denied,
-        }),
-      );
-      const top = hotspotSummaries[0];
-      const riskProfileParts = buildTracePermissionRiskParts(
-        context,
-        hotspotVisibleEvents,
-      );
-      const riskProfileLine = riskProfileParts
-        ? context.t("agent.command.trace.riskProfile", { risks: riskProfileParts })
-        : null;
-      const riskProfileMatrixLine = buildTracePermissionRiskProfileLine(
-        context,
-        hotspotVisibleEvents,
-      );
-      const queuePriorityStats = buildTraceQueuePriorityStats(hotspotVisibleEvents, context.queueLimit);
-      const queuePriorityLine =
-        queuePriorityStats.total > 0 || queuePriorityStats.latestQueueDepth > 0
-          ? context.t("agent.command.trace.hotspotsQueuePriority", {
-              nowLabel: context.t("agent.queue.priority.now"),
-              nowQueued: formatNumber(queuePriorityStats.queued.now),
-              nowDequeued: formatNumber(queuePriorityStats.dequeued.now),
-              nowRejected: formatNumber(queuePriorityStats.rejected.now),
-              nextLabel: context.t("agent.queue.priority.next"),
-              nextQueued: formatNumber(queuePriorityStats.queued.next),
-              nextDequeued: formatNumber(queuePriorityStats.dequeued.next),
-              nextRejected: formatNumber(queuePriorityStats.rejected.next),
-              laterLabel: context.t("agent.queue.priority.later"),
-              laterQueued: formatNumber(queuePriorityStats.queued.later),
-              laterDequeued: formatNumber(queuePriorityStats.dequeued.later),
-              laterRejected: formatNumber(queuePriorityStats.rejected.later),
-              depth: formatNumber(queuePriorityStats.latestQueueDepth),
-              limitSuffix: context.queueLimit > 0 ? `/${formatNumber(context.queueLimit)}` : "",
-              pressure: context.t(`agent.trace.queuePressure.${queuePriorityStats.pressure}`),
-            })
-          : null;
-      const scopeFilterTokens: string[] = [];
-      if (riskFilter !== "all") scopeFilterTokens.push(`risk=${riskFilter}`);
-      if (reversibilityFilter !== "all") scopeFilterTokens.push(`reversibility=${reversibilityFilter}`);
-      if (blastRadiusFilter !== "all") scopeFilterTokens.push(`blast=${blastRadiusFilter}`);
-      const hintCommand = top
-        ? `/trace summary failure tool=${top.tool} ${runWindow === "all" ? "runs=all" : `runs=${runWindow}`}${
-            scopeFilterTokens.length > 0 ? ` ${scopeFilterTokens.join(" ")}` : ""
-          }`
-        : null;
-      return {
-        message: [
-          context.t("agent.command.trace.hotspotsTitle", { count: hotspotSummaries.length }),
-          context.t("agent.command.trace.appliedFilter", {
-            filter: filterLabel,
-            warnings: warningLabel,
-          }),
-          ...(riskProfileLine ? [riskProfileLine] : []),
-          ...(riskProfileMatrixLine ? [riskProfileMatrixLine] : []),
-          ...(queuePriorityLine ? [queuePriorityLine] : []),
-          ...lines,
-          ...(hintCommand ? [context.t("agent.command.trace.hotspotsHint", { command: hintCommand })] : []),
-        ].join("\n"),
-      };
-    }
-
-    if (investigateMode) {
-      const hottest = buildTraceHotspotSummaries(
-        visibleRuns.flatMap((run) => run.visibleEvents),
-        1,
-      )[0];
-      if (!hottest) {
-        return {
-          message: [
-            context.t("agent.command.trace.investigateTitleEmpty"),
-            context.t("agent.command.trace.appliedFilter", {
-              filter: filterLabel,
-              warnings: warningLabel,
-            }),
-            context.t("agent.command.trace.hotspotsEmpty"),
-          ].join("\n"),
-        };
-      }
-      const prompt = context.t("agent.command.trace.investigatePrompt", {
-        tool: hottest.tool,
-        total: hottest.total,
-        errors: hottest.errors,
-        rejected: hottest.rejected,
-        denied: hottest.denied,
-      });
-      const runbookLines = buildTraceInvestigateRunbookLines({
-        context,
-        tool: hottest.tool,
-        total: hottest.total,
-        errors: hottest.errors,
-        rejected: hottest.rejected,
-        denied: hottest.denied,
+    const filterLabels = deriveTraceAppliedFilterLabelSnapshot(
+      createTraceAppliedFilterLabelOptions({
+        t: (key, vars) => context.t(key as any, vars),
+        filter,
+        warningsOnly,
+        failureFocus,
+        hottestMode,
+        hottestApplied,
+        effectiveToolFocus,
         runWindow,
         riskFilter,
         reversibilityFilter,
         blastRadiusFilter,
+      }),
+    );
+    const { filterLabel, warningLabel } = filterLabels;
+
+    if (hotspotsMode) {
+      const hotspotVisibleEvents = visibleRuns.flatMap((run) => run.visibleEvents);
+      return {
+        message: deriveTraceHotspotsMessage(createTraceHotspotsMessageOptions({
+          t: (key, vars) => context.t(key as any, vars),
+          visibleEvents: hotspotVisibleEvents,
+          limit,
+          queueLimit: context.queueLimit,
+          filterLabel,
+          warningLabel,
+          runWindow,
+          riskFilter,
+          reversibilityFilter,
+          blastRadiusFilter,
+          formatNumber,
+          formatFailureClassLabel: (failureClass) =>
+            formatTraceToolFailureClassLabel(tTrace, failureClass),
+          formatPermissionRiskLabel: (risk) => context.t(`agent.trace.permissionRisk.${risk}`),
+          formatQueuePressureLabel: (pressure) => context.t(`agent.trace.queuePressure.${pressure}`),
+        })),
+      };
+    }
+
+    if (investigateMode) {
+      const investigatePlan = deriveTraceInvestigateActionPlan({
+        t: (key, vars) => context.t(key as any, vars),
+        visibleEvents: visibleRuns.flatMap((run) => run.visibleEvents),
+        runWindow,
+        riskFilter,
+        reversibilityFilter,
+        blastRadiusFilter,
+        investigateWorkflowMode,
+        investigateSubmitMode,
       });
-      const workflowTask = investigateWorkflowMode
-        ? context.taskManager.createTask({
+      const workflowDescriptor = investigatePlan.workflowDescriptor;
+      const workflowTask =
+        workflowDescriptor
+          ? context.taskManager.createTask({
             type: "local_workflow",
-            description: context.t("agent.command.trace.investigateWorkflowDescription", {
-              tool: hottest.tool,
-            }),
-            metadata: {
-              source: "trace_investigate",
-              tool: hottest.tool,
-              total: hottest.total,
-              errors: hottest.errors,
-              rejected: hottest.rejected,
-              denied: hottest.denied,
-            },
+            description: workflowDescriptor.description,
+            metadata: workflowDescriptor.metadata,
             run: async ({ log }) => {
-              log(context.t("agent.command.trace.investigateWorkflowLogHeader", { tool: hottest.tool }));
-              for (const line of runbookLines) {
+              log(workflowDescriptor.logHeader);
+              for (const line of investigatePlan.runbookLines) {
                 log(line);
               }
             },
           })
-        : null;
-      const submitResult = investigateSubmitMode
-        ? context.submitFollowupQuery(prompt, {
-            model: context.currentModel,
-            permissionMode: context.permissionMode,
-            priority: "later",
-          })
-        : null;
-      const submitResultLine = submitResult
-        ? submitResult.accepted
-          ? submitResult.started
-            ? context.t("agent.command.trace.investigateSubmitStarted")
-            : context.t("agent.command.trace.investigateSubmitQueued", {
-                queue: submitResult.queueCount,
-                limit: submitResult.queueLimit,
-              })
-          : submitResult.reason === "queue_full"
-            ? context.t("agent.command.trace.investigateSubmitQueueFull", {
-                queue: submitResult.queueCount,
-                limit: submitResult.queueLimit,
-              })
-            : context.t("agent.command.trace.investigateSubmitEmpty")
-        : null;
+          : null;
+      const submitResult =
+        investigatePlan.submitPrompt
+          ? context.submitFollowupQuery(
+            investigatePlan.submitPrompt,
+            {
+              model: context.currentModel,
+              permissionMode: context.permissionMode,
+              priority: "later",
+            },
+          )
+          : null;
+      const submitResultLine = deriveTraceInvestigateSubmitResultLine({
+        submitResult,
+        t: (key, vars) => context.t(key as any, vars),
+      });
       return {
-        message: [
-          context.t("agent.command.trace.investigateTitle", { tool: hottest.tool }),
-          context.t("agent.command.trace.appliedFilter", {
-            filter: filterLabel,
-            warnings: warningLabel,
-          }),
-          context.t("agent.command.trace.investigateStats", {
-            total: hottest.total,
-            errors: hottest.errors,
-            rejected: hottest.rejected,
-            denied: hottest.denied,
-          }),
-          ...(submitResultLine ? ["", submitResultLine] : []),
-          "",
-          prompt,
-          ...(investigateRunbookMode || investigateWorkflowMode
-            ? ["", ...runbookLines]
-            : []),
-          ...(workflowTask
-            ? [
-                "",
-                context.t("agent.command.task.created", { taskId: workflowTask.id }),
-                context.t("agent.command.task.createdType", { type: workflowTask.type }),
-                context.t("agent.command.task.createdDescription", { description: workflowTask.description }),
-                context.t("agent.command.task.createdHint", { taskId: workflowTask.id }),
-              ]
-            : []),
-        ].join("\n"),
+        message: deriveTraceInvestigateMessage(createTraceInvestigateMessageOptions({
+          t: (key, vars) => context.t(key as any, vars),
+          hotspot: investigatePlan.hotspot,
+          filterLabel,
+          warningLabel,
+          runbookLines: investigatePlan.runbookLines,
+          investigateRunbookMode,
+          investigateWorkflowMode,
+          submitResultLine,
+          workflowTask: workflowTask
+            ? {
+                id: workflowTask.id,
+                type: workflowTask.type,
+                description: workflowTask.description,
+              }
+            : null,
+        })),
       };
     }
 
     if (summaryMode) {
-      const limitedVisibleRuns = visibleRuns.length > limit
-        ? visibleRuns.slice(visibleRuns.length - limit)
-        : visibleRuns;
-
-      if (limitedVisibleRuns.length === 0) {
-        return {
-          message: [
-            context.t("agent.command.trace.summaryTitle", { count: 0 }),
-            context.t("agent.command.trace.empty"),
-          ].join("\n"),
-        };
-      }
-
-      const summaryLines = limitedVisibleRuns.map((run) => {
-        const durationSec = Math.max(0, ((run.endedAt - run.startedAt) / 1000)).toFixed(1);
-        const terminalReason = run.terminalReason
-          ? formatTerminalReasonLabel(context, {
-              type: "query_end",
-              terminalReason: run.terminalReason,
-              durationMs: Math.max(0, run.endedAt - run.startedAt),
-              at: run.endedAt,
-            })
-          : context.t("agent.trace.runStatusOngoing");
-        const categoryParts = TRACE_CATEGORY_ORDER
-          .filter((category) => run.categoryCounts[category] > 0)
-          .map((category) => `${context.t(`agent.trace.bucket.${category}`)}=${run.categoryCounts[category]}`)
-          .join(" ");
-        const baseLine = context.t("agent.command.trace.summaryLine", {
-          run: run.runIndex,
-          status: terminalReason,
-          duration: durationSec,
-          events: run.visibleEvents.length,
-          warns: run.warningCount,
-          errors: run.errorCount,
-          categories: categoryParts,
-        });
-        const detailLines: string[] = [];
-        const promptEvents = run.visibleEvents.filter(
-          (event): event is Extract<QueryStreamEvent, { type: "prompt_compiled" }> =>
-            event.type === "prompt_compiled",
-        );
-        if (promptEvents.length > 0) {
-          const latestPrompt = promptEvents[promptEvents.length - 1];
-          const promptLine = formatTraceEventLine(context, latestPrompt);
-          detailLines.push(`${context.t("agent.trace.bucket.prompt")}: ${promptLine}`);
-        }
-        const hotspotParts = buildTraceHotspotParts(run.visibleEvents, 5);
-        if (hotspotParts) {
-          detailLines.push(
-            context.t("agent.command.trace.summaryHotspots", { hotspots: hotspotParts }),
-          );
-        }
-        const riskProfileMatrixLine = buildTracePermissionRiskProfileLine(context, run.visibleEvents);
-        if (riskProfileMatrixLine) {
-          detailLines.push(riskProfileMatrixLine);
-        }
-        const fallbackStats = buildTraceFallbackStats(run.visibleEvents);
-        if (fallbackStats.used > 0 || fallbackStats.suppressed > 0) {
-          const fallbackLineKey = fallbackStats.latestSuppressed
-            ? "agent.command.trace.summaryFallbackDetailed"
-            : "agent.command.trace.summaryFallback";
-          detailLines.push(
-            context.t(fallbackLineKey, {
-              used: formatNumber(fallbackStats.used),
-              suppressed: formatNumber(fallbackStats.suppressed),
-              reason: fallbackStats.latestSuppressed
-                ? context.t(
-                    `agent.trace.fallbackSuppressedReason.${fallbackStats.latestSuppressed.reason}`,
-                  )
-                : "-",
-              strategy: fallbackStats.latestSuppressed
-                ? formatRetryStrategyLabel(context, fallbackStats.latestSuppressed.retryStrategy)
-                : formatRetryStrategyLabel(context, "balanced"),
-            }),
-          );
-        }
-        const queuePriorityStats = buildTraceQueuePriorityStats(run.visibleEvents, context.queueLimit);
-        if (queuePriorityStats.total > 0) {
-          detailLines.push(
-            context.t("agent.command.trace.summaryQueuePriority", {
-              nowLabel: context.t("agent.queue.priority.now"),
-              nowQueued: formatNumber(queuePriorityStats.queued.now),
-              nowDequeued: formatNumber(queuePriorityStats.dequeued.now),
-              nowRejected: formatNumber(queuePriorityStats.rejected.now),
-              nextLabel: context.t("agent.queue.priority.next"),
-              nextQueued: formatNumber(queuePriorityStats.queued.next),
-              nextDequeued: formatNumber(queuePriorityStats.dequeued.next),
-              nextRejected: formatNumber(queuePriorityStats.rejected.next),
-              laterLabel: context.t("agent.queue.priority.later"),
-              laterQueued: formatNumber(queuePriorityStats.queued.later),
-              laterDequeued: formatNumber(queuePriorityStats.dequeued.later),
-              laterRejected: formatNumber(queuePriorityStats.rejected.later),
-            }),
-          );
-        }
-        if (detailLines.length === 0) {
-          return baseLine;
-        }
-        return `${baseLine}\n  ${detailLines.join("\n  ")}`;
+      const summarySnapshot = deriveTraceSummarySnapshot({
+        visibleRuns,
+        limit,
+        queueLimit: context.queueLimit,
       });
-      const overallVisibleEvents = limitedVisibleRuns.flatMap((run) => run.visibleEvents);
-      const overallHotspotParts = buildTraceHotspotParts(
-        overallVisibleEvents,
-        8,
-      );
-      const overallHotspotLine = overallHotspotParts
-        ? context.t("agent.command.trace.summaryGlobalHotspots", { hotspots: overallHotspotParts })
-        : null;
-      const overallRiskParts = buildTracePermissionRiskParts(
-        context,
-        overallVisibleEvents,
-      );
-      const overallRiskLine = overallRiskParts
-        ? context.t("agent.command.trace.riskProfile", { risks: overallRiskParts })
-        : null;
-      const overallRiskProfileMatrixLine = buildTracePermissionRiskProfileLine(
-        context,
-        overallVisibleEvents,
-      );
-      const overallFallbackStats = buildTraceFallbackStats(
-        overallVisibleEvents,
-      );
-      const overallQueuePriorityStats = buildTraceQueuePriorityStats(overallVisibleEvents, context.queueLimit);
-      const overallFallbackLine =
-        overallFallbackStats.used > 0 || overallFallbackStats.suppressed > 0
-          ? context.t(
-              overallFallbackStats.latestSuppressed
-                ? "agent.command.trace.summaryGlobalFallbackDetailed"
-                : "agent.command.trace.summaryGlobalFallback",
-              {
-                used: formatNumber(overallFallbackStats.used),
-                suppressed: formatNumber(overallFallbackStats.suppressed),
-                reason: overallFallbackStats.latestSuppressed
-                  ? context.t(
-                      `agent.trace.fallbackSuppressedReason.${overallFallbackStats.latestSuppressed.reason}`,
-                    )
-                  : "-",
-                strategy: overallFallbackStats.latestSuppressed
-                  ? formatRetryStrategyLabel(context, overallFallbackStats.latestSuppressed.retryStrategy)
-                  : formatRetryStrategyLabel(context, "balanced"),
-              },
-            )
-          : null;
-      const overallQueuePriorityLine =
-        overallQueuePriorityStats.total > 0
-          ? context.t("agent.command.trace.summaryGlobalQueuePriority", {
-              nowLabel: context.t("agent.queue.priority.now"),
-              nowQueued: formatNumber(overallQueuePriorityStats.queued.now),
-              nowDequeued: formatNumber(overallQueuePriorityStats.dequeued.now),
-              nowRejected: formatNumber(overallQueuePriorityStats.rejected.now),
-              nextLabel: context.t("agent.queue.priority.next"),
-              nextQueued: formatNumber(overallQueuePriorityStats.queued.next),
-              nextDequeued: formatNumber(overallQueuePriorityStats.dequeued.next),
-              nextRejected: formatNumber(overallQueuePriorityStats.rejected.next),
-              laterLabel: context.t("agent.queue.priority.later"),
-              laterQueued: formatNumber(overallQueuePriorityStats.queued.later),
-              laterDequeued: formatNumber(overallQueuePriorityStats.dequeued.later),
-              laterRejected: formatNumber(overallQueuePriorityStats.rejected.later),
-            })
-          : null;
-
       return {
-        message: [
-          context.t("agent.command.trace.summaryTitle", { count: limitedVisibleRuns.length }),
-          context.t("agent.command.trace.appliedFilter", {
-            filter: filterLabel,
-            warnings: warningLabel,
-          }),
-          ...(overallHotspotLine ? [overallHotspotLine] : []),
-          ...(overallRiskLine ? [overallRiskLine] : []),
-          ...(overallRiskProfileMatrixLine ? [overallRiskProfileMatrixLine] : []),
-          ...(overallFallbackLine ? [overallFallbackLine] : []),
-          ...(overallQueuePriorityLine ? [overallQueuePriorityLine] : []),
-          ...summaryLines,
-        ].join("\n"),
+        message: deriveTraceSummaryMessage(createTraceSummaryMessageOptions({
+          t: (key, vars) => context.t(key as any, vars),
+          summarySnapshot,
+          formatNumber,
+          filterLabel,
+          warningLabel,
+          formatTerminalReasonLabel: (reason) => formatTraceTerminalReasonLabel(tTrace, reason),
+          formatRetryStrategyLabel: (strategy) => formatTraceRetryStrategyLabel(tTrace, strategy),
+          formatFailureClassLabel: (failureClass) =>
+            formatTraceToolFailureClassLabel(tTrace, failureClass),
+          formatPromptLine: (event) => formatTraceEventLine(context, event),
+        })),
       };
     }
 
     return {
-      message: [
-        context.t("agent.command.trace.title", { count: visibleEvents.length }),
-        context.t("agent.command.trace.appliedFilter", {
-          filter: filterLabel,
-          warnings: warningLabel,
-        }),
-        ...lines,
-      ].join("\n"),
+      message: deriveTraceListMessage(createTraceListMessageOptions({
+        t: (key, vars) => context.t(key as any, vars),
+        visibleEvents,
+        formatEventTime: (at) => formatTime(context.locale, at),
+        formatEventLine: (event) => formatTraceEventLine(context, event),
+        filterLabel,
+        warningLabel,
+      })),
     };
   },
 };
@@ -2693,68 +2070,148 @@ const doctorCommand: SlashCommand = {
   descriptionKey: "agent.command.doctor.description",
   usageKey: "agent.command.doctor.usage",
   execute: async (context) => {
+    const tTrace = traceTranslate(context);
     const mode = context.parsed.args[0]?.toLowerCase();
     const subMode = context.parsed.args[1]?.toLowerCase();
-    if (mode === "fallback" && subMode === "investigate") {
+    if (mode === "queue" && subMode === "investigate") {
       const kv = parseKeyValueArgs(context.parsed.args.slice(2));
-      const fallbackSuppressed = parseNonNegativeNumber(kv.fallback_suppressed, 0);
-      const fallbackUsed = parseNonNegativeNumber(kv.fallback_used, 0);
-      const retryEvents = parseNonNegativeNumber(kv.retry_events, 0);
-      const derivedTotal = fallbackSuppressed + fallbackUsed;
-      const suppressionRatioPct = parseNonNegativeNumber(
-        kv.suppression_ratio_pct,
-        derivedTotal > 0 ? Math.round((fallbackSuppressed / derivedTotal) * 100) : 0,
-      );
-      const reasonLabel = formatFallbackSuppressedReasonLabel(context, kv.last_reason ?? kv.reason ?? "unknown");
-      const strategyLabel = formatRetryStrategyLabel(
-        context,
-        (kv.last_strategy ?? kv.strategy ?? "balanced").replace(/\s+/g, "_"),
-      );
-      const queuePressure = deriveQueuePressure(context.queueCount, context.queueLimit);
-      const queuePressureLabel = context.t(`agent.trace.queuePressure.${queuePressure}`);
-      const assessmentKey =
-        suppressionRatioPct >= DOCTOR_FALLBACK_SUPPRESSION_WARN_RATIO_PCT || fallbackSuppressed > 0
-          ? "agent.command.doctor.fallbackInvestigateAssessmentHigh"
-          : "agent.command.doctor.fallbackInvestigateAssessmentNormal";
+      const queueEvents = context
+        .getRecentQueryEvents(400)
+        .filter(
+          (event): event is Extract<QueryStreamEvent, { type: "queue_update" }> =>
+            event.type === "queue_update",
+        );
+      const queuePriorityStats = buildTraceQueuePriorityStats(queueEvents, context.queueLimit);
+      const queueReasonStats = buildTraceQueueReasonStats(queueEvents);
+      const latestQueueEvent = queueEvents.length > 0 ? queueEvents[queueEvents.length - 1] : null;
+      const derivedQueueLimit = Math.max(0, latestQueueEvent?.queueLimit ?? context.queueLimit);
+      const derivedLatestDepth = queuePriorityStats.latestQueueDepth;
+      const derivedMaxDepth = Math.max(queuePriorityStats.maxQueueDepth, derivedLatestDepth);
+      const derivedQueuedCount =
+        queuePriorityStats.queued.now + queuePriorityStats.queued.next + queuePriorityStats.queued.later;
+      const derivedDequeuedCount =
+        queuePriorityStats.dequeued.now + queuePriorityStats.dequeued.next + queuePriorityStats.dequeued.later;
+      const derivedRejectedCount =
+        queuePriorityStats.rejected.now + queuePriorityStats.rejected.next + queuePriorityStats.rejected.later;
+      const fallbackPressure =
+        queueEvents.length > 0
+          ? queuePriorityStats.pressure
+          : deriveQueuePressure(Math.max(0, context.queueCount), Math.max(0, context.queueLimit));
+      const queueInvestigateRuntime = deriveDoctorQueueInvestigateRuntime({
+        kv,
+        fallback: {
+          pressure: fallbackPressure,
+          queueLimit: derivedQueueLimit,
+          latestDepth: derivedLatestDepth,
+          maxDepth: derivedMaxDepth,
+          queuedCount: derivedQueuedCount,
+          dequeuedCount: derivedDequeuedCount,
+          rejectedCount: derivedRejectedCount,
+          deduplicatedCount: queueReasonStats.deduplicated,
+          capacityRejections: queueReasonStats.capacity,
+          staleRejections: queueReasonStats.stale,
+          manualRejections: queueReasonStats.manual,
+          dominantPriorityLabel: getDominantQueuePriorityLabel(context, queuePriorityStats.queued),
+        },
+        labels: {
+          pressureById: {
+            idle: context.t("agent.trace.queuePressure.idle"),
+            busy: context.t("agent.trace.queuePressure.busy"),
+            congested: context.t("agent.trace.queuePressure.congested"),
+            saturated: context.t("agent.trace.queuePressure.saturated"),
+          },
+          priorityById: {
+            now: context.t("agent.queue.priority.now"),
+            next: context.t("agent.queue.priority.next"),
+            later: context.t("agent.queue.priority.later"),
+          },
+        },
+        formatNumber,
+      });
+
       return {
-        message: [
-          context.t("agent.command.doctor.fallbackInvestigateTitle"),
-          context.t("agent.command.doctor.fallbackInvestigateScope", {
-            suppressed: formatNumber(fallbackSuppressed),
-            used: formatNumber(fallbackUsed),
-            ratio: formatNumber(suppressionRatioPct),
-            retryEvents: formatNumber(retryEvents),
-            reason: reasonLabel,
-            strategy: strategyLabel,
-            pressure: queuePressureLabel,
-          }),
-          context.t(assessmentKey),
-          context.t("agent.command.doctor.fallbackInvestigateDiagnosisHeader"),
-          context.t("agent.command.doctor.fallbackInvestigateDiagnosisTraceSummary"),
-          context.t("agent.command.doctor.fallbackInvestigateDiagnosisQueueHotspots"),
-          context.t("agent.command.doctor.fallbackInvestigateFixHeader"),
-          context.t("agent.command.doctor.fallbackInvestigateFixPolicy"),
-          context.t("agent.command.doctor.fallbackInvestigateFixQueue"),
-          context.t("agent.command.doctor.fallbackInvestigateVerifyHeader"),
-          context.t("agent.command.doctor.fallbackInvestigateVerifyStatus"),
-          context.t("agent.command.doctor.fallbackInvestigateVerifyDoctor"),
-          context.t("agent.command.doctor.fallbackInvestigateVerifyOutcome"),
-        ].join("\n"),
+        message: queueInvestigateRuntime.lines
+          .map((line) => context.t(line.key, line.vars))
+          .join("\n"),
       };
     }
 
-    const lines: string[] = [context.t("agent.command.doctor.title")];
-    const recommendations: string[] = [];
+    if ((mode === "recover" || mode === "recovery") && subMode === "investigate") {
+      return {
+        message: buildRecoverInvestigateMessage(context, parseKeyValueArgs(context.parsed.args.slice(2))),
+      };
+    }
+
+    if (mode === "fallback" && subMode === "investigate") {
+      const kv = parseKeyValueArgs(context.parsed.args.slice(2));
+      const reasonLabel = formatTraceFallbackSuppressedReasonLabel(
+        tTrace,
+        kv.last_reason ?? kv.reason ?? "unknown",
+        context.t("agent.command.unknown"),
+      );
+      const strategyLabel = formatTraceRetryStrategyLabel(
+        tTrace,
+        (kv.last_strategy ?? kv.strategy ?? "balanced").replace(/\s+/g, "_"),
+      );
+      const queuePressure = deriveQueuePressure(context.queueCount, context.queueLimit);
+      const fallbackInvestigateRuntime = deriveDoctorFallbackInvestigateRuntime({
+        kv,
+        queuePressure,
+        queuePressureLabel: context.t(`agent.trace.queuePressure.${queuePressure}`),
+        reasonLabel,
+        strategyLabel,
+        suppressionWarnThresholdPct: DOCTOR_FALLBACK_SUPPRESSION_WARN_RATIO_PCT,
+        formatNumber,
+      });
+      return {
+        message: fallbackInvestigateRuntime.lines
+          .map((line) => context.t(line.key, line.vars))
+          .join("\n"),
+      };
+    }
+
+    const sectionComposer = createDoctorSectionComposer();
+    sectionComposer.addLine("header", context.t("agent.command.doctor.title"));
+    const recommendations: DoctorRecommendationEntry[] = [];
+    const addRecommendation = (id: DoctorRecommendationId, text: string) => {
+      recommendations.push({ id, text });
+    };
+    const addEnvironmentEvaluation = (
+      sectionId: "workspace" | "git",
+      evaluation: DoctorEnvironmentEvaluation,
+      options?: { workspaceForInitGit?: string | null },
+    ) => {
+      sectionComposer.addLine(
+        sectionId,
+        formatDoctorLine(
+          evaluation.line.level,
+          context.t(evaluation.line.key, evaluation.line.vars),
+        ),
+      );
+      for (const recommendationId of evaluation.recommendationIds) {
+        const workspaceOptions =
+          recommendationId === "initGit"
+            ? { workspace: options?.workspaceForInitGit ?? context.workingDir ?? null }
+            : undefined;
+        addRecommendation(
+          recommendationId,
+          getDoctorRecommendationText(context, recommendationId, workspaceOptions),
+        );
+      }
+    };
     let hasGitRepo: boolean | null = null;
 
-    const apiState = context.currentModel
-      ? context.t("agent.command.doctor.apiReady", { model: context.currentModel })
-      : context.t("agent.command.doctor.apiMissing");
-    lines.push(`[OK] ${apiState}`);
+    const apiStateLine = deriveDoctorApiStateLine(context.currentModel);
+    sectionComposer.addLine(
+      "header",
+      formatDoctorLine(
+        apiStateLine.level,
+        context.t(apiStateLine.key, apiStateLine.vars),
+      ),
+    );
 
     if (!context.workingDir) {
-      lines.push(`[WARN] ${context.t("agent.command.doctor.workspaceMissing")}`);
-      recommendations.push(context.t("agent.command.doctor.recommend.selectWorkspace"));
+      addEnvironmentEvaluation("workspace", deriveDoctorWorkspaceMissing());
     } else {
       try {
         const result: any = await invoke("invoke_agent_list_dir", {
@@ -2766,18 +2223,14 @@ const doctorCommand: SlashCommand = {
           },
         });
         const count = Number(result?.total_count ?? 0);
-        lines.push(
-          `[OK] ${context.t("agent.command.doctor.workspaceOk", {
-            workspace: context.workingDir,
-            count: formatNumber(count),
-          })}`,
+        addEnvironmentEvaluation(
+          "workspace",
+          deriveDoctorWorkspaceOk(context.workingDir, formatNumber(count)),
         );
       } catch (error) {
-        lines.push(
-          `[FAIL] ${context.t("agent.command.doctor.workspaceFail", {
-            workspace: context.workingDir,
-            error: String(error),
-          })}`,
+        addEnvironmentEvaluation(
+          "workspace",
+          deriveDoctorWorkspaceFail(context.workingDir, String(error)),
         );
       }
     }
@@ -2790,245 +2243,222 @@ const doctorCommand: SlashCommand = {
             max_commits: 3,
           },
         });
-
-        if (snapshot?.is_git_repo) {
-          hasGitRepo = true;
-          lines.push(
-            `[OK] ${context.t("agent.command.doctor.gitOk", {
-              branch: snapshot.branch || context.t("agent.command.unknown"),
-              base: snapshot.default_branch || context.t("agent.command.unknown"),
-            })}`,
-          );
-        } else {
-          hasGitRepo = false;
-          lines.push(
-            `[WARN] ${context.t("agent.command.doctor.gitMissing", {
-              workspace: context.workingDir,
-            })}`,
-          );
-          recommendations.push(
-            context.t("agent.command.doctor.recommend.initGit", {
-              workspace: context.workingDir,
-            }),
-          );
-        }
+        const gitEvaluation = deriveDoctorGitLineFromSnapshot({
+          workspace: context.workingDir,
+          snapshot,
+          unknownLabel: context.t("agent.command.unknown"),
+        });
+        hasGitRepo = gitEvaluation.hasGitRepo;
+        addEnvironmentEvaluation("git", gitEvaluation, {
+          workspaceForInitGit: context.workingDir,
+        });
       } catch (error) {
-        lines.push(
-          `[WARN] ${context.t("agent.command.doctor.gitFail", { error: String(error) })}`,
+        addEnvironmentEvaluation(
+          "git",
+          deriveDoctorGitLineFromError(String(error)),
         );
-        recommendations.push(context.t("agent.command.doctor.recommend.checkGit"));
       }
     }
 
-    const usage = context.getUsageSnapshot();
-    lines.push(
-      `[OK] ${context.t("agent.command.doctor.usageStats", {
-        total: formatNumber(usage.totals.totalTokens),
-        models: formatNumber(usage.byModel.length),
-      })}`,
-    );
     const recentEvents = context.getRecentQueryEvents(120);
+    const usage = context.getUsageSnapshot();
     const lastQueryStart = [...recentEvents]
       .reverse()
       .find((event): event is Extract<QueryStreamEvent, { type: "query_start" }> => event.type === "query_start");
-    if (lastQueryStart) {
-      lines.push(
-        `[OK] ${context.t("agent.command.doctor.queryProfile", {
-          lane: context.t(`agent.trace.queryLane.${lastQueryStart.lane ?? "foreground"}`),
-          retries: typeof lastQueryStart.retryMax === "number" ? String(lastQueryStart.retryMax) : "-",
-          fallback: context.t(`agent.trace.queryFallback.${lastQueryStart.fallbackEnabled ? "on" : "off"}`),
-          strategy: formatRetryStrategyLabel(context, lastQueryStart.retryStrategy),
-        })}`,
-      );
-    }
     const fallbackStats = buildTraceFallbackStats(recentEvents);
-    if (fallbackStats.used > 0 || fallbackStats.suppressed > 0) {
-      lines.push(
-        `[OK] ${context.t("agent.command.doctor.fallbackActivity", {
-          used: formatNumber(fallbackStats.used),
-          suppressed: formatNumber(fallbackStats.suppressed),
-        })}`,
+    const toolFailureStats = buildToolFailureClassStats({
+      events: recentEvents,
+      formatFailureClassLabel: (failureClass) =>
+        formatTraceToolFailureClassLabel(tTrace, failureClass),
+    });
+    const toolFailureCounts = collectToolFailureClassCounts(recentEvents);
+    const budgetGuardStats = buildToolBudgetGuardReasonStats(recentEvents);
+    const operationalSectionRuntime = deriveDoctorOperationalSectionRuntime({
+      usage: {
+        totalTokensLabel: formatNumber(usage.totals.totalTokens),
+        modelCountLabel: formatNumber(usage.byModel.length),
+      },
+      queryProfile: lastQueryStart
+        ? {
+            laneLabel: context.t(`agent.trace.queryLane.${lastQueryStart.lane ?? "foreground"}`),
+            retriesLabel:
+              typeof lastQueryStart.retryMax === "number" ? String(lastQueryStart.retryMax) : "-",
+            fallbackLabel: context.t(
+              `agent.trace.queryFallback.${lastQueryStart.fallbackEnabled ? "on" : "off"}`,
+            ),
+            strategyLabel: formatTraceRetryStrategyLabel(tTrace, lastQueryStart.retryStrategy),
+          }
+        : null,
+      fallback: {
+        used: fallbackStats.used,
+        suppressed: fallbackStats.suppressed,
+        usedLabel: formatNumber(fallbackStats.used),
+        suppressedLabel: formatNumber(fallbackStats.suppressed),
+        suppressionWarnThresholdPct: DOCTOR_FALLBACK_SUPPRESSION_WARN_RATIO_PCT,
+        latestSuppressed: fallbackStats.latestSuppressed
+          ? {
+              countLabel: formatNumber(fallbackStats.suppressed),
+              reasonLabel: context.t(
+                `agent.trace.fallbackSuppressedReason.${fallbackStats.latestSuppressed.reason}`,
+              ),
+              strategyLabel: formatTraceRetryStrategyLabel(
+                tTrace,
+                fallbackStats.latestSuppressed.retryStrategy,
+              ),
+              reasonId: fallbackStats.latestSuppressed.reason,
+            }
+          : null,
+        formatNumber,
+      },
+      tooling: {
+        toolFailure: {
+          total: toolFailureStats.total,
+          detailsLabel: toolFailureStats.total > 0 ? toolFailureStats.parts : "-",
+          counts: toolFailureCounts,
+        },
+        budgetGuard: {
+          total: budgetGuardStats.total,
+          perToolLimit: budgetGuardStats.perToolLimit,
+          perToolLimitLabel: formatNumber(budgetGuardStats.perToolLimit),
+          failureBackoff: budgetGuardStats.failureBackoff,
+          failureBackoffLabel: formatNumber(budgetGuardStats.failureBackoff),
+          dominantLabel: budgetGuardStats.dominantReason
+            ? formatTraceToolBudgetReasonLabel(tTrace, budgetGuardStats.dominantReason)
+            : context.t("agent.command.notSet"),
+        },
+      },
+    });
+    for (const lineDescriptor of operationalSectionRuntime.lines) {
+      sectionComposer.addLine(
+        lineDescriptor.section,
+        formatDoctorLine(
+          lineDescriptor.level,
+          context.t(lineDescriptor.key, lineDescriptor.vars),
+        ),
       );
     }
-    const totalFallbackTransitions = fallbackStats.used + fallbackStats.suppressed;
-    if (fallbackStats.suppressed > 0 && totalFallbackTransitions > 0) {
-      const suppressionRatioPct = Math.round((fallbackStats.suppressed / totalFallbackTransitions) * 100);
-      if (suppressionRatioPct >= DOCTOR_FALLBACK_SUPPRESSION_WARN_RATIO_PCT) {
-        lines.push(
-          `[WARN] ${context.t("agent.command.doctor.fallbackSuppressedRatio", {
-            ratio: suppressionRatioPct,
-            used: formatNumber(fallbackStats.used),
-            suppressed: formatNumber(fallbackStats.suppressed),
-          })}`,
-        );
-      }
+    for (const recommendationId of operationalSectionRuntime.recommendationIds) {
+      addRecommendation(recommendationId, getDoctorRecommendationText(context, recommendationId));
     }
-    if (fallbackStats.latestSuppressed) {
-      lines.push(
-        `[WARN] ${context.t("agent.command.doctor.fallbackSuppressed", {
-          count: formatNumber(fallbackStats.suppressed),
-          reason: context.t(`agent.trace.fallbackSuppressedReason.${fallbackStats.latestSuppressed.reason}`),
-          strategy: formatRetryStrategyLabel(context, fallbackStats.latestSuppressed.retryStrategy),
-        })}`,
-      );
-      if (
-        fallbackStats.latestSuppressed.reason === "retry_strategy" ||
-        fallbackStats.latestSuppressed.reason === "already_retried"
-      ) {
-        recommendations.push(context.t("agent.command.doctor.recommend.relieveQueueForFallback"));
-      } else if (
-        fallbackStats.latestSuppressed.reason === "fallback_missing" ||
-        fallbackStats.latestSuppressed.reason === "same_model"
-      ) {
-        recommendations.push(context.t("agent.command.doctor.recommend.configureFallbackModel"));
-      } else if (fallbackStats.latestSuppressed.reason === "gate_disabled") {
-        recommendations.push(context.t("agent.command.doctor.recommend.enableFallbackGate"));
-      }
-    }
+
     const lastPromptCompiled = [...recentEvents]
       .reverse()
       .find((event): event is Extract<QueryStreamEvent, { type: "prompt_compiled" }> => {
         return event.type === "prompt_compiled";
       });
-    if (lastPromptCompiled) {
-      lines.push(
-        `[OK] ${context.t("agent.command.doctor.promptStats", {
-          staticSections: formatNumber(lastPromptCompiled.staticSections),
-          dynamicSections: formatNumber(lastPromptCompiled.dynamicSections),
-          staticChars: formatNumber(lastPromptCompiled.staticChars),
-          dynamicChars: formatNumber(lastPromptCompiled.dynamicChars),
-          totalChars: formatNumber(lastPromptCompiled.totalChars),
-        })}`,
+    const promptLineDescriptors = deriveDoctorPromptSectionLineDescriptors({
+      lastPromptCompiled: lastPromptCompiled ?? null,
+      formatNumber,
+    });
+    for (const lineDescriptor of promptLineDescriptors) {
+      sectionComposer.addLine(
+        "prompt",
+        formatDoctorLine(
+          lineDescriptor.level,
+          context.t(lineDescriptor.key, lineDescriptor.vars),
+        ),
       );
-      if (lastPromptCompiled.staticHash && lastPromptCompiled.dynamicHash) {
-        lines.push(
-          `[OK] ${context.t("agent.command.doctor.promptHashes", {
-            staticHash: lastPromptCompiled.staticHash,
-            dynamicHash: lastPromptCompiled.dynamicHash,
-          })}`,
-        );
-      }
-      if (Array.isArray(lastPromptCompiled.modelLaunchTags) && lastPromptCompiled.modelLaunchTags.length > 0) {
-        lines.push(
-          `[OK] ${context.t("agent.command.doctor.promptTags", {
-            tags: lastPromptCompiled.modelLaunchTags.join(", "),
-          })}`,
-        );
-      }
-      if (Array.isArray(lastPromptCompiled.sectionMetadata) && lastPromptCompiled.sectionMetadata.length > 0) {
-        const governance = summarizePromptGovernance(lastPromptCompiled.sectionMetadata);
-        lines.push(
-          `[OK] ${context.t("agent.command.doctor.promptGovernance", {
-            core: formatNumber(governance.ownerCounts.core),
-            safeguards: formatNumber(governance.ownerCounts.safeguards),
-            runtime: formatNumber(governance.ownerCounts.runtime),
-            immutable: formatNumber(governance.immutableCount),
-            launch: formatNumber(governance.modelLaunchCount),
-          })}`,
-        );
-      }
-    } else {
-      lines.push(`[WARN] ${context.t("agent.command.doctor.promptStatsMissing")}`);
     }
 
     const tasks = context.taskManager.listTasks();
     const running = tasks.filter((task) => task.status === "running").length;
     const queueLimit = Math.max(0, context.queueLimit);
     const queueCount = Math.max(0, context.queueCount);
-    const queuePct =
-      queueLimit > 0 ? Math.min(100, Math.round((queueCount / queueLimit) * 100)) : 0;
-    if (queueLimit > 0 && queueCount >= queueLimit) {
-      lines.push(
-        `[WARN] ${context.t("agent.command.doctor.queueFull", {
-          queue: queueCount,
-          limit: queueLimit,
-        })}`,
+    const recoverRuntimeSnapshot = buildRecoverCommandRuntimeSnapshot({
+      messages: context.getMessages(),
+      queuedQueries: context.getQueuedQueries(),
+      queueLimit: context.queueLimit,
+      queueCountOverride: queueCount,
+      queueLimitOverride: queueLimit,
+      events: recentEvents,
+      queuedRecoveryMatcher: isRecoverContinuePrompt,
+    });
+    const recoverSignals = recoverRuntimeSnapshot.signals;
+    const queueSectionRuntime = deriveDoctorQueueSectionRuntime({
+      queueCount,
+      queueLimit,
+      queueDeduplicatedCount: recoverSignals.queueDeduplicatedCount,
+      runningTaskCount: running,
+      totalTaskCount: tasks.length,
+      formatNumber,
+    });
+    for (const lineDescriptor of queueSectionRuntime.lines) {
+      sectionComposer.addLine(
+        "queue",
+        formatDoctorLine(
+          lineDescriptor.level,
+          context.t(lineDescriptor.key, lineDescriptor.vars),
+        ),
       );
-      recommendations.push(context.t("agent.command.doctor.recommend.relieveQueue"));
-    } else if (queueLimit > 0 && queueCount >= Math.ceil(queueLimit * 0.75)) {
-      lines.push(
-        `[WARN] ${context.t("agent.command.doctor.queueHigh", {
-          queue: queueCount,
-          limit: queueLimit,
-          pct: queuePct,
-        })}`,
-      );
-      recommendations.push(context.t("agent.command.doctor.recommend.relieveQueue"));
-    } else {
-      lines.push(
-        `[OK] ${context.t("agent.command.doctor.queueHealthy", {
-          queue: queueCount,
-          limit: queueLimit,
-          pct: queuePct,
-        })}`,
-      );
+    }
+    for (const recommendationId of queueSectionRuntime.recommendationIds) {
+      addRecommendation(recommendationId, getDoctorRecommendationText(context, recommendationId));
     }
 
-    lines.push(
-      `[OK] ${context.t("agent.command.doctor.tasks", {
-        running: formatNumber(running),
-        total: formatNumber(tasks.length),
-      })}`,
-    );
-    if (running > 0) {
-      recommendations.push(context.t("agent.command.doctor.recommend.inspectTasks"));
+    const recoverState = recoverRuntimeSnapshot.state;
+    const recoverySectionRuntime = deriveDoctorRecoverySectionRuntime({
+      stateKind: recoverState.kind,
+      stateLastMessageId: recoverState.lastMessageId ?? null,
+      interruptionReasonLabel:
+        recoverState.kind === "none"
+          ? null
+          : formatRecoverReasonLabel(context, recoverState.kind),
+      notSetLabel: context.t("agent.command.notSet"),
+      queueCount,
+      queueLimit,
+      queueDeduplicatedCount: recoverSignals.queueDeduplicatedCount,
+      queueRejectedCount: recoverSignals.queueRejectedCount,
+      failureTotal: recoverSignals.failureTotal,
+    });
+    for (const lineDescriptor of recoverySectionRuntime.lines) {
+      const text = context.t(lineDescriptor.key, lineDescriptor.vars);
+      if (lineDescriptor.format === "doctor") {
+        sectionComposer.addLine(
+          "recovery",
+          formatDoctorLine(lineDescriptor.level ?? "ok", text),
+        );
+        continue;
+      }
+      sectionComposer.addLine("recovery", text);
     }
+    recommendations.push(
+      ...recoverySectionRuntime.recommendations.map((recommendation) =>
+        getRecoverRecommendationEntry(context, recommendation),
+      ),
+    );
 
-    lines.push(
-      `[OK] ${context.t("agent.command.doctor.permissions", {
-        mode: context.permissionMode,
-        rules: formatNumber(context.permissionRules.length),
-      })}`,
-    );
-
-    const permissionRiskCounters = collectPermissionRiskCounters(recentEvents);
-    lines.push(
-      `[OK] ${context.t("agent.command.doctor.permissionRiskSummary", {
-        critical: formatNumber(permissionRiskCounters.critical),
-        highRisk: formatNumber(permissionRiskCounters.high_risk),
-        interactive: formatNumber(permissionRiskCounters.interactive),
-        pathOutside: formatNumber(permissionRiskCounters.path_outside),
-        policy: formatNumber(permissionRiskCounters.policy),
-        scopeNotices: formatNumber(permissionRiskCounters.scopeNotices),
-      })}`,
-    );
-    lines.push(
-      `[OK] ${context.t("agent.command.doctor.permissionRiskProfileSummary", {
-        reversible: formatNumber(permissionRiskCounters.reversibilityReversible),
-        mixed: formatNumber(permissionRiskCounters.reversibilityMixed),
-        hardToReverse: formatNumber(permissionRiskCounters.reversibilityHardToReverse),
-        local: formatNumber(permissionRiskCounters.blastLocal),
-        workspace: formatNumber(permissionRiskCounters.blastWorkspace),
-        shared: formatNumber(permissionRiskCounters.blastShared),
-      })}`,
-    );
-    if (permissionRiskCounters.critical > 0 || permissionRiskCounters.high_risk > 0) {
-      lines.push(`[WARN] ${context.t("agent.command.doctor.permissionRiskHigh")}`);
-      recommendations.push(context.t("agent.command.doctor.recommend.reduceHighRiskApprovals"));
+    const permissionSectionRuntime = deriveDoctorPermissionSectionRuntime({
+      events: recentEvents,
+      permissionMode: context.permissionMode,
+      permissionRuleCount: context.permissionRules.length,
+      formatNumber,
+    });
+    for (const lineDescriptor of permissionSectionRuntime.lines) {
+      sectionComposer.addLine(
+        "permission",
+        formatDoctorLine(
+          lineDescriptor.level,
+          context.t(lineDescriptor.key, lineDescriptor.vars),
+        ),
+      );
     }
-    if (permissionRiskCounters.path_outside > 0) {
-      recommendations.push(context.t("agent.command.doctor.recommend.keepWorkspaceBoundaries"));
-    }
-    if (
-      permissionRiskCounters.reversibilityHardToReverse > 0 ||
-      permissionRiskCounters.blastShared > 0
-    ) {
-      recommendations.push(context.t("agent.command.doctor.recommend.explicitConfirmationForIrreversible"));
+    for (const recommendationId of permissionSectionRuntime.recommendationIds) {
+      addRecommendation(recommendationId, getDoctorRecommendationText(context, recommendationId));
     }
 
     if (hasGitRepo && context.workingDir && context.permissionMode !== "full_access") {
-      recommendations.push(context.t("agent.command.doctor.recommend.allowWorkspaceWrite"));
+      addRecommendation("allowWorkspaceWrite", getDoctorRecommendationText(context, "allowWorkspaceWrite"));
     }
 
-    const dedupedRecommendations = [...new Set(recommendations)];
+    const dedupedRecommendations = prioritizeDoctorRecommendations(recommendations);
     if (dedupedRecommendations.length > 0) {
-      lines.push(context.t("agent.command.doctor.recommend.title"));
+      sectionComposer.addLine("recommend", context.t("agent.command.doctor.recommend.title"));
       for (const suggestion of dedupedRecommendations) {
-        lines.push(`- ${suggestion}`);
+        sectionComposer.addLine("recommend", `- ${suggestion}`);
       }
     }
 
-    return { message: lines.join("\n") };
+    return { message: sectionComposer.buildLines().join("\n") };
   },
 };
 
@@ -3086,6 +2516,9 @@ export function createDefaultCommandRegistry(): CommandRegistry {
   return new CommandRegistry([
     helpCommand,
     statusCommand,
+    queueCommand,
+    recoverCommand,
+    budgetCommand,
     usageCommand,
     traceCommand,
     doctorCommand,
