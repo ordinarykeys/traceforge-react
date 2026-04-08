@@ -1,6 +1,6 @@
 # Lumo Coding
 
-中文 | [English](/C:/Users/pingfan/Desktop/tools/traceforge-react/README.en-US.md)
+中文 | [English](./README.en-US.md)
 
 Lumo Coding 是一个基于 `React + TypeScript + Tauri` 的桌面 AI Coding 工作台，当前仓库包含前端界面、Agent 运行时、持久化、更新发布脚本与 Windows 打包流程。
 
@@ -103,8 +103,8 @@ npm run updater:publish:flat -- `
 
 ## 文档导航
 
-- Updater + Nginx（中文）：[docs/tauri-updater-brainchat-nginx.md](/C:/Users/pingfan/Desktop/tools/traceforge-react/docs/tauri-updater-brainchat-nginx.md)
-- Updater + Nginx（English）：[docs/tauri-updater-brainchat-nginx.en-US.md](/C:/Users/pingfan/Desktop/tools/traceforge-react/docs/tauri-updater-brainchat-nginx.en-US.md)
+- Updater + Nginx（中文）：[docs/tauri-updater-brainchat-nginx.md](./docs/tauri-updater-brainchat-nginx.md)
+- Updater + Nginx（English）：[docs/tauri-updater-brainchat-nginx.en-US.md](./docs/tauri-updater-brainchat-nginx.en-US.md)
 
 ## 提交前建议
 

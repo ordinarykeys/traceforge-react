@@ -1,6 +1,6 @@
 # Lumo Coding
 
-[中文](/C:/Users/pingfan/Desktop/tools/traceforge-react/README.md) | English
+[中文](./README.md) | English
 
 Lumo Coding is a desktop AI coding workstation built with `React + TypeScript + Tauri`.  
 This repository includes the frontend app, agent runtime, persistence layer, updater publishing scripts, and Windows release workflow.
@@ -104,8 +104,8 @@ Generated files:
 
 ## Docs
 
-- Updater + Nginx (Chinese): [docs/tauri-updater-brainchat-nginx.md](/C:/Users/pingfan/Desktop/tools/traceforge-react/docs/tauri-updater-brainchat-nginx.md)
-- Updater + Nginx (English): [docs/tauri-updater-brainchat-nginx.en-US.md](/C:/Users/pingfan/Desktop/tools/traceforge-react/docs/tauri-updater-brainchat-nginx.en-US.md)
+- Updater + Nginx (Chinese): [docs/tauri-updater-brainchat-nginx.md](./docs/tauri-updater-brainchat-nginx.md)
+- Updater + Nginx (English): [docs/tauri-updater-brainchat-nginx.en-US.md](./docs/tauri-updater-brainchat-nginx.en-US.md)
 
 ## Before You Commit
 
